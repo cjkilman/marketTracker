@@ -1,0 +1,13 @@
+# Ignore clasp authentication file
+.clasp.json
+
+# Ignore node modules (if you use npm packages)
+node_modules/
+
+# Ignore temp and OS-specific files
+*.log
+.DS_Store
+Thumbs.db
+
+# Ignore backup files
+*~
