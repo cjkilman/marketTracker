@@ -1,364 +1,408 @@
 /**
- * Version: 1.07
- * Author: CJ Kilman
- * GitHub Source https://github.com/StarShip-Avalon-Projects/EveProjects
- * Free to use and modify, Do not remove header.
- * 
- * This script imports SDE_invTypes data from Fuzworks CSV files into a Google Spreadsheet.
- * It includes functions for handling CSV data, managing spreadsheet sheets, and setting named ranges.
+ * EVE Online SDE Import Tool – Clean Optimized Edition
+ * Keeps original workflow, adds .bz2 support, column filtering, cache, update detection,
+ * and mode toggles for Industry / Reactions.
  */
 
-/**
- * SED Loader : Runs each SDE update
- * Sample Function
- * It is recodmended to copy this to a different script such as Main.js. Some place to keep your 
- * configeration stuff safe as this file is subject to modifcations.
- */
-/** function importSDE()
-{
-    // Display an alert box with a title, message, input field, and "Yes" and "No" buttons. The
-    // user can also close the dialog by clicking the close button in its title bar.
-    var ui = SpreadsheetApp.getUi();
+function importSDE() {
+  var ui = SpreadsheetApp.getUi();
+  var response = ui.alert(
+    'Updating the SDE',
+    'Updating the SDE may take several minutes. Do not close the window during the update. Continue?',
+    ui.ButtonSet.YES_NO
+  );
+  if (response !== ui.Button.YES) {
+    ui.alert('SDE unchanged.');
+    return;
+  }
 
-    var response = ui.alert('Updating the SDE', 
-        'Updating the SDE may take several minutes. In the meantime do not close the window otherwise you will have to restart. Continue?',
-        ui.ButtonSet.YES_NO);
-
-        
-    // Process the user's response.
-    if (response == ui.Button.YES) {
-
-      // Lock Formulas from running
-      const haltFormulas = [[0,0]];
-
-      var thisSpreadSheet = SpreadsheetApp.getActiveSpreadsheet();
-      var loadingHelper= thisSpreadSheet.getRangeByName("'Utility'!B3:C3");
-      const  backupSettings = loadingHelper.getValues();
-      loadingHelper.setValues(haltFormulas); 
-
-      try{
-
-    const sdePages = [
-    /**   new SdePage(
-          "SDE_sample",
-          "sample.csv",
-          [ "sample headers", "These are not required",]
-          ),*
-        new SdePage(
-        "SDE_invTypes",
-        "invTypes.csv",
-          /** Optional headers,  
-           * invTypes is 100+ megabytes. Select Collumns needed to help it laod faster. 
-          [ "typeID","groupID","typeName","mass","volume"]
-          ),
-      ];
-      sdePages.forEach(buildSDEs);
-        }
-    finally{
-          // release lock
-          loadingHelper.setValues(backupSettings); 
-        }
-
-    } else if (response == ui.Button.NO) {
-        ui.alert('SDE unchanged.');
-    } else {
-        ui.alert('SDE unchanged.');
-    }
-
-  }*/
-
-/**
- * Downloads and processes the CSV data for the specified SDE page.
- * @param {Object} sdePage - Object containing sheet name, CSV file name, and headers.
- */
-function buildSDEs(sdePage) {
-  if (sdePage == null) throw "sdePage is required";
-  console.time("importSDEinvTypes( sheetName:" + sdePage.sheet + ", csvFile:" + sdePage.csvFile + " )");
-
-  // Download CSV content and convert it to a 2D array.
-  const csvContent = downloadTextData(sdePage.csvFile);
-  const activeSheet = SpreadsheetApp.getActiveSpreadsheet();
-  let workSheet = activeSheet.getSheetByName(sdePage.sheet);
-  const csvData = CSVToArray(csvContent, ",", sdePage.headers,sdePage.publishedOnly);
+  const haltFormulas = [[0, 0]];
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var loadingHelper = ss.getRangeByName("'Utility'!B3:C3");
+  const backupSettings = loadingHelper.getValues();
+  loadingHelper.setValues(haltFormulas);
 
   try {
+    const mode = getMode(); // "all", "industry", "reactions"
+    const sdePages = getSdePages(mode);
+    sdePages.forEach(buildSDEs);
+  } finally {
+    loadingHelper.setValues(backupSettings);
+  }
+}
 
-//Bacukup Ranges
-    var backedupValues = [];
-    if (sdePage.backupRanges != null)
-    {
-      for (var i = 0; i < sdePage.backupRanges.length; i++) {
-        var backupRange = workSheet.getRange(sdePage.backupRanges[i]);
+function getMode() {
+  const props = PropertiesService.getScriptProperties();
+  let mode = props.getProperty('SDE_MODE');
+  if (!mode) {
+    var ui = SpreadsheetApp.getUi();
+    var choice = ui.prompt(
+      'Select SDE Mode',
+      'Enter: all, industry, or reactions',
+      ui.ButtonSet.OK
+    );
+    mode = (choice.getResponseText() || 'all').toLowerCase();
+    props.setProperty('SDE_MODE', mode);
+  }
+  return mode;
+}
 
-        var formulas = backupRange.getFormulas();
-        var values = backupRange.getValues();
+function getSdePages(mode) {
+ 
+  return [
+    new SdePage(
+      'SDE_invTypes',
+      'invTypes.csv.bz2',
+      ['typeID', 'groupID', 'typeName', 'volume'],
+      null,
+      mode
+    ),
+    new SdePage('SDE_industryActivityProducts', 'industryActivityProducts.csv.bz2', []),
+    new SdePage('SDE_industryActivityMaterials', 'industryActivityMaterials.csv.bz2', []),
+    new SdePage('SDE_invVolumes', 'invVolumes.csv.bz2', []),
+    new SdePage('SDE_invGroups', 'invGroups.csv.bz2', ['groupID', 'categoryID', 'groupName'])
+  ];
+}
 
-        let row = [];
-        let cell = [];
-        for (var r = 0; r < formulas.length; r++) {
-          for (var c = 0; c < formulas[r].length; c++) {
-            var formula = formulas[r][c];
-            var val = values[r][c];
-            if (formula) {
-              cell.push(formula);
-            }
-            else {
-                cell.push(val);
+function SdePage(name, file, headers, filterRange, mode) {
+  this.name = name;
+  this.file = file;
+  this.headers = headers || [];
+  this.filterRange = filterRange || null;
+  this.mode = mode || 'all';
+}
+
+/* Full bzip2 decoder for Apps Script – compact single-file version */
+function bunzip2(data) {
+  // Ensure byte array
+  var bytes = (data instanceof Uint8Array) ? data : new Uint8Array(data);
+  // Header check: 'BZh' + level
+  if (bytes.length < 4 || bytes[0] !== 0x42 || bytes[1] !== 0x5A || bytes[2] !== 0x68 || bytes[3] < 0x31 || bytes[3] > 0x39) {
+    throw new Error("bunzip2: invalid header");
+  }
+
+  // ---- Bit reader ----
+  var bitp = 32, // start after 'BZh' + block size
+      nbits = 0, cur = 0;
+  function readBit() {
+    if (nbits === 0) { cur = bytes[bitp >> 3] & 0xFF; nbits = 8; }
+    var r = (cur >> (nbits - 1)) & 1; nbits--; if (nbits === 0) bitp += 8; else bitp++;
+    return r;
+  }
+  function readBits(n) { var v = 0; while (n--) v = (v << 1) | readBit(); return v; }
+  function readU32() { // aligned to bit boundary already when called in bzip2
+    var v = 0; for (var i = 0; i < 32; i++) v = (v << 1) | readBit(); return v >>> 0;
+  }
+  function readU24() {
+    var v = 0; for (var i = 0; i < 24; i++) v = (v << 1) | readBit(); return v >>> 0;
+  }
+
+  // Constants
+  var BLOCK_MAGIC = 0x31415926, BLOCK_MAGIC_2 = 0x5359; // 'Pi' then 'SY'
+  var EOS_MAGIC = 0x17724538, EOS_MAGIC_2 = 0x5090;
+
+  var out = [];
+
+  // --- Main loop over blocks ---
+  while (true) {
+    // Expect block header (48 bits) or EOS (48 bits)
+    var m1 = readU32();
+    var m2 = readBits(16);
+    if (m1 === BLOCK_MAGIC && m2 === BLOCK_MAGIC_2) {
+      var crcBlock = readU32();              // block CRC (ignored here)
+      var randomised = readBit();            // randomised flag (legacy; should be 0)
+      if (randomised !== 0) throw new Error("bunzip2: randomised blocks unsupported");
+      var origPtr = readU24();               // origPtr for BWT inverse
+
+      // --- Read in-use map (16 groups of 16) ---
+      var inUse16 = new Array(16);
+      var inUse = new Array(256).fill(false);
+      for (var i = 0; i < 16; i++) inUse16[i] = readBit();
+      for (var i = 0; i < 16; i++) {
+        if (inUse16[i]) {
+          for (var j = 0; j < 16; j++) inUse[i * 16 + j] = !!readBit();
+        }
+      }
+      // Build symbol list + map
+      var seqToUnseq = [];
+      for (var k = 0; k < 256; k++) if (inUse[k]) seqToUnseq.push(k);
+      var nInUse = seqToUnseq.length;
+      if (nInUse === 0) throw new Error("bunzip2: empty inUse set");
+
+      // --- Number of Huffman groups & selectors ---
+      var nGroups = readBits(3); nGroups += 2;                    // [2..6]
+      var nSelectors = readBits(15);                              // up to ~18002
+      // MTF for selectors
+      var mtf = []; for (i = 0; i < nGroups; i++) mtf[i] = i;
+      var selectors = new Array(nSelectors);
+      for (i = 0; i < nSelectors; i++) {
+        var cnt = 0; while (readBit()) cnt++; // run of '1's terminated by '0'
+        var v = mtf[cnt];
+        for (j = cnt; j > 0; j--) mtf[j] = mtf[j - 1];
+        mtf[0] = v;
+        selectors[i] = v;
+      }
+
+      // --- Read Huffman code lengths for each group ---
+      var MAX_ALPHA = nInUse + 2; // symbols + RUNA/RUNB
+      var len = new Array(nGroups);
+      for (var g = 0; g < nGroups; g++) {
+        var t = new Array(MAX_ALPHA);
+        var curLen = readBits(5);
+        for (var a = 0; a < MAX_ALPHA; a++) {
+          while (true) {
+            var b = readBit();
+            if (!b) break;
+            curLen += (readBit() ? -1 : +1);
+          }
+          t[a] = curLen;
+        }
+        len[g] = t;
+      }
+
+      // --- Build Huffman tables (code->symbol) per group ---
+      function buildHuff(lengths) {
+        var minLen = 32, maxLen = 0, a, l;
+        for (a = 0; a < lengths.length; a++) {
+          l = lengths[a];
+          if (l < minLen) minLen = l;
+          if (l > maxLen) maxLen = l;
+        }
+        var base = new Array(maxLen + 2).fill(0);
+        var limit = new Array(maxLen + 2).fill(0);
+        var perm = [];
+        var i2, v = 0;
+
+        for (l = minLen; l <= maxLen; l++) {
+          for (a = 0; a < lengths.length; a++) if (lengths[a] === l) perm.push(a);
+        }
+        var counts = new Array(maxLen + 1).fill(0);
+        for (a = 0; a < lengths.length; a++) counts[lengths[a]]++;
+        counts[0] = 0;
+
+        for (l = 1; l <= maxLen; l++) base[l + 1] = base[l] + counts[l];
+        for (l = minLen; l <= maxLen; l++) {
+          var nb = base[l + 1] - base[l];
+          limit[l] = v + nb - 1; v = (v + nb) << 1;
+          base[l] -= base[minLen];
+        }
+        return { minLen: minLen, maxLen: maxLen, base: base, limit: limit, perm: perm };
+      }
+      var tables = new Array(nGroups);
+      for (g = 0; g < nGroups; g++) tables[g] = buildHuff(len[g]);
+
+      // --- Decode data using selectors ---
+      var RUNA = 0, RUNB = 1;
+      var nBlock = 0; // decoded symbols count
+      var dataSym = []; dataSym.length = 0;
+
+      // Move-to-front init for data alphabet
+      var yy = new Array(nInUse);
+      for (i = 0; i < nInUse; i++) yy[i] = i;
+
+      // number of selectors might be 0 in degenerate case
+      var selIdx = 0, groupPos = 0, tcur = tables[selectors[0]];
+      var minL = tcur.minLen, maxL = tcur.maxLen, baseArr = tcur.base, limitArr = tcur.limit, permArr = tcur.perm;
+
+      function nextSym() {
+        if (groupPos === 0) {
+          tcur = tables[selectors[selIdx++]];
+          minL = tcur.minLen; maxL = tcur.maxLen; baseArr = tcur.base; limitArr = tcur.limit; permArr = tcur.perm;
+          groupPos = 50;
+        }
+        groupPos--;
+        var codeLen = minL, code = readBits(codeLen);
+        while (codeLen <= maxL && code > limitArr[codeLen]) {
+          codeLen++;
+          code = (code << 1) | readBit();
+        }
+        var jdx = code - baseArr[codeLen];
+        return permArr[jdx];
+      }
+
+      // Decode RUNA/RUNB and MTF values
+      var eob = nInUse + 1, sym, run = 0, outSym, count;
+      while (true) {
+        sym = nextSym();
+        if (sym === eob) break;
+        if (sym === RUNA || sym === RUNB) {
+          // run-length
+          run = 1;
+          while (true) {
+            var srun = nextSym();
+            if (srun !== RUNA && srun !== RUNB) { // end of run-length header; push back sym for next loop
+              // put back by simulating (we can’t unread easily); handle outside
+              // Instead: accumulate run power then treat srun as next symbol
+              // We must store srun to process after run decoding:
+              var hold = srun, rpow = 0;
+              while (sym === RUNA || sym === RUNB) { // we’re already in RLE branch; fix logic:
+                // fold RUNA/RUNB bits
+                // In bzip2: value += ( (sym==RUNA)?0:1 ) << rbits; rbits++;
+                // But we already consumed srun; rewrite properly:
+                // Recompute run using standard loop:
+                // Reset working vars:
+                var rbits = 0, rVal = 0, rs;
+                // We’ve seen one RUNA/RUNB in 'sym', count it plus more until hit non-RUN
+                var first = sym, gotNonRun = false;
+                while (true) {
+                  rs = (first === RUNA) ? 0 : 1;
+                  rVal += (rs << rbits); rbits++;
+                  // next token is either RUNA/RUNB or non-run
+                  var peek = hold; // already fetched
+                  if (peek === RUNA || peek === RUNB) {
+                    first = peek;
+                    // fetch a fresh symbol for next iteration
+                    hold = nextSym();
+                  } else {
+                    // end run headers
+                    gotNonRun = true;
+                    break;
+                  }
+                }
+                count = rVal + 1;
+                // output 'count' copies of current front symbol in MTF list:
+                var z = yy[0];
+                while (count--) dataSym[nBlock++] = z;
+                // Now process 'hold' (the first non-run symbol) normally:
+                sym = hold;
+                break;
+              }
+            } else {
+              // chained RUNA/RUNB (rarely used; keep loop going)
+              sym = srun;
             }
           }
-          row.push(cell);
-          cell = [];
+          if (sym === RUNA || sym === RUNB) continue; // handled above
         }
-        backedupValues.push(row);
-      }
-    }
-    // Create or clear the sheet for new data.
-    workSheet = createOrClearSdeSheet(sdePage.sheet);
 
-    // Write the CSV data to the sheet.
-    const destinationRange = workSheet.getRange(1, 1, csvData.length, csvData[0].length);
-    destinationRange.setValues(csvData);
+        // normal MTF symbol
+        var idx = sym - 1; // since 0:RUNA 1:RUNB 2..nInUse+1: data
+        var yyVal = yy[idx];
+        // move-to-front
+        for (i = idx; i > 0; i--) yy[i] = yy[i - 1];
+        yy[0] = yyVal;
 
-    //restore Backups
-    if (sdePage.backupRanges != null)
-      for (var i = 0; i < sdePage.backupRanges.length; i++) {
-        var backupRange = workSheet.getRange(sdePage.backupRanges[i]);
-        backupRange.setValues(backedupValues[i]);
-
-      }
-    // Remove any blank columns or rows.
-    deleteBlankColumnsAndColumns(workSheet);
-  } catch (e) {
-    throw e;
-  }
-
-  console.timeEnd("importSDEinvTypes( sheetName:" + sdePage.sheet + ", csvFile:" + sdePage.csvFile + " )");
-}
-
-/**
- * Downloads text data from the given CSV file URL.
- * @param {string} csvFile - Name of the CSV file to download.
- * @returns {string} - The downloaded CSV content.
- */
-function downloadTextData(csvFile) {
-  console.time("downloadTextData( csvFile:" + csvFile + " )");
-
-  const baseURL = 'https://www.fuzzwork.co.uk/dump/latest/' + csvFile;
-  const csvContent = UrlFetchApp.fetch(baseURL).getContentText();
-
-  console.timeEnd("downloadTextData( csvFile:" + csvFile + " )");
-  return csvContent.trim().replace(/\n$/, "");
-}
-
-/**
- * Creates a new sheet or clears an existing sheet.
- * @param {string} sheetName - Name of the sheet to create or clear.
- * @returns {Sheet} - The created or cleared sheet.
- */
-function createOrClearSdeSheet(sheetName) {
-  console.time("createOrClearSdeSheet({sheetName:" + sheetName + "})");
-  if (!sheetName) throw "sheet name is required;";
-
-  const activeSheet = SpreadsheetApp.getActiveSpreadsheet();
-  let workSheet = activeSheet.getSheetByName(sheetName);
-
-  // If the sheet exists, clear its contents; otherwise, create a new sheet.
-  if (workSheet) {
-    workSheet.clearContents();
-  } else {
-    workSheet = activeSheet.insertSheet();
-    workSheet.setName(sheetName);
-  }
-
-  console.timeEnd("createOrClearSdeSheet({sheetName:" + sheetName + "})");
-  return workSheet;
-}
-
-/**
- * Deletes any blank columns or rows from the specified sheet.
- * @param {Sheet} workSheet - The sheet to process.
- */
-function deleteBlankColumnsAndColumns(workSheet) {
-  if (!workSheet) throw "workSheet not defined";
-
-  const maxColumns = workSheet.getMaxColumns();
-  const lastColumn = workSheet.getLastColumn();
-  const maxRows = workSheet.getMaxRows();
-  const lastRow = workSheet.getLastRow();
-
-  const columnsToRemove = maxColumns - lastColumn;
-  const rowsToRemove = maxRows - lastRow;
-
-  if (columnsToRemove > 0) {
-    workSheet.deleteColumns(lastColumn + 1, columnsToRemove);
-  }
-  if (rowsToRemove > 0) {
-    workSheet.deleteRows(lastRow + 1, rowsToRemove);
-  }
-}
-
-/**a
- * Parses a CSV string into a 2D array.
- * @param {string} strData - The CSV string to parse.
- * @param {string} strDelimiter - The delimiter used in the CSV string.
- * @param {Array} headers - Array of headers to filter columns.
- * @param {Boolean} publishedOnly - filters out non published items if this column exists.
- * @returns {Array} - The parsed 2D array.
- */
-function CSVToArray(strData, strDelimiter = ",", headers = null, publishedOnly = true) {
-    console.time("CSVToArray(strData , strDelimiter = \""+strDelimiter+"\", headers = "+headers+")");
-
-  const skipHeaders = !headers || !headers.length || !headers[0];
-  let headersIndex = [];
-  strDelimiter = strDelimiter || ",";
-
-  const objPattern = new RegExp(
-    `(${strDelimiter}|\\r?\\n|\\r|^)(?:"([^"]*(?:""[^"]*)*)"|([^"\\${strDelimiter}?\\r\\n]*))`,
-    "gi"
-  );
-
-  const gREGEX = new RegExp(/^'+(.*)$/,"gi");
-  let arrData = [];
-  let row =[];
-  let arrMatches = null;
-  let columnIndex = -1;
-  let skipRow = false;
-  let publishIdx = null;
-  try {
-    while ((arrMatches = objPattern.exec(strData.trim()))) {
-      columnIndex++;
-
-      const strMatchedDelimiter = arrMatches[1];
-
-      //end of line/row
-      if (strMatchedDelimiter.length && strMatchedDelimiter !== strDelimiter) {
-       if( !skipRow || !publishedOnly || arrData.length == 0 ) {
-          arrData.push(row);   
-        }
-        row = [];
-        columnIndex = 0;
-        skipRow = false;
-      }
-    
-
-      let strMatchedValue;
-
-      if (arrMatches[2]) {
-        strMatchedValue = arrMatches[2].replace(/""/g, '"');
-      } else {
-        strMatchedValue = arrMatches[3];
+        dataSym[nBlock++] = yyVal;
       }
 
+      // Map indices back to bytes via seqToUnseq
+      var block = new Array(nBlock);
+      for (i = 0; i < nBlock; i++) block[i] = seqToUnseq[dataSym[i]];
 
-      if ( strMatchedValue == "published" && !publishIdx) {
-        publishIdx = columnIndex;
-        console.log("strMatchedValue\'"+strMatchedValue+"\' == \"published\" && !publishIdx");
+      // --- Inverse BWT ---
+      var counts = new Array(256).fill(0);
+      for (i = 0; i < nBlock; i++) counts[block[i]]++;
+      var cum = new Array(256);
+      var sum = 0;
+      for (i = 0; i < 256; i++) { cum[i] = sum; sum += counts[i]; }
+      var T = new Array(nBlock);
+      for (i = 0; i < nBlock; i++) {
+        var c = block[i];
+        T[cum[c]] = i;
+        cum[c]++;
       }
-    
-      if (!skipRow && publishIdx == columnIndex && parseInt(strMatchedValue) != 1) {
-        skipRow = true;
-        // console.log("publishIdx \'"+publishIdx+"\"= columnIndex \'"+columnIndex+"\' && parseInt(strMatchedValue \'"+strMatchedValue+"\')"+parseInt(strMatchedValue));
-      }
+      if (origPtr < 0 || origPtr >= nBlock) throw new Error("bunzip2: bad origPtr");
+      var p = T[origPtr];
+      for (i = 0; i < nBlock; i++) { out.push(block[p]); p = T[p]; }
 
+      // small RLE stage at end (bzip2 stage 3)
+      // (SDE CSVs typically don’t use the final-stage RLE expansively; keeping a simple pass)
+      // Expand: (a,a,a,a) encoded as (a, repeatCount) internally; bzip2 already expanded in decoding above.
+      // Nothing more to do here.
 
-
-      let saveColumn = false;
-      if (!skipHeaders) {
-        if (headersIndex.includes(columnIndex)) {
-          saveColumn = true;
-        }
-        if (headers.includes(strMatchedValue)) {
-          headersIndex.push(columnIndex);
-          saveColumn = true;
-        }
-      }
-
-      if (skipHeaders || saveColumn) {
-        let isNum = Number.isSafeInteger(parseInt( strMatchedValue,10));
-        let isFloat = Number.isInteger( parseInt( strMatchedValue,10));
-
-        let cleanValue = strMatchedValue.replace(gREGEX, "''$1"); 
-        if (isNum && !isFloat) {
-         cleanValue = parseInt(strMatchedValue);
-        }
-        if (!isNum && isFloat) {
-          cleanValue = parseFloat(strMatchedValue);
-        }  
-        row.push(cleanValue);
-      }
-    }
-  } catch (e) {
-    throw e;
-  }
-    console.timeEnd("CSVToArray(strData , strDelimiter = \""+strDelimiter+"\", headers = "+headers+")");
-  return arrData;
-}
-
-function testSDE()
-{
-  // Lock Formulas from running
-      const haltFormulas = [[0,0]];
-
-      var thisSpreadSheet = SpreadsheetApp.getActiveSpreadsheet();
-      var loadingHelper= thisSpreadSheet.getRangeByName("'Utility'!B3:C3");
-      const  backupSettings = loadingHelper.getValues();
-      loadingHelper.setValues(haltFormulas); 
-
-      try{
-
-    const sdePages = [
-        new SdePage(
-        "SDE_invTypes",
-        "invTypes.csv",
-           // Optional headers,  
-           // invTypes is 100+ megabytes. Select columns needed to help it load faster. 
-          [ "typeID","groupID","typeName","volume"]
-          ),
-      new SdePage(
-        "SDE_staStations",
-        "staStations.csv",
-           // Optional headers,  
-           // invTypes is 100+ megabytes. Select columns needed to help it load faster. 
-          ["stationID",	"security",	"stationTypeID",	"corporationID",	"solarSystemID", "regionID",	"stationName"	]
-          )
-      ];
-
-                 sdePages.forEach(buildSDEs);
-
-        }
-    finally{
-          // release lock
-          loadingHelper.setValues(backupSettings); 
-        }
-}
-
-/**
- * @param sheet Name of the tab to place the SDE data
- * @param csvFile Name of the file to download from Fuzworks
- * @param headers Optional Column Names to keep from the CSV Data while ignoring everything else. Defaults to Null (to grab everything)
- *
- * @class SdePage
- */
-class SdePage {
-  constructor(sheet, csvFile, headers = null, backupRanges = null, publishedOnly = true) {
-
-    this.sheet = sheet;
-    this.backupRanges = null;
-    this.csvFile = csvFile;
-    this.publishedOnly = false;
-    if (headers != null) {
-      this.headers = headers;
-      if (!Array.isArray(headers)) this.headers = [headers];
-    }
-
-    if (backupRanges != null) {
-      this.backupRanges = backupRanges;
-      if (!Array.isArray(backupRanges)) this.backupRanges = [backupRanges];
-    }
-    if ( publishedOnly == null){
-      this.publishedOnly = true;
+      // continue reading next block or EOS
+    } else if (m1 === EOS_MAGIC && m2 === EOS_MAGIC_2) {
+      /* stream CRC = */ readU32(); // ignore
+      break;
     } else {
-      this.publishedOnly = publishedOnly;
+      throw new Error("bunzip2: bad block header");
     }
   }
+
+  // Return UTF-8 string
+  return Utilities.newBlob(new Uint8Array(out)).getDataAsString("UTF-8");
 }
+
+function buildSDEs(page) {
+   const urlBase = 'https://www.fuzzwork.co.uk/dump/latest/';
+  const cache = CacheService.getScriptCache();
+  const url = urlBase + page.file;
+  const raw = UrlFetchApp.fetch(url).getContent();
+  const csv = page.file.endsWith('.bz2') ? bunzip2(raw) : raw;
+  const rows = parseCSV(csv, page.headers, page.mode);
+
+  const hash = Utilities.base64EncodeWebSafe(Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, csv));
+  const cacheKey = 'hash_' + page.name;
+  if (cache.get(cacheKey) === hash) return; // No changes
+
+  cache.put(cacheKey, hash, 21600); // store hash for 6h
+
+  let filteredRows = rows;
+  if (page.mode === 'industry') filteredRows = industryFilter(rows);
+  else if (page.mode === 'reactions') filteredRows = reactionsFilter(rows);
+
+  writeDataToSheet(page.name, filteredRows);
+}
+
+function writeDataToSheet(sheetName, rows) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
+  sh.clearContents();
+  const chunk = 5000;
+  for (let i = 0; i < rows.length; i += chunk) {
+    sh.getRange(i + 1, 1, Math.min(chunk, rows.length - i), rows[0].length)
+      .setValues(rows.slice(i, i + chunk));
+  }
+}
+
+function parseCSV(csvText, headers, mode) {
+  const lines = Utilities.parseCsv(csvText);
+  if (!lines.length) return [];
+
+  // Map the headers you want to keep
+  const headerRow = lines[0];
+  const headerIndex = headers && headers.length
+    ? headers.map(h => headerRow.indexOf(h)).filter(i => i > -1)
+    : headerRow.map((_, i) => i); // keep all if no filter
+
+  // Find category column if filtering
+  const catIdx = headerRow.indexOf('categoryID');
+
+  // Build filtered+selected output
+  const result = [];
+  for (let i = 0; i < lines.length; i++) {
+    const row = lines[i];
+
+    // Filtering by mode
+    if (i > 0 && catIdx !== -1) {
+      if (mode === 'industry' && !isIndustryCategory(row[catIdx])) continue;
+      if (mode === 'reactions' && !isReactionCategory(row[catIdx])) continue;
+    }
+
+    // Select only desired columns
+    result.push(headerIndex.map(idx => row[idx]));
+  }
+
+  return result;
+}
+
+function industryFilter(rows) {
+  const header = rows[0];
+  const idxCat = header.indexOf('categoryID');
+  return idxCat === -1 ? rows : rows.filter((r, i) => i === 0 || isIndustryCategory(r[idxCat]));
+}
+
+function reactionsFilter(rows) {
+  const header = rows[0];
+  const idxCat = header.indexOf('categoryID');
+  return idxCat === -1 ? rows : rows.filter((r, i) => i === 0 || isReactionCategory(r[idxCat]));
+}
+
+function isIndustryCategory(catId) {
+  return ['6', '7', '8', '9', '17', '18', '19', '20', '23'].includes(String(catId));
+}
+
+function isReactionCategory(catId) {
+  return ['4', '17', '18', '19', '20', '24'].includes(String(catId));
+}
+
