@@ -6,10 +6,11 @@ function getCurrentMarketPrices() {
   const typeIDs = getTypeIDsFromItemList(maxLogIDs);
   const marketCombos = getMarketSettings();
 
-  const sheet = getOrCreateSheet(
+const sheet = getOrCreateSheet(
+  ss,  // <-- Add this
   "Market Prices",
   ["type_id", "market_id", "market_type", "max_buy", "min_sell", "date"]
-  );
+);
 
   const now = new Date();
   const cutoff = new Date(now.getTime() - 24 * 60 * 60 * 1000);
