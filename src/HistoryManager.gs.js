@@ -17,6 +17,7 @@ function updateHistory() {
   return _updateHistoryCore({ testMode: false });
 }
 
+
 /**
  * Test entrypoint – bypasses window checks and writes to "History (TEST)".
  * Use this while developing.
