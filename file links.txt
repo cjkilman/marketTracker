@@ -1,0 +1,14 @@
+https://raw.githubusercontent.com/cjkilman/marketTracker/dev/src/appsscript.json
+https://raw.githubusercontent.com/cjkilman/marketTracker/dev/src/Calc%20Current%20Median%20Prices.js
+https://raw.githubusercontent.com/cjkilman/marketTracker/dev/src/CandlestickBuilder.gs.js
+https://raw.githubusercontent.com/cjkilman/marketTracker/dev/src/ConfigHandler.gs.js
+https://raw.githubusercontent.com/cjkilman/marketTracker/dev/src/Fuz%20API.js
+https://raw.githubusercontent.com/cjkilman/marketTracker/dev/src/HistoryManager.gs.js
+https://raw.githubusercontent.com/cjkilman/marketTracker/dev/src/main.js
+https://raw.githubusercontent.com/cjkilman/marketTracker/dev/src/MarketFetcher.gs.js
+https://raw.githubusercontent.com/cjkilman/marketTracker/dev/src/MasterRunner.gs.js
+https://raw.githubusercontent.com/cjkilman/marketTracker/dev/src/PricePruner.gs.js
+https://raw.githubusercontent.com/cjkilman/marketTracker/dev/src/Refresh.js
+https://raw.githubusercontent.com/cjkilman/marketTracker/dev/src/SDE%20Import.js
+https://raw.githubusercontent.com/cjkilman/marketTracker/dev/src/Untitled.js
+https://raw.githubusercontent.com/cjkilman/marketTracker/dev/src/Utility.js

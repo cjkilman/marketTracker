@@ -7,7 +7,7 @@ function getCurrentMarketPrices() {
   const marketCombos = getMarketSettings();
 
 const sheet = getOrCreateSheet(
-  ss,  // <-- Add this
+  ss,  // Add this so the function gets the correct context
   "Market Prices",
   ["type_id", "market_id", "market_type", "max_buy", "min_sell", "date"]
 );

@@ -1,7 +1,10 @@
 function getOrCreateSheet(ss, name, headers) {
-  if (!ss || typeof ss.getSheetByName !== "function") {
-    ss = SpreadsheetApp.getActiveSpreadsheet();
-  }
+if (!ss || typeof ss.getSheetByName !== 'function') {
+  ss = SpreadsheetApp.getActiveSpreadsheet();
+}
+if (!Array.isArray(headers)) {
+  throw new Error("getOrCreateSheet: headers must be an array of strings");
+}
 
   let sheet = ss.getSheetByName(name);
   if (!sheet) {
