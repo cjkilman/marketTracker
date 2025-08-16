@@ -40,32 +40,72 @@ const sheet = getOrCreateSheet(
   sheet.getRange(2, 1, existing.length, header.length).setValues(existing);
 }
 
-function getTypeIDsFromItemList(limit) {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName("Item List Back End");
-  if (!sheet) throw new Error("Item List Back End sheet not found.");
-  let ids = sheet.getRange("A2:A" + sheet.getLastRow()).getValues().flat().filter(Number);
-  ids = [...new Set(ids)]; // unique
-  if (limit && ids.length > limit) ids = ids.slice(0, limit);
-  return ids;
+// Sanitizer helper
+function sanitizeIDs(ids) {
+  return [...new Set(
+    ids
+      .map(v => Number(v))
+      .filter(v => !isNaN(v) && v > 0)
+  )];
 }
 
 function getMarketSettings() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName("Market Settings");
   if (!sheet) throw new Error("Market Settings sheet not found.");
-  const data = sheet.getRange(3, 4, sheet.getLastRow() - 2, 3).getValues();
-  const combos = [];
+
   const types = ["station", "system", "region"];
-  data.forEach(row => {
-    row.forEach((id, i) => {
-      if (id) combos.push({ market_id: Number(id), market_type: types[i] });
+  const combos = [];
+
+  // Loop each column separately
+  types.forEach((type, index) => {
+    const col = 4 + index; // D, E, F
+    const raw = sheet.getRange(3, col, sheet.getLastRow() - 2, 1)
+      .getValues()
+      .flat();
+
+    const clean = sanitizeIDs(raw);
+    clean.forEach(id => combos.push({ market_id: id, market_type: type }));
+  });
+
+  return combos;
+}
+
+function getTypeIDsFromItemList(limit) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("Item List Back End");
+  if (!sheet) throw new Error("Item List Back End sheet not found.");
+
+  let ids = sheet.getRange("A2:A" + sheet.getLastRow())
+    .getValues()
+    .flat();
+
+  ids = sanitizeIDs(ids);
+
+  if (limit && ids.length > limit) ids = ids.slice(0, limit);
+  return ids;
+}
+
+function getAllMarketAssignments() {
+  const typeIDs = getTypeIDsFromItemList(); // Already returns sanitized list
+  const marketCombos = getMarketSettings(); // [{ market_id, market_type }, ...]
+
+  const assignments = [];
+
+  marketCombos.forEach(({ market_id, market_type }) => {
+    typeIDs.forEach(type_id => {
+      assignments.push({
+        type_id,
+        market_id,
+        market_type
+      });
     });
   });
-  return combos.filter((v, i, a) => a.findIndex(t =>
-    t.market_id === v.market_id && t.market_type === v.market_type
-  ) === i);
+
+  return assignments;
 }
+
+
 
 /**
  * Fetches market prices and ensures numeric values are math-friendly.
@@ -85,4 +125,43 @@ function getMarketPrices(type_ids, market_id, market_type) {
   });
 
   return result;
+}
+
+/**
+ * Test consumer for getAllMarketAssignments().
+ * Creates/clears a sheet named "Market Assignments Test"
+ * and writes out all assignments.
+ */
+function testConsumerAssignments() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheetName = "Market Assignments Test";
+
+  // Get the market assignments (array of objects)
+  const assignments = getAllMarketAssignments();
+
+  // Map objects -> rows
+  const rows = assignments.map(a => [
+    a.type_id,
+    a.market_id,
+    a.market_type
+  ]);
+
+  // Headers
+  const header = ["type_id", "market_id", "market_type"];
+
+  // Create/clear sheet
+  let sheet = ss.getSheetByName(sheetName);
+  if (!sheet) {
+    sheet = ss.insertSheet(sheetName);
+  } else {
+    sheet.clearContents();
+  }
+
+  // Write data
+  sheet.getRange(1, 1, 1, header.length).setValues([header]);
+  if (rows.length > 0) {
+    sheet.getRange(2, 1, rows.length, header.length).setValues(rows);
+  }
+
+  Logger.log(`Wrote ${rows.length} assignments to '${sheetName}'`);
 }

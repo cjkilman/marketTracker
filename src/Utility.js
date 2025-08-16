@@ -22,3 +22,11 @@ if (!Array.isArray(headers)) {
   }
   return sheet;
 }
+
+/**
+ * Basic logging utility for informational messages.
+ * @param {string} message - The message to log.
+ */
+function logInfo(message) {
+  Logger.log("[INFO] " + message);
+}
