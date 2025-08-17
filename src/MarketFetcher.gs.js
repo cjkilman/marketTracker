@@ -3,42 +3,72 @@ function getCurrentMarketPrices() {
   const config = getConfig();
   const maxLogIDs = config["MaxLogIDs"] ? parseInt(config["MaxLogIDs"], 10) : 750;
 
+  // Read the typeIDs list once
   const typeIDs = getTypeIDsFromItemList(maxLogIDs);
+
+  // Read market settings once
   const marketCombos = getMarketSettings();
 
-const sheet = getOrCreateSheet(
-  ss,  // Add this so the function gets the correct context
-  "Market Prices",
-  ["type_id", "market_id", "market_type", "max_buy", "min_sell", "date"]
-);
+  // Ensure sheet exists and preserve headers
+  const sheetName = "Market Prices";
+  const headers = ["date", "market_id", "market_type", "type_id", "min_sell", "max_buy", "median_sell", "median_buy"];
+  const sheet = getOrCreateSheet(ss, sheetName, headers);
 
-  const now = new Date();
-  const cutoff = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-
-  // Keep existing data within 24 hours
-  let existing = sheet.getDataRange().getValues();
-  const header = existing.shift();
-  existing = existing.filter(row => new Date(row[5]) >= cutoff);
-
-  // Process each market combo
+  // Collect rows
+  const rows = [];
   marketCombos.forEach(({ market_id, market_type }) => {
-    const data = getMarketPrices(typeIDs, market_id, market_type);
-    const rows = Object.entries(data).map(([type_id, prices]) => [
-      parseInt(type_id, 10),
-      market_id,
-      market_type,
-      prices.maxBuy || "",
-      prices.minSell || "",
-      now
-    ]);
-    existing.push(...rows);
+    const prices = getMarketPrices(typeIDs, market_id, market_type);
+
+    typeIDs.forEach(type_id => {
+      const entry = prices[type_id];
+      rows.push([
+        new Date(),
+        market_id,
+        market_type,
+        type_id,
+        entry.minSell,
+        entry.maxBuy,
+        entry.medianSell,
+        entry.medianBuy
+      ]);
+    });
   });
 
-  // Write back
-  sheet.clearContents();
-  sheet.getRange(1, 1, 1, header.length).setValues([header]);
-  sheet.getRange(2, 1, existing.length, header.length).setValues(existing);
+  // Append under headers
+  if (rows.length > 0) {
+    sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
+  }
+
+  // Prune old rows (configurable retention days)
+  pruneOldRows(sheet, config["PriceRetentionDays"]);
+
+  // NOTE: HistoryManager/updateHistory will also use pruneOldRows()
+  // with config["HistoryRetentionDays"] — hook that in when we build it.
 }
+
+
+function pruneOldRows(sheet, retentionDays) {
+  if (!retentionDays) return;
+
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - retentionDays);
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return; // nothing to prune (header only)
+
+  const timestamps = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+
+  for (let i = timestamps.length - 1; i >= 0; i--) {
+    const ts = timestamps[i][0];
+    if (ts instanceof Date && ts < cutoff) {
+      sheet.deleteRow(i + 2); // +2 offset for 1-based + header row
+    }
+  }
+
+  // NOTE: Shared between Market Prices and Market History.
+  // updateHistory() will also call this with HistoryRetentionDays.
+}
+
 
 // Sanitizer helper
 function sanitizeIDs(ids) {
@@ -48,6 +78,7 @@ function sanitizeIDs(ids) {
       .filter(v => !isNaN(v) && v > 0)
   )];
 }
+
 
 function getMarketSettings() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -71,6 +102,7 @@ function getMarketSettings() {
   return combos;
 }
 
+
 function getTypeIDsFromItemList(limit) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName("Item List Back End");
@@ -86,25 +118,17 @@ function getTypeIDsFromItemList(limit) {
   return ids;
 }
 
-function getAllMarketAssignments() {
-  const typeIDs = getTypeIDsFromItemList(); // Already returns sanitized list
-  const marketCombos = getMarketSettings(); // [{ market_id, market_type }, ...]
 
-  const assignments = [];
+function getAllMarketAssignments(limit) {
+  const typeIDs = getTypeIDsFromItemList(limit);
+  const marketCombos = getMarketSettings();
 
-  marketCombos.forEach(({ market_id, market_type }) => {
-    typeIDs.forEach(type_id => {
-      assignments.push({
-        type_id,
-        market_id,
-        market_type
-      });
-    });
-  });
-
-  return assignments;
+  return marketCombos.map(({ market_id, market_type }) => ({
+    market_id,
+    market_type,
+    type_ids: typeIDs
+  }));
 }
-
 
 
 /**
@@ -118,14 +142,17 @@ function getMarketPrices(type_ids, market_id, market_type) {
   type_ids.forEach(id => {
     const entry = data[id] || {};
 
-    const minSell = parseFloat(entry.sell?.min) > 0 ? parseFloat(entry.sell.min) : null;
-    const maxBuy  = parseFloat(entry.buy?.max)  > 0 ? parseFloat(entry.buy.max)  : null;
+    const minSell    = parseFloat(entry.sell?.min)    > 0 ? parseFloat(entry.sell.min)    : null;
+    const maxBuy     = parseFloat(entry.buy?.max)     > 0 ? parseFloat(entry.buy.max)     : null;
+    const medianSell = parseFloat(entry.sell?.median) > 0 ? parseFloat(entry.sell.median) : null;
+    const medianBuy  = parseFloat(entry.buy?.median)  > 0 ? parseFloat(entry.buy.median)  : null;
 
-    result[id] = { minSell, maxBuy };
+    result[id] = { minSell, maxBuy, medianSell, medianBuy };
   });
 
   return result;
 }
+
 
 /**
  * Test consumer for getAllMarketAssignments().
@@ -139,12 +166,13 @@ function testConsumerAssignments() {
   // Get the market assignments (array of objects)
   const assignments = getAllMarketAssignments();
 
-  // Map objects -> rows
-  const rows = assignments.map(a => [
-    a.type_id,
-    a.market_id,
-    a.market_type
-  ]);
+  // Flatten each assignment into rows
+  const rows = [];
+  assignments.forEach(a => {
+    a.type_ids.forEach(type_id => {
+      rows.push([type_id, a.market_id, a.market_type]);
+    });
+  });
 
   // Headers
   const header = ["type_id", "market_id", "market_type"];
@@ -163,5 +191,5 @@ function testConsumerAssignments() {
     sheet.getRange(2, 1, rows.length, header.length).setValues(rows);
   }
 
-  Logger.log(`Wrote ${rows.length} assignments to '${sheetName}'`);
+  Logger.log(`Wrote ${rows.length} assignment rows to '${sheetName}'`);
 }

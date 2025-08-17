@@ -1,3 +1,9 @@
+// =========================================================
+// TODO [Bridge Tag]:
+// Add debugLog() + warnIfMismatch() helpers here if/when
+// array length mismatches or noisy debugging become a pain.
+// =========================================================
+
 function getOrCreateSheet(ss, name, headers) {
 if (!ss || typeof ss.getSheetByName !== 'function') {
   ss = SpreadsheetApp.getActiveSpreadsheet();
