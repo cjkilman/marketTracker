@@ -1,35 +1,39 @@
-function buildCandlestickData() {
+
+// is this Sheet Formula 
+// Something about All Items Candle Stick chaart?
+
+function getDailyCandlestick(type_id, market_id, market_type, date) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const config = getConfig();
-  const daysBack = parseInt(config["DaysForCandlestick"], 10) || 30;
+  const sheet = ss.getSheetByName("Market History");
+  if (!sheet) throw new Error("Market History sheet not found.");
 
-  const historySheet = ss.getSheetByName("History");
-  if (!historySheet) throw new Error("History sheet not found.");
+  const data = sheet.getDataRange().getValues();
+  const headers = data.shift(); // Remove header row
 
-  const lastDate = new Date();
-  const firstDate = new Date();
-  firstDate.setDate(lastDate.getDate() - daysBack);
+  // Map columns by header
+  const col = {};
+  headers.forEach((h, i) => col[h] = i);
 
-  const data = historySheet.getDataRange().getValues();
-  const headers = data.shift();
-  const dateIndex = headers.indexOf("Date");
-  const openIndex = headers.indexOf("Open");
-  const highIndex = headers.indexOf("High");
-  const lowIndex = headers.indexOf("Low");
-  const closeIndex = headers.indexOf("Close");
+  // Filter rows matching type_id, market_id, market_type, and date
+  const rows = data.filter(r =>
+    r[col["type_id"]] === type_id &&
+    r[col["market_id"]] === market_id &&
+    r[col["market_type"]] === market_type &&
+    r[col["date"]].toDateString() === date.toDateString()
+  );
 
-  const filtered = data.filter(row => {
-    const rowDate = new Date(row[dateIndex]);
-    return rowDate >= firstDate;
-  });
+  if (!rows.length) return null;
 
-  const candleSheet = ss.getSheetByName("Candlestick Data") || ss.insertSheet("Candlestick Data");
-  candleSheet.clear();
-  candleSheet.appendRow(["Date", "Low", "Open", "Close", "High"]);
+  const minSells = rows.map(r => r[col["min_sell"]]);
+  const maxBuys  = rows.map(r => r[col["max_buy"]]);
 
-  filtered.forEach(row => {
-    candleSheet.appendRow([
-      row[dateIndex], row[lowIndex], row[openIndex], row[closeIndex], row[highIndex]
-    ]);
-  });
+  const high = Math.max(...minSells);
+  const low  = Math.min(...maxBuys);
+
+  // Open: first min_sell of the day
+  const open = rows[0][col["min_sell"]];
+  // Close: last min_sell of the day
+  const close = rows[rows.length - 1][col["min_sell"]];
+
+  return { open, close, high, low };
 }
