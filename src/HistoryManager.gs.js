@@ -2,309 +2,345 @@
  * HistoryManager.gs
  * - Builds daily history from "Market Prices"
  * - Day High  = max(min_sell) over last 24h
- * - Day Low   = min(max_buy) over last 24h
+ * - Day Low   = min(max_buy)  over last 24h
  * - Open/Close snapshots from getMarketPrices(...)
  * - Retention via HistoryRetentionDays (default 365)
  * - Production sheet: "Market History"
  * - Test sheet:       "History (TEST)"
  ***********************/
 
+const HISTORY_PROD_SHEET = "Market History";
+const HISTORY_TEST_SHEET = "History (TEST)";
+
 /**
- * Production entrypoint – respects open/close windows and writes to "Market History".
- * Set two time-based triggers to call this around your OpenTime and CloseTime windows.
+ * Production entrypoint – safe for triggers.
+ * Uses "auto" mode (respects open/close time windows).
  */
 function updateHistory() {
-  return _updateHistoryCore({ testMode: false });
+  return _updateHistoryCore({
+    testMode: false,
+    mode: "auto"
+  });
 }
-
 
 /**
- * Test entrypoint – bypasses window checks and writes to "History (TEST)".
- * Use this while developing.
+ * Test entrypoint – writes to "History (TEST)".
+ * Defaults to "auto", or pass "open"/"close" for debugging.
  */
-function updateHistoryTestMode() {
-  return _updateHistoryCore({ testMode: true });
+function updateHistoryTestMode(modeOverride) {
+  return _updateHistoryCore({
+    testMode: true,
+    mode: modeOverride || "auto"
+  });
 }
 
-/** ---------------- Core ---------------- **/
+/**
+ * Core: fetch → build rows → append → prune.
+ * - testMode: writes to "History (TEST)" instead of prod history sheet.
+ * - Daily extremes per key (type_id|market_id|market_type):
+ *    - buy_open  = first max_buy seen today
+ *    - buy_close = current snapshot max_buy
+ *    - sell_open = first min_sell seen today
+ *    - sell_close= current snapshot min_sell
+ *    - daily_high= max(min_sell) today (sell ceiling)
+ *    - daily_low = min(max_buy)  today (buy floor)
+ */
 function _updateHistoryCore(opts) {
-  var testMode = !!(opts && opts.testMode);
+  const testMode = !!(opts && opts.testMode);
+  const mode = (opts && opts.mode) || "auto";
 
-  // --- Config
-  var config = getConfig();
-  var openStr  = (config["OpenTime"]  !== undefined ? String(config["OpenTime"])  : "11:00");
-  var closeStr = (config["CloseTime"] !== undefined ? String(config["CloseTime"]) : "18:00");
-  var retentionDays = parseInt(config["HistoryRetentionDays"], 10);
-  if (isNaN(retentionDays) || retentionDays <= 0) retentionDays = 365;
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const config = getConfig();
 
-  var now = new Date();
-  var tz = Session.getScriptTimeZone();
-  var todayKey = Utilities.formatDate(now, tz, "yyyy-MM-dd"); // key for today’s rows
+  const maxLogIDs     = parseInt(config["MaxLogIDs"] || 750, 10);
+  const retentionDays = parseInt(config["HistoryRetentionDays"] || 365, 10);
 
-  // --- Window check (skip only in production)
-  if (!testMode) {
-    var withinOpen = _isWithinWindow(now, openStr);
-    var withinClose = _isWithinWindow(now, closeStr);
-    if (!withinOpen && !withinClose) {
-      console.log("⏸ Not within open/close window. Skipping update.");
-      return;
-    }
-  }
+  const now = new Date();
 
-  var mode = _decideMode(now, openStr, closeStr); // "OPEN" or "CLOSE"
-  if (testMode) {
-    console.log("⏩ Test mode active. Mode evaluated as:", mode);
-  }
-
-  // --- Sheet targets
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var historyName = testMode ? "History (TEST)" : "Market History";
-  var header = [
-    "Date","Type_ID","Market_ID","Market_Type",
-    "Day_High","Day_Low",
-    "Open_Buy","Open_Sell",
-    "Close_Buy","Close_Sell"
-  ];
-  var historySheet = getOrCreateSheet(ss, historyName, header);
-
-  // --- Source sheets
-  var pricesSheet = ss.getSheetByName("Market Prices");
-  if (!pricesSheet) throw new Error("Market Prices sheet not found.");
-
-  // --- Pull Type IDs & Markets (reuse your helpers)
-  var maxLog = config["MaxLogIDs"] ? parseInt(config["MaxLogIDs"], 10) : 750;
-  var typeIDs = getTypeIDsFromItemList(maxLog);
-  var marketCombos = getMarketSettings();
-
-  if (!typeIDs.length || !marketCombos.length) {
-    console.log("Nothing to do. typeIDs length =", typeIDs.length, "markets length =", marketCombos.length);
+  const phase = _determinePhase(config, mode, now); // 1-hour trigger windows
+  if (!phase.allowed) {
+    Logger.log("[updateHistory] Skipped: outside Open/Close trigger windows (auto mode).");
     return;
   }
 
-  // --- Build 24h high/low map from Market Prices
-  var cutoff = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-  var priceData = pricesSheet.getDataRange().getValues();
-  priceData.shift(); // drop header: ["type_id","market_id","market_type","max_buy","min_sell","date"]
+  const typeIDs      = getTypeIDsFromItemList(maxLogIDs);
+  const marketCombos = getMarketSettings();
 
-  var hiLoMap = {}; // key -> { dayHigh, dayLow }
-  for (var i = 0; i < priceData.length; i++) {
-    var r = priceData[i];
-    var type_id = r[0];
-    var market_id = r[1];
-    var market_type = r[2];
-    var max_buy = r[3];
-    var min_sell = r[4];
-    var stamp = new Date(r[5]);
+  // ---- 1) Fetch fresh market data into a flat list
+  const marketData = [];
+  marketCombos.forEach(({ market_id, market_type }) => {
+    const prices = getMarketPrices(typeIDs, market_id, market_type);
+    typeIDs.forEach(type_id => {
+      const p = prices[type_id] || {};
+      marketData.push({
+        date: now,
+        type_id,
+        market_id,
+        market_type,
+        min_sell:    p.minSell ?? null,     // sell side price
+        max_buy:     p.maxBuy  ?? null,     // buy side price
+        median_sell: p.medianSell ?? null,
+        median_buy:  p.medianBuy  ?? null
+      });
+    });
+  });
 
-    if (isNaN(stamp) || stamp < cutoff) continue;
+// ---- 2) Upsert today's rows (respect open/close phase)
+  const targetSheetName = testMode ? HISTORY_TEST_SHEET : HISTORY_PROD_SHEET;
+  _ensureHistoryHeader(targetSheetName, [
+    "type_id","market_id","market_type","date",
+    "buy_open","buy_close","sell_open","sell_close",
+    "daily_high","daily_low","median_buy","median_sell"
+  ]);
 
-    var key = _key(todayKey, type_id, market_id, market_type);
+  const targetSheet = ss.getSheetByName(targetSheetName);
+  _upsertHistoryRows(targetSheet, marketData, phase);
 
-    // Day High = max(min_sell), Day Low = min(max_buy)
-    var entry = hiLoMap[key] || { dayHigh: null, dayLow: null };
-    if (typeof min_sell === "number" && !isNaN(min_sell)) {
-      entry.dayHigh = (entry.dayHigh == null) ? min_sell : Math.max(entry.dayHigh, min_sell);
-    }
-    if (typeof max_buy === "number" && !isNaN(max_buy)) {
-      entry.dayLow = (entry.dayLow == null) ? max_buy : Math.min(entry.dayLow, max_buy);
-    }
-    hiLoMap[key] = entry;
-  }
+  // ---- 3) Prune (date is column 4 in History)
+  pruneOldRows(targetSheet, retentionDays, 4);
+}
 
-  // --- Snapshot prices for this moment (Open/Close)
-  // For each market combo, query current prices once per combo for all typeIDs
-  var snapMap = {}; // key -> { openBuy?, openSell?, closeBuy?, closeSell? } (only fills based on mode)
-  for (var m = 0; m < marketCombos.length; m++) {
-    var mc = marketCombos[m];
-    var market_id = mc.market_id;
-    var market_type = mc.market_type;
+/**
+ * Build daily rows with dual-side open/close + daily_high/low.
+ * phase = { isOpenRun, isCloseRun }
+ * Seeds today's state from the PROD sheet so opens persist even when testing.
+ */
+function _buildDailyRowsForHistory(marketData, phase) {
+  if (!marketData || marketData.length === 0) return [];
 
-    var snap = getMarketPrices(typeIDs, market_id,market_type ); // { [type_id]: { minSell, maxBuy } }
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const prodSheet = ss.getSheetByName(HISTORY_PROD_SHEET); // seed from prod
 
-      for (var t = 0; t < typeIDs.length; t++) {
-        var tid = typeIDs[t];
-        var p = snap[tid] || {};
-        var key2 = _key(todayKey, tid, market_id, market_type);
+  const today0 = new Date(marketData[0].date); today0.setHours(0,0,0,0);
 
-        var holder = snapMap[key2] || {};
-        if (mode === "OPEN") {
-          holder.openBuy  = (Number(p.maxBuy)  > 0) ? Number(p.maxBuy)  : null;
-          holder.openSell = (Number(p.minSell) > 0) ? Number(p.minSell) : null;
-        } else {
-          holder.closeBuy  = (Number(p.maxBuy)  > 0) ? Number(p.maxBuy)  : null;
-          holder.closeSell = (Number(p.minSell) > 0) ? Number(p.minSell) : null;
-        }
-        snapMap[key2] = holder;
+  // state[key] = { buy_open, sell_open, high, low }
+  const state = new Map();
+
+  if (prodSheet && prodSheet.getLastRow() > 1) {
+    const headers = prodSheet.getRange(1,1,1,prodSheet.getLastColumn()).getValues()[0];
+    const idx = {}; headers.forEach((h,i)=> idx[h]=i);
+
+    const required = ["type_id","market_id","market_type","date","buy_open","sell_open","daily_high","daily_low"];
+    const haveAll = required.every(h => h in idx);
+
+    if (haveAll) {
+      const data = prodSheet.getRange(2,1,prodSheet.getLastRow()-1,prodSheet.getLastColumn()).getValues();
+      for (let i=0;i<data.length;i++) {
+        const r = data[i];
+        const d = new Date(r[idx["date"]]); d.setHours(0,0,0,0);
+        if (d.getTime() !== today0.getTime()) continue;
+
+        const key = `${r[idx["type_id"]]}|${r[idx["market_id"]]}|${r[idx["market_type"]]}`;
+        const cur = state.get(key) || { buy_open: null, sell_open: null, high: null, low: null };
+
+        const buy_open  = r[idx["buy_open"]];
+        const sell_open = r[idx["sell_open"]];
+        const hi        = r[idx["daily_high"]];
+        const lo        = r[idx["daily_low"]];
+
+        if (typeof buy_open  === "number" && cur.buy_open  == null) cur.buy_open  = buy_open;
+        if (typeof sell_open === "number" && cur.sell_open == null) cur.sell_open = sell_open;
+        if (typeof hi        === "number") cur.high = cur.high == null ? hi : Math.max(cur.high, hi);
+        if (typeof lo        === "number") cur.low  = cur.low  == null ? lo : Math.min(cur.low,  lo);
+
+        state.set(key, cur);
       }
-  }
-
-  // --- Merge into existing history
-  var existing = historySheet.getDataRange().getValues();
-  var histHeader = existing.shift(); // drop header
-
-  // Build index for today's rows
-  var idx = {}; // key -> row array (without header)
-  var others = []; // rows not for today (keep as-is)
-  for (var e = 0; e < existing.length; e++) {
-    var row = existing[e];
-    if (!row || !row.length) continue;
-    var d = row[0];
-    if (d === todayKey) {
-      var k = _key(d, row[1], row[2], row[3]); // Date + type + market id + type
-      idx[k] = row;
-    } else {
-      others.push(row);
     }
   }
 
-  // Construct the set of keys we care about today (union of hiLoMap and snapMap)
-  var keysToday = new Set([].concat(Object.keys(hiLoMap), Object.keys(snapMap)));
+  // Build new snapshot rows + update today's state by phase
+  const out = [];
+  for (const rec of marketData) {
+    const key = `${rec.type_id}|${rec.market_id}|${rec.market_type}`;
+    const cur = state.get(key) || { buy_open: null, sell_open: null, high: null, low: null };
 
-  var mergedToday = [];
-  keysToday.forEach(function(k) {
-    var parts = k.split("|");
-    var date = parts[0];
-    var tid = Number(parts[1]);
-    var mid = Number(parts[2]);
-    var mtype = parts[3];
+    // Always update extremes
+    if (typeof rec.min_sell === "number") cur.high = cur.high == null ? rec.min_sell : Math.max(cur.high, rec.min_sell);
+    if (typeof rec.max_buy  === "number") cur.low  = cur.low  == null ? rec.max_buy  : Math.min(cur.low,  rec.max_buy);
 
-    var base = idx[k] || [
-      date, tid, mid, mtype, // 0..3
-      "", "",                // Day_High, Day_Low
-      "", "",                // Open_Buy, Open_Sell
-      "", ""                 // Close_Buy, Close_Sell
-    ];
-
-    var hl = hiLoMap[k];
-    if (hl) {
-      if (hl.dayHigh != null) base[4] = hl.dayHigh;
-      if (hl.dayLow  != null) base[5] = hl.dayLow;
+    // OPEN phase: set opens if not already set; do NOT set closes
+    if (phase.isOpenRun) {
+      if (cur.buy_open  == null && typeof rec.max_buy  === "number") cur.buy_open  = rec.max_buy;
+      if (cur.sell_open == null && typeof rec.min_sell === "number") cur.sell_open = rec.min_sell;
     }
 
-    var snapv = snapMap[k];
-    if (snapv) {
-      if (snapv.openBuy   !== undefined && snapv.openBuy   !== null) base[6] = snapv.openBuy;
-      if (snapv.openSell  !== undefined && snapv.openSell  !== null) base[7] = snapv.openSell;
-      if (snapv.closeBuy  !== undefined && snapv.closeBuy  !== null) base[8] = snapv.closeBuy;
-      if (snapv.closeSell !== undefined && snapv.closeSell !== null) base[9] = snapv.closeSell;
-    }
+    // CLOSE phase: set closes from this snapshot; do NOT change opens
+    const buy_close  = phase.isCloseRun && (typeof rec.max_buy  === "number") ? rec.max_buy  : null;
+    const sell_close = phase.isCloseRun && (typeof rec.min_sell === "number") ? rec.min_sell : null;
 
-    mergedToday.push(base);
-  });
+    state.set(key, cur);
 
-  // --- Apply retention (drop older than retentionDays)
-  var cutoffDate = new Date();
-  cutoffDate.setDate(cutoffDate.getDate() - retentionDays);
+    out.push([
+      rec.type_id,
+      rec.market_id,
+      rec.market_type,
+      rec.date,
+      cur.buy_open,
+      buy_close,
+      cur.sell_open,
+      sell_close,
+      cur.high,
+      cur.low,
+      rec.median_buy,
+      rec.median_sell
+    ]);
+  }
 
-  var kept = others.filter(function(row) {
-    var d = _parseDateYMD(row[0], tz);
-    return d >= cutoffDate;
-  });
-
-  // Rebuild sheet
-  var out = [histHeader].concat(kept, mergedToday);
-  historySheet.clearContents();
-  historySheet.getRange(1, 1, out.length, histHeader.length).setValues(out);
-
-  console.log("✅ History updated. Mode:", mode,
-              "Today rows:", mergedToday.length,
-              "Kept older rows:", kept.length);
+  return out;
 }
 
-/** ---------------- Helpers ---------------- **/
-function _key(dateStr, type_id, market_id, market_type) {
-  return [dateStr, type_id, market_id, market_type].join("|");
+/** Ensure target history sheet exists with exact headers, limited to header count on create. */
+function _ensureHistoryHeader(sheetName, headers) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  getOrCreateSheet(ss, sheetName, headers);
 }
 
-function _parseDateYMD(ymd, tz) {
-  // ymd: "yyyy-MM-dd"
-  var parts = String(ymd).split("-");
-  var y = parseInt(parts[0], 10), m = parseInt(parts[1], 10) - 1, d = parseInt(parts[2], 10);
-  var dt = new Date(y, m, d, 12, 0, 0); // midday to avoid DST edge
-  return dt;
+/** Batch-append rows to a sheet (no header changes). */
+function appendRowsToSheet(sheetName, rows) {
+  if (!rows || rows.length === 0) return;
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(sheetName);
+  sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
 }
 
-function _isWithinWindow(now, hhmm) {
-  // "HH:mm" => 1-hour window starting at that time (local tz)
-  var hourMin = _parseHHmm(hhmm);
-  var start = new Date(now);
-  start.setHours(hourMin.h, hourMin.m, 0, 0);
-  var end = new Date(start.getTime() + 60 * 60 * 1000);
+/** --------- Time-window helpers (1-hour trigger windows) --------- */
+
+function _inWindow_(now, startH, startM, durationMin) {
+  const start = new Date(now); start.setHours(startH, startM, 0, 0);
+  const end   = new Date(start.getTime() + durationMin * 60 * 1000);
   return now >= start && now < end;
 }
 
-function _decideMode(now, openStr, closeStr) {
-  // If within open window -> OPEN, else if within close -> CLOSE, else choose closest upcoming
-  if (_isWithinWindow(now, openStr)) return "OPEN";
-  if (_isWithinWindow(now, closeStr)) return "CLOSE";
-  // Outside both: pick whichever window is closer in time (used only for test visibility/debug)
-  var o = _parseHHmm(openStr), c = _parseHHmm(closeStr);
-  var nowMin = now.getHours() * 60 + now.getMinutes();
-  var oMin = o.h * 60 + o.m;
-  var cMin = c.h * 60 + c.m;
-  return (Math.abs(nowMin - oMin) <= Math.abs(nowMin - cMin)) ? "OPEN" : "CLOSE";
+/**
+ * Returns { isOpenRun, isCloseRun, allowed }
+ * - mode "auto": allowed only if within the 60m window after OpenTime or CloseTime
+ * - mode "open"/"close": forced, always allowed
+ */
+function _determinePhase(config, mode, now) {
+  if (mode === "open")  return { isOpenRun: true,  isCloseRun: false, allowed: true };
+  if (mode === "close") return { isOpenRun: false, isCloseRun: true,  allowed: true };
+
+  const [oH, oM] = String(config["OpenTime"]  || "11:00").split(":").map(Number);
+  const [cH, cM] = String(config["CloseTime"] || "18:00").split(":").map(Number);
+  const DUR = 60; // minutes
+
+  const inOpen  = _inWindow_(now, oH, oM, DUR);
+  const inClose = _inWindow_(now, cH, cM, DUR);
+
+  if (inOpen)  return { isOpenRun: true,  isCloseRun: false, allowed: true  };
+  if (inClose) return { isOpenRun: false, isCloseRun: true,  allowed: true  };
+  return { isOpenRun: false, isCloseRun: false, allowed: false };
 }
 
-function _parseHHmm(timeLike) {
-  // Accepts Date | number | string with lots of variants
-  if (timeLike instanceof Date) {
-    return { h: timeLike.getHours(), m: timeLike.getMinutes() };
+/**
+ * Upserts today's history rows into target sheet.
+ * - OPEN pass: set buy_open/sell_open (first seen), closes null; update daily_high/low.
+ * - CLOSE pass: set buy_close/sell_close (current snapshot); update daily_high/low.
+ * - If no open row exists at close time, create a single row with open=close.
+ */
+function _upsertHistoryRows(sheet, marketData, phase) {
+  if (!marketData || marketData.length === 0) return;
+
+  // Header index map
+  const headers = sheet.getRange(1,1,1,sheet.getLastColumn()).getValues()[0];
+  const idx = {}; headers.forEach((h,i)=> idx[h]=i+1); // 1-based for setValue convenience
+
+  // Build index of today's existing rows by key
+  const today0 = new Date(marketData[0].date); today0.setHours(0,0,0,0);
+  const lastRow = sheet.getLastRow();
+  const rowMap = new Map(); // key -> rowIndex
+  if (lastRow > 1) {
+    const data = sheet.getRange(2,1,lastRow-1,sheet.getLastColumn()).getValues();
+    for (let r=0; r<data.length; r++) {
+      const row = data[r];
+      const d = new Date(row[idx["date"]-1]); d.setHours(0,0,0,0);
+      if (d.getTime() !== today0.getTime()) continue;
+      const key = _keyForRow(row, idx);
+      rowMap.set(key, r+2); // store 1-based row index in sheet
+    }
   }
 
-  let s = String(timeLike || "").trim().toLowerCase();
-  if (!s) return { h: 0, m: 0 };
+  // For performance, accumulate appends and do one batch append
+  const appends = [];
 
-  // If a range is provided, take the first segment (e.g., "16:00–17:00")
-  // splits on hyphen, en dash, em dash, or the word 'to'
-  s = s.split(/\s*(?:-|–|—|\bto\b)\s*/)[0].trim();
+  for (const rec of marketData) {
+    const key = `${rec.type_id}|${rec.market_id}|${rec.market_type}`;
+    let rowIndex = rowMap.get(key);
 
-  // Try "H[:MM][am|pm]" patterns
-  // Examples: "4pm", "4:30 pm", "16:00", "04:05", "16"
-  const m = s.match(/^(\d{1,2})(?::\s*(\d{1,2}))?\s*(am|pm)?$/i);
-  if (m) {
-    let h = parseInt(m[1], 10);
-    let min = m[2] != null ? parseInt(m[2], 10) : 0;
-    const ap = m[3] ? m[3].toLowerCase() : null;
+    // Compute high/low incrementally
+    const highVal = (typeof rec.min_sell === "number") ? rec.min_sell : null; // sell-side high
+    const lowVal  = (typeof rec.max_buy  === "number") ? rec.max_buy  : null; // buy-side low
 
-    if (isNaN(h)) h = 0;
-    if (isNaN(min)) min = 0;
-
-    // 12-hour clock handling
-    if (ap) {
-      if (ap === 'am') {
-        if (h === 12) h = 0;
-      } else if (ap === 'pm') {
-        if (h !== 12) h = (h + 12) % 24;
+    if (!rowIndex) {
+      // No row yet for today → create one based on phase
+      if (phase.isOpenRun) {
+        appends.push([
+          rec.type_id, rec.market_id, rec.market_type, rec.date,
+          (typeof rec.max_buy  === "number") ? rec.max_buy  : null, // buy_open
+          null,                                                     // buy_close
+          (typeof rec.min_sell === "number") ? rec.min_sell : null, // sell_open
+          null,                                                     // sell_close
+          highVal,                                                  // daily_high
+          lowVal,                                                   // daily_low
+          rec.median_buy, rec.median_sell
+        ]);
+      } else {
+        // Close run but open row missing (edge case): set open=close to current snapshot
+        const buySnap  = (typeof rec.max_buy  === "number") ? rec.max_buy  : null;
+        const sellSnap = (typeof rec.min_sell === "number") ? rec.min_sell : null;
+        appends.push([
+          rec.type_id, rec.market_id, rec.market_type, rec.date,
+          buySnap,                         // buy_open (seed)
+          buySnap,                         // buy_close
+          sellSnap,                        // sell_open (seed)
+          sellSnap,                        // sell_close
+          highVal,                         // daily_high
+          lowVal,                          // daily_low
+          rec.median_buy, rec.median_sell
+        ]);
       }
+      continue; // handle updates after append batch
     }
 
-    // Clamp to sane ranges
-    h = Math.max(0, Math.min(23, h));
-    min = Math.max(0, Math.min(59, min));
-    return { h, m: min };
+    // Row exists for today → update columns in-place
+    // Read existing values needed for high/low carry
+    const existing = sheet.getRange(rowIndex, 1, 1, sheet.getLastColumn()).getValues()[0];
+
+    // Derive new high/low
+    let newHigh = existing[idx["daily_high"]-1];
+    let newLow  = existing[idx["daily_low"]-1];
+    if (typeof highVal === "number") newHigh = (typeof newHigh === "number") ? Math.max(newHigh, highVal) : highVal;
+    if (typeof lowVal  === "number") newLow  = (typeof newLow  === "number") ? Math.min(newLow,  lowVal)  : lowVal;
+
+    // OPEN: set opens only if not set; CLOSE: set closes to snapshot
+    if (phase.isOpenRun) {
+      if (existing[idx["buy_open"]-1]  == null && typeof rec.max_buy  === "number")
+        sheet.getRange(rowIndex, idx["buy_open"]).setValue(rec.max_buy);
+      if (existing[idx["sell_open"]-1] == null && typeof rec.min_sell === "number")
+        sheet.getRange(rowIndex, idx["sell_open"]).setValue(rec.min_sell);
+    } else if (phase.isCloseRun) {
+      if (typeof rec.max_buy  === "number")
+        sheet.getRange(rowIndex, idx["buy_close"]).setValue(rec.max_buy);
+      if (typeof rec.min_sell === "number")
+        sheet.getRange(rowIndex, idx["sell_close"]).setValue(rec.min_sell);
+    }
+
+    // Always refresh highs/lows and medians to latest known
+    sheet.getRange(rowIndex, idx["daily_high"]).setValue(newHigh);
+    sheet.getRange(rowIndex, idx["daily_low"]).setValue(newLow);
+    sheet.getRange(rowIndex, idx["median_buy"]).setValue(rec.median_buy);
+    sheet.getRange(rowIndex, idx["median_sell"]).setValue(rec.median_sell);
   }
 
-  // Last resort: find first HH:MM anywhere in the string
-  const m2 = s.match(/(\d{1,2})\s*:\s*(\d{1,2})/);
-  if (m2) {
-    let h = parseInt(m2[1], 10);
-    let min = parseInt(m2[2], 10);
-    if (isNaN(h)) h = 0;
-    if (isNaN(min)) min = 0;
-    h = Math.max(0, Math.min(23, h));
-    min = Math.max(0, Math.min(59, min));
-    return { h, m: min };
+  // Perform one batch append if needed, then update rowMap for those new rows (not strictly necessary today)
+  if (appends.length > 0) {
+    const startRow = sheet.getLastRow() + 1;
+    sheet.getRange(startRow, 1, appends.length, headers.length).setValues(appends);
+    // (Optionally populate rowMap for appended rows if you upsert multiple passes in one invocation)
   }
+}
 
-  // If nothing matches but there's a leading integer, treat it as hour
-  const m3 = s.match(/^(\d{1,2})/);
-  if (m3) {
-    let h = parseInt(m3[1], 10);
-    if (isNaN(h)) h = 0;
-    h = Math.max(0, Math.min(23, h));
-    return { h, m: 0 };
-  }
-
-  // Fallback
-  return { h: 0, m: 0 };
+/** Build the row key from an existing row using header indices. */
+function _keyForRow(row, idx) {
+  return `${row[idx["type_id"]-1]}|${row[idx["market_id"]-1]}|${row[idx["market_type"]-1]}`;
 }

@@ -47,26 +47,31 @@ function getCurrentMarketPrices() {
 }
 
 
-function pruneOldRows(sheet, retentionDays) {
+/**
+ * Prunes rows older than `retentionDays`, based on the given date column.
+ * Defaults to column 1 if not specified.
+ * 
+ * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet
+ * @param {number} retentionDays
+ * @param {number} [dateCol=1] - 1-based index of the date column
+ */
+function pruneOldRows(sheet, retentionDays, dateCol = 1) {
   if (!retentionDays) return;
 
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - retentionDays);
 
   const lastRow = sheet.getLastRow();
-  if (lastRow < 2) return; // nothing to prune (header only)
+  if (lastRow < 2) return; // nothing but headers
 
-  const timestamps = sheet.getRange(2, 1, lastRow - 1, 1).getValues();
+  const timestamps = sheet.getRange(2, dateCol, lastRow - 1, 1).getValues();
 
   for (let i = timestamps.length - 1; i >= 0; i--) {
     const ts = timestamps[i][0];
     if (ts instanceof Date && ts < cutoff) {
-      sheet.deleteRow(i + 2); // +2 offset for 1-based + header row
+      sheet.deleteRow(i + 2); // offset for header row
     }
   }
-
-  // NOTE: Shared between Market Prices and Market History.
-  // updateHistory() will also call this with HistoryRetentionDays.
 }
 
 
