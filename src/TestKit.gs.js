@@ -1,0 +1,289 @@
+/** ================== Quick Wins Helpers ================== **/
+
+function sanityCheck() {
+  const needed = [
+    ["Market Prices", ["type_id","market_id","market_type","max_buy","min_sell","date"]],
+    ["Market History", ["type_id","market_id","market_type","date","buy_open","buy_close","sell_open","sell_close","daily_high","daily_low","median_buy","median_sell"]],
+  ];
+  const ss = SpreadsheetApp.getActive();
+  for (const [name, headers] of needed) {
+    const sh = ss.getSheetByName(name);
+    if (!sh) throw new Error(`Missing sheet: ${name}`);
+    const got = sh.getRange(1,1,1,headers.length).getValues()[0];
+    if (got.join("|") !== headers.join("|")) {
+      throw new Error(`Header mismatch on ${name}. Expected: ${headers.join(", ")}`);
+    }
+  }
+  return true;
+}
+
+function readUsedRange(sheet) {
+  const lastRow = Math.max(1, sheet.getLastRow());
+  const lastCol = Math.max(1, sheet.getLastColumn());
+  return sheet.getRange(1, 1, lastRow, lastCol).getValues();
+}
+
+// Standalone timing helper (works with or without Logger)
+function timeIt(label, fn) {
+  const t0 = Date.now();
+  const out = fn();
+  const ms = Date.now() - t0;
+  try {
+    // If Logger is available, mirror to it
+    if (typeof Log !== "undefined") Log.for("timeIt").info(label, { ms });
+  } catch (_){}
+  Logger.log(`${label}: ${ms} ms`);
+  return out;
+}
+
+function safeAppendRows(sheet, rows) {
+  if (!rows || !rows.length) return;
+  const start = sheet.getLastRow() + 1;
+  sheet.getRange(start, 1, rows.length, rows[0].length).setValues(rows);
+}
+
+const CACHE_NS = "EVE_TRACKER";
+function cacheGetAll(keys){
+  const c = CacheService.getScriptCache();
+  const kv = c.getAll(keys.map(k=>`${CACHE_NS}:${k}`));
+  const out = {};
+  keys.forEach(k => { out[k] = kv[`${CACHE_NS}:${k}`] || null; });
+  return out;
+}
+function cacheSetAll(obj, seconds){
+  const c = CacheService.getScriptCache();
+  const kv = {};
+  Object.keys(obj).forEach(k => kv[`${CACHE_NS}:${k}`] = String(obj[k]));
+  c.putAll(kv, seconds || 300);
+}
+
+function isTestMode(){ 
+  return PropertiesService.getScriptProperties().getProperty("TEST_MODE")==="true";
+}
+function enableTestMode(){ PropertiesService.getScriptProperties().setProperty("TEST_MODE","true"); }
+function disableTestMode(){ PropertiesService.getScriptProperties().setProperty("TEST_MODE","false"); }
+
+function protectHeaders(sheetName){
+  const sh = SpreadsheetApp.getActive().getSheetByName(sheetName);
+  if (!sh) return;
+  const p = sh.protect().setDescription(`${sheetName} headers`);
+  p.setUnprotectedRanges([sh.getRange(1,1,1,sh.getLastColumn())]);
+}
+
+function logTriggers(){
+  ScriptApp.getProjectTriggers().forEach(t=>{
+    Logger.log(`${t.getHandlerFunction()} — ${t.getEventType()}`);
+  });
+}
+
+/** ================== Test Harness Switches ================== **/
+
+function runHistoryTest() {
+  const useLogger = (typeof Log !== "undefined");
+  if (useLogger) return Log.for("Harness").time("updateHistoryTest", () => updateHistoryTest());
+  return timeIt("updateHistoryTest", () => updateHistoryTest());
+}
+function runHistoryProd() {
+  const useLogger = (typeof Log !== "undefined");
+  if (useLogger) return Log.for("Harness").time("updateHistory", () => updateHistory());
+  return timeIt("updateHistory", () => updateHistory());
+}
+function runTestModeOn(){ enableTestMode(); }
+function runTestModeOff(){ disableTestMode(); }
+
+/** ================== Table Integrity Check ================== **/
+
+function TableIntegrity_Check() {
+  const log = (typeof Log !== "undefined") ? Log.for("Integrity") : null;
+
+  const EXPECT_MP = ["type_id","market_id","market_type","max_buy","min_sell","date"];
+  const EXPECT_MH = ["type_id","market_id","market_type","date","buy_open","buy_close","sell_open","sell_close","daily_high","daily_low","median_buy","median_sell"];
+
+  const ss = SpreadsheetApp.getActive();
+  const shMP = ss.getSheetByName("Market Prices");
+  const shMH = ss.getSheetByName("Market History");
+
+  let ok = true;
+
+  ok = checkSheet(shMP, "Market Prices", EXPECT_MP, validateRow_MP, log) && ok;
+  ok = checkSheet(shMH, "Market History", EXPECT_MH, validateRow_MH, log) && ok;
+
+  // Cross-table sanity
+  try {
+    const keysMP = collectKeys(shMP, EXPECT_MP);
+    const keysMH = collectKeys(shMH, EXPECT_MH);
+    let missingInMP = 0;
+    for (const k of keysMH) if (!keysMP.has(k)) missingInMP++;
+    if (missingInMP > 0) {
+      log ? log.warn("Some history keys aren’t present in Market Prices", { missing_count: missingInMP })
+          : Logger.log(`[WARN] Some history keys aren’t present in Market Prices: ${missingInMP}`);
+    } else {
+      log ? log.info("Cross-table key check OK (history keys present in prices).")
+          : Logger.log("Cross-table key check OK (history keys present in prices).");
+    }
+  } catch (e) {
+    log ? log.warn("Cross-table key check skipped due to error", { err: String(e) })
+        : Logger.log(`[WARN] Cross-table key check skipped: ${e}`);
+  }
+
+  if (ok) { log ? log.info("TableIntegrity_Check PASS") : Logger.log("TableIntegrity_Check PASS"); }
+  else    { log ? log.error("TableIntegrity_Check FAIL (see above logs)") : Logger.log("TableIntegrity_Check FAIL"); }
+
+  return ok;
+}
+
+function checkSheet(sheet, name, expectedHeaders, rowValidator, log) {
+  if (!sheet) {
+    log ? log.error("Missing sheet", { sheet: name }) : Logger.log(`[ERROR] Missing sheet: ${name}`);
+    return false;
+  }
+  const header = sheet.getRange(1,1,1,expectedHeaders.length).getValues()[0];
+  const headerMatch = header.join("|") === expectedHeaders.join("|");
+  if (!headerMatch) {
+    log ? log.error("Header mismatch", { sheet: name, expected: expectedHeaders, got: header })
+        : Logger.log(`[ERROR] Header mismatch on ${name}`);
+    return false;
+  }
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) {
+    log ? log.info("No data rows to validate", { sheet: name })
+        : Logger.log(`[INFO] No data rows to validate: ${name}`);
+    return true;
+  }
+  const data = sheet.getRange(2,1,lastRow-1,expectedHeaders.length).getValues();
+
+  let errors = 0, warns = 0;
+  for (let i=0;i<data.length;i++){
+    const row = data[i];
+    const res = rowValidator(row);
+    if (!res) continue;
+    if (res.error && res.error.length){
+      errors += res.error.length;
+      res.error.forEach(msg => log ? log.error(msg, { sheet: name, row: i+2, row_preview: safePreview(row) })
+                                   : Logger.log(`[ERROR] ${name} row ${i+2}: ${msg}`));
+    }
+    if (res.warn && res.warn.length){
+      warns += res.warn.length;
+      res.warn.forEach(msg => log ? log.warn(msg, { sheet: name, row: i+2, row_preview: safePreview(row) })
+                                  : Logger.log(`[WARN] ${name} row ${i+2}: ${msg}`));
+    }
+  }
+
+  if (errors === 0 && warns === 0) {
+    log ? log.info("Sheet OK", { sheet: name, rows_checked: data.length })
+        : Logger.log(`[INFO] Sheet OK: ${name}, rows: ${data.length}`);
+    return true;
+  } else if (errors === 0) {
+    log ? log.info("Sheet OK with warnings", { sheet: name, rows_checked: data.length, warns })
+        : Logger.log(`[INFO] Sheet OK with warnings: ${name}, warns: ${warns}`);
+    return true;
+  } else {
+    log ? log.error("Sheet FAILED", { sheet: name, rows_checked: data.length, errors, warns })
+        : Logger.log(`[ERROR] Sheet FAILED: ${name}, errors: ${errors}, warns: ${warns}`);
+    return false;
+  }
+}
+
+/** ---------- Validators ---------- **/
+function validateRow_MP(row){
+  const errs = [], warns = [];
+  const [type_id, market_id, market_type, max_buy, min_sell, dt] = row;
+
+  if (!isPositiveInt(type_id)) errs.push("type_id must be positive integer");
+  if (!isPositiveInt(market_id)) errs.push("market_id must be positive integer");
+
+  const mt = String(market_type || "").toLowerCase();
+  if (!["region","system","station"].includes(mt)) errs.push("market_type must be region|system|station");
+
+  if (!isNumberish(max_buy)) errs.push("max_buy must be numeric");
+  if (!isNumberish(min_sell)) errs.push("min_sell must be numeric");
+
+  if (isNumberish(max_buy) && isNumberish(min_sell) && Number(max_buy) > Number(min_sell)) {
+    warns.push("max_buy > min_sell (spread inverted?)");
+  }
+
+  if (!isValidDate(dt)) errs.push("date must be a valid date");
+  return { error: errs, warn: warns };
+}
+
+function validateRow_MH(row){
+  const errs = [], warns = [];
+  const [type_id, market_id, market_type, dt, bo, bc, so, sc, hi, lo, mb, ms] = row;
+
+  if (!isPositiveInt(type_id)) errs.push("type_id must be positive integer");
+  if (!isPositiveInt(market_id)) errs.push("market_id must be positive integer");
+  const mt = String(market_type || "").toLowerCase();
+  if (!["region","system","station"].includes(mt)) errs.push("market_type must be region|system|station");
+
+  if (!isValidDate(dt)) errs.push("date must be a valid date");
+
+  ["buy_open","buy_close","sell_open","sell_close","daily_high","daily_low","median_buy","median_sell"]
+    .forEach((field, idx) => {
+      const v = row[4 + idx];
+      if (!isBlank(v) && !isNumberish(v)) errs.push(`${field} must be numeric or blank`);
+    });
+
+  if (isNumberish(hi) && isNumberish(lo) && Number(hi) < Number(lo)) errs.push("daily_high < daily_low");
+
+  const values = [bo, bc, so, sc, mb, ms].filter(isNumberish).map(Number);
+  if (isNumberish(hi) && isNumberish(lo) && values.length) {
+    const outOfRange = values.some(v => v > Number(hi) || v < Number(lo));
+    if (outOfRange) warns.push("one or more price fields outside [daily_low, daily_high]");
+  }
+
+  return { error: errs, warn: warns };
+}
+
+/** ---------- Cross-table key collection ---------- **/
+function collectKeys(sheet, expectedHeaders){
+  const lastRow = sheet.getLastRow();
+  const set = new Set();
+  if (lastRow <= 1) return set;
+  const data = sheet.getRange(2,1,lastRow-1,expectedHeaders.length).getValues();
+  const idxType = expectedHeaders.indexOf("type_id");
+  const idxMarket = expectedHeaders.indexOf("market_id");
+  const idxTypeStr = expectedHeaders.indexOf("market_type");
+  for (const r of data) {
+    const k = `${r[idxType]}|${r[idxMarket]}|${String(r[idxTypeStr] || "").toLowerCase()}`;
+    set.add(k);
+  }
+  return set;
+}
+
+/** ---------- Small utilities ---------- **/
+function isNumberish(v){ return v !== "" && v !== null && !isNaN(Number(v)); }
+function isPositiveInt(v){ return isNumberish(v) && Number.isInteger(Number(v)) && Number(v) > 0; }
+function isBlank(v){ return v === "" || v === null; }
+function isValidDate(v){
+  if (Object.prototype.toString.call(v) === "[object Date]" && !isNaN(v)) return true;
+  const t = (typeof v === "string") ? Date.parse(v) : NaN;
+  return !isNaN(t);
+}
+function safePreview(row){ return row.slice(0, 6); }
+
+/** ================== Quick Start ================== **/
+function QuickWins_SmokeTest() {
+  Logger.log("Running QuickWins_SmokeTest…");
+  sanityCheck();
+
+  const ss = SpreadsheetApp.getActive();
+  const mp = ss.getSheetByName("Market Prices");
+  const rows = readUsedRange(mp);
+  Logger.log(`Market Prices rows read: ${rows.length}`);
+
+  timeIt("NoOp-100k", () => { for (let i=0;i<100000;i++){} });
+
+  cacheSetAll({ foo: "123", bar: "xyz" }, 60);
+  const got = cacheGetAll(["foo","bar","baz"]);
+  Logger.log(`Cache foo=${got.foo} bar=${got.bar} baz=${got.baz}`);
+
+  protectHeaders("Market Prices");
+  Logger.log("QuickWins_SmokeTest completed.");
+}
+
+function TableIntegrity_Run() {
+  // Optional: bump verbosity temporarily
+  if (typeof setLogLevel === "function") setLogLevel("INFO");
+  return TableIntegrity_Check();
+}
