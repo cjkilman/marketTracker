@@ -206,7 +206,8 @@ function appendRowsToSheet(sheetName, rows) {
 /** --------- Time-window helpers (1-hour trigger windows) --------- */
 
 function _inWindow_(now, startH, startM, durationMin) {
-  const start = new Date(now); start.setHours(startH, startM, 0, 0);
+  const start = new Date(now);
+   start.setHours(startH, startM, 0, 0);
   const end   = new Date(start.getTime() + durationMin * 60 * 1000);
   return now >= start && now < end;
 }
@@ -220,8 +221,8 @@ function _determinePhase(config, mode, now) {
   if (mode === "open")  return { isOpenRun: true,  isCloseRun: false, allowed: true };
   if (mode === "close") return { isOpenRun: false, isCloseRun: true,  allowed: true };
 
-  const [oH, oM] = String(config["OpenTime"]  || "11:00").split(":").map(Number);
-  const [cH, cM] = String(config["CloseTime"] || "18:00").split(":").map(Number);
+  const [oH, oM] = _toHM(config.OpenTime  || "11:00");
+  const [cH, cM] = _toHM(config.CloseTime || "18:00");
   const DUR = 60; // minutes
 
   const inOpen  = _inWindow_(now, oH, oM, DUR);

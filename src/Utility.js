@@ -50,9 +50,43 @@ function getOrCreateSheet(ss, name, headers) {
 }
 
 /**
- * Basic logging utility for informational messages.
- * @param {string} message - The message to log.
+ * Parse a Config time cell into [hour, minute] in project timezone.
+ * Handles strings ("11:00", "6:30 PM"), Dates, or numeric fractions (Google Sheets TIME).
  */
-function logInfo(message) {
-  Logger.log("[INFO] " + message);
+function _toHM(val) {
+  
+  const tz = _projectTZ();
+
+  // Case: Date object (common when cell is time-formatted)
+  if (Object.prototype.toString.call(val) === "[object Date]" && !isNaN(val)) {
+    const h = Number(Utilities.formatDate(val, tz, "H"));
+    const m = Number(Utilities.formatDate(val, tz, "m"));
+    return [h, m];
+  }
+
+  // Case: Number (fraction of a day)
+  if (typeof val === "number") {
+    let total = Math.round(val * 1440);             // minutes in a day
+    total = ((total % 1440) + 1440) % 1440;         // wrap safely
+    return [Math.floor(total / 60), total % 60];
+  }
+
+  // Case: String "HH:mm" or "h:mm AM/PM"
+  const s = String(val || "").trim();
+  const m = s.match(/^(\d{1,2}):(\d{2})(?:\s*(AM|PM))?$/i);
+  if (m) {
+    let h = Number(m[1]), mm = Number(m[2]);
+    const ap = (m[3] || "").toUpperCase();
+    if (ap === "AM" && h === 12) h = 0;
+    if (ap === "PM" && h < 12) h += 12;
+    return [h, mm];
+  }
+
+  throw new Error(`Unrecognized time value in Config: ${val}`);
+}
+
+function _projectTZ() {
+  return (typeof Session !== 'undefined' && Session.getScriptTimeZone)
+    ? Session.getScriptTimeZone()
+    : 'Etc/UTC';
 }

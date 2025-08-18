@@ -287,3 +287,65 @@ function TableIntegrity_Run() {
   if (typeof setLogLevel === "function") setLogLevel("INFO");
   return TableIntegrity_Check();
 }
+
+function Debug_Gatekeeper() {
+  const cfg = getConfig();             // your config fetch
+  const tz  = _projectTZ();
+  const now = new Date();
+
+  const [oH,oM] = _toHM(cfg.OpenTime);
+  const [cH,cM] = _toHM(cfg.CloseTime);
+  const DUR = 60; // minutes window for open/close
+
+  // window membership
+  const inOpen  = _inWindow_(now, oH, oM, DUR);
+  const inClose = _inWindow_(now, cH, cM, DUR);
+
+  // pretty prints
+  const openStart = _fmt(tz, _atHM(now, oH, oM));
+  const openEnd   = _fmt(tz, _addMin(_atHM(now, oH, oM), DUR));
+  const closeStart= _fmt(tz, _atHM(now, cH, cM));
+  const closeEnd  = _fmt(tz, _addMin(_atHM(now, cH, cM), DUR));
+
+  Logger.log("=== Gatekeeper Sanity ===");
+  Logger.log(`Now:        ${_fmt(tz, now)} (${tz})`);
+  Logger.log(`Open win :  ${openStart} → ${openEnd}  (inside=${inOpen})`);
+  Logger.log(`Close win:  ${closeStart} → ${closeEnd} (inside=${inClose})`);
+  Logger.log(`Status  :   ${inOpen ? "INSIDE OPEN" : inClose ? "INSIDE CLOSE" : "OUTSIDE BOTH"}`);
+
+  const cases = [
+    { mode:"auto",  expect: (inOpen || inClose) },
+    { mode:"open",  expect: true  },
+    { mode:"close", expect: true  }
+  ];
+
+  cases.forEach(({mode, expect}) => {
+    const r = _determinePhase(cfg, mode, now);
+    const pass = (r.allowed === expect);
+    Logger.log(
+      `Mode=${mode.padEnd(5)} | allowed=${r.allowed} | isOpen=${r.isOpenRun} | isClose=${r.isCloseRun} | EXPECT=${expect} | ${pass?"PASS":"FAIL"}`
+    );
+  });
+}
+
+/* ---------- tiny helpers ---------- */
+function _fmt(tz, d){ return Utilities.formatDate(d, tz, "yyyy-MM-dd HH:mm"); }
+function _atHM(base, h, m){ const d=new Date(base); d.setHours(h,m,0,0); return d; }
+function _addMin(d, min){ return new Date(d.getTime() + min*60000); }
+
+function Debug_Gatekeeper_At(isoLike) {
+  const tz  = _projectTZ();
+  const mock = new Date(isoLike); // e.g., "2025-08-18T11:15:00"
+  Logger.log(`--- Simulating now=${_fmt(tz, mock)} ---`);
+  const cfg = getConfig();
+  const [oH,oM] = _toHM(cfg.OpenTime);
+  const [cH,cM] = _toHM(cfg.CloseTime);
+  const DUR=60;
+  const inOpen  = _inWindow_(mock, oH, oM, DUR);
+  const inClose = _inWindow_(mock, cH, cM, DUR);
+  Logger.log(`Inside OPEN=${inOpen}, Inside CLOSE=${inClose}`);
+  ["auto","open","close"].forEach(mode=>{
+    const r = _determinePhase(cfg, mode, mock);
+    Logger.log(`Mode=${mode} → allowed=${r.allowed}, isOpen=${r.isOpenRun}, isClose=${r.isCloseRun}`);
+  });
+}
