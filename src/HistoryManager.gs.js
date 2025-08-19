@@ -17,6 +17,7 @@ const HISTORY_TEST_SHEET = "History (TEST)";
  * Uses "auto" mode (respects open/close time windows).
  */
 function updateHistory() {
+  if (AbortCloseIfNoHistoryYet()) return; 
   return _updateHistoryCore({
     testMode: false,
     mode: "auto"
@@ -344,4 +345,77 @@ function _upsertHistoryRows(sheet, marketData, phase) {
 /** Build the row key from an existing row using header indices. */
 function _keyForRow(row, idx) {
   return `${row[idx["type_id"]-1]}|${row[idx["market_id"]-1]}|${row[idx["market_type"]-1]}`;
+}
+
+// Call near the top of updateHistory()
+function AbortCloseIfNoHistoryYet() {
+  const cfg = getConfig();
+  const phase = _determinePhase(cfg, "auto", new Date());
+  if (!phase.allowed || !phase.isCloseRun) return false; // only care during close window
+
+  const histName = cfg.HistorySheetName || "Market History";
+  const sh = SpreadsheetApp.getActive().getSheetByName(histName);
+  if (!sh) {
+    Logger.log(`[ABORT] Close run aborted: "${histName}" does not exist (no open-run creation yet).`);
+    return true; // signal caller to abort
+  }
+  return false;
+}
+
+// Uses your Config + Utility._toHM and stays in Project TZ
+function projectTZ_() {
+  const c = getConfig();
+  return c["TZ.Project"] || SpreadsheetApp.getActive().getSpreadsheetTimeZone();
+}
+
+// Build today's window [OpenTime .. now] in Project TZ
+function projectDayWindowNow_() {
+  const c = getConfig();
+  const tz = projectTZ_();
+
+  const now = new Date();
+  const y  = Number(Utilities.formatDate(now, tz, "yyyy"));
+  const M  = Number(Utilities.formatDate(now, tz, "MM")) - 1;
+  const d  = Number(Utilities.formatDate(now, tz, "dd"));
+
+  const { h: oH, m: oM } = _toHM(c["OpenTime"] || "11:00");  // <-- your Utility.js
+  const start = new Date(y, M, d, oH, oM, 0, 0);              // Date in Project TZ
+
+  return { start, endNow: now };
+}
+
+// Build today's full window [OpenTime .. CloseTime] in Project TZ
+function projectDayWindowFull_() {
+  const c = getConfig();
+  const tz = projectTZ_();
+
+  const now = new Date();
+  const y  = Number(Utilities.formatDate(now, tz, "yyyy"));
+  const M  = Number(Utilities.formatDate(now, tz, "MM")) - 1;
+  const d  = Number(Utilities.formatDate(now, tz, "dd"));
+
+  const { h: oH, m: oM } = _toHM(c["OpenTime"]  || "11:00");
+  const { h: cH, m: cM } = _toHM(c["CloseTime"] || "18:00");
+
+  const start  = new Date(y, M, d, oH, oM, 0, 0);
+  const endDay = new Date(y, M, d, cH, cM, 59, 999);
+
+  return { start, endDay };
+}
+
+// Date-only (00:00) in Project TZ for one-row-per-day keys
+function dateOnlyProjectTZ_(dt) {
+  const tz = projectTZ_();
+  const y  = Number(Utilities.formatDate(dt, tz, "yyyy"));
+  const M  = Number(Utilities.formatDate(dt, tz, "MM")) - 1;
+  const d  = Number(Utilities.formatDate(dt, tz, "dd"));
+  return new Date(y, M, d); // midnight in Project TZ
+}
+
+function isSameProjectDay_(a, bDateOnly) {
+  if (!(a instanceof Date) || !(bDateOnly instanceof Date)) return false;
+  const tz = projectTZ_();
+  const A = Utilities.formatDate(a,       tz, "yyyy-MM-dd");
+  const B = Utilities.formatDate(bDateOnly, tz, "yyyy-MM-dd");
+  return A === B;
 }
