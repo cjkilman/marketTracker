@@ -1,283 +1,287 @@
-function getCurrentMarketPrices() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const config = getConfig();
-  const maxLogIDs = config["MaxLogIDs"] ? parseInt(config["MaxLogIDs"], 10) : 750;
-
-  // Read the typeIDs list once
-  const typeIDs = getTypeIDsFromItemList(maxLogIDs);
-
-  // Read market settings once
-  const marketCombos = getMarketSettings();
-
-  // Ensure sheet exists and preserve headers
-  const sheetName = "Market Prices";
-  const headers = ["date", "market_id", "market_type", "type_id", "min_sell", "max_buy", "median_sell", "median_buy"];
-  const sheet = getOrCreateSheet(ss, sheetName, headers);
-
-  // Collect rows
-  const rows = [];
-  marketCombos.forEach(({ market_id, market_type }) => {
-    const prices = getMarketPrices(typeIDs, market_id, market_type);
-
-    typeIDs.forEach(type_id => {
-      const entry = prices[type_id];
-      rows.push([
-        new Date(),
-        market_id,
-        market_type,
-        type_id,
-        entry.minSell,
-        entry.maxBuy,
-        entry.medianSell,
-        entry.medianBuy
-      ]);
-    });
-  });
-
-  // Append under headers
-  if (rows.length > 0) {
-    sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
-  }
-
-  // Prune old rows (configurable retention days)
-  pruneOldRows(sheet, config["PriceRetentionDays"]);
-
-  // NOTE: HistoryManager/updateHistory will also use pruneOldRows()
-  // with config["HistoryRetentionDays"] — hook that in when we build it.
-}
-
-function testPrune()
-{
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    // Ensure sheet exists and preserve headers
-  const sheetName = "Market Prices";
-  const headers = ["date", "market_id", "market_type", "type_id", "min_sell", "max_buy", "median_sell", "median_buy"];
-  const sheet = getOrCreateSheet(ss, sheetName, headers);
-  pruneOldRows(sheet,1)
-}
-/**
- * Prunes rows older than `retentionDays`, based on the given date column.
- * Defaults to column 1 if not specified.
- * 
- * @param {GoogleAppsScript.Spreadsheet.Sheet} sheet
- * @param {number} retentionDays
- * @param {number} [dateCol=1] - 1-based index of the date column
+/** MarketFetcher.gs — Prices runner with Light/Heavy Prune + Lock
+ *  Assumes sheet "Market Prices" exists with header in row 1:
+ *  ["date","market_id","market_type","type_id","min_sell","max_buy","median_sell","median_buy"]
+ *  Depends on:
+ *    - getConfig(), getMarketSettings(), getTypeIDsFromItemList(), postFetch()
+ *    - LoggerEx
  */
-function pruneOldRows(sheet, retentionDays, dateCol = 1) {
-  if (!retentionDays) return;
 
-  const cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() - retentionDays);
+/* ---------------------- Config helpers ---------------------- */
 
-  const lastRow = sheet.getLastRow();
-  if (lastRow < 2) return; // nothing but headers
-
-  const timestamps = sheet.getRange(2, dateCol, lastRow - 1, 1).getValues().flat();
-
-  for (let i = timestamps.length - 1; i >= 0; i--) {
-    const ts = timestamps[i];
-    var meep = ts instanceof Date && ts < cutoff;
-    if (ts instanceof Date && ts < cutoff) {
-      sheet.deleteRow(i + 2); // offset for header row
-    }
-  }
+function mtConfig() {
+  const c = (typeof getConfig === 'function') ? (getConfig() || {}) : {};
+  const num = (v, d) => (v == null || isNaN(Number(v))) ? d : Number(v);
+  const str = (v, d) => (v == null || v === '') ? d : String(v);
+  return {
+    sheets: {
+      prices:  str(c["MarketPricesSheet"], "Market Prices"),
+      history: str(c["HistorySheetName"],  "Market History"),
+    },
+    retentionDays: {
+      prices:  num(c["PriceRetentionDays"],   1),
+      history: num(c["HistoryRetentionDays"], 365),
+    },
+    maxRows: {
+      prices:  num(c["PricesMaxRows"],  100000),
+      history: num(c["HistoryMaxRows"], 200000),
+    },
+    chunkSize:     num(c["ChunkSize"],     75),
+    maxLogIDs:     num(c["MaxLogIDs"],    750),
+    bucketMinutes: num(c["BucketMinutes"], 20),
+    // optional:
+    daysForCandlestick: num(c["DaysForCandlestick"], 30),
+    openTime:           str(c["OpenTime"],  "11:00"),
+    closeTime:          str(c["CloseTime"], "18:00"),
+    rebuildAlways:      String(c["RebuildAlways"] || "FALSE").toUpperCase() === "TRUE",
+  };
 }
+function getBucketMinutes() { return mtConfig().bucketMinutes; }
 
+/* ---------------------- Utilities ---------------------- */
 
-// Sanitizer helper
 function sanitizeIDs(ids) {
-  return [...new Set(
-    ids
-      .map(v => Number(v))
-      .filter(v => !isNaN(v) && v > 0)
-  )];
+  return [...new Set(ids.map(v => Number(v)).filter(v => !isNaN(v) && v > 0))];
 }
-
-
 function getMarketSettings() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName("Market Settings");
   if (!sheet) throw new Error("Market Settings sheet not found.");
-
   const types = ["station", "system", "region"];
   const combos = [];
-
-  // Loop each column separately
-  types.forEach((type, index) => {
-    const col = 4 + index; // D, E, F
-    const raw = sheet.getRange(3, col, sheet.getLastRow() - 2, 1)
-      .getValues()
-      .flat();
-
-    const clean = sanitizeIDs(raw);
-    clean.forEach(id => combos.push({ market_id: id, market_type: type }));
+  types.forEach((type, i) => {
+    const col = 4 + i; // D,E,F
+    const raw = sheet.getRange(3, col, Math.max(0, sheet.getLastRow() - 2), 1).getValues().flat();
+    sanitizeIDs(raw).forEach(id => combos.push({ market_id: id, market_type: type }));
   });
-
   return combos;
 }
-
-
 function getTypeIDsFromItemList(limit) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName("Item List Back End");
   if (!sheet) throw new Error("Item List Back End sheet not found.");
-
-  let ids = sheet.getRange("A2:A" + sheet.getLastRow())
-    .getValues()
-    .flat();
-
+  let ids = sheet.getRange("A2:A" + sheet.getLastRow()).getValues().flat();
   ids = sanitizeIDs(ids);
-
   if (limit && ids.length > limit) ids = ids.slice(0, limit);
   return ids;
 }
-
-
-function getAllMarketAssignments(limit) {
-  const typeIDs = getTypeIDsFromItemList(limit);
-  const marketCombos = getMarketSettings();
-
-  return marketCombos.map(({ market_id, market_type }) => ({
-    market_id,
-    market_type,
-    type_ids: typeIDs
-  }));
+function getOrCreateSheet(ss, name, headers) {
+  let sh = ss.getSheetByName(name);
+  if (!sh) {
+    sh = ss.insertSheet(name);
+    sh.getRange(1,1,1,headers.length).setValues([headers]);
+    sh.setFrozenRows(1);
+  } else if (sh.getLastRow() === 0) {
+    sh.getRange(1,1,1,headers.length).setValues([headers]);
+    sh.setFrozenRows(1);
+  }
+  return sh;
 }
 
 
-/**
- * Fetches market prices and ensures numeric values are math-friendly.
- * Non-numeric values become null instead of "".
- */
+/** Map Fuz result into math-friendly numbers (null for non-numeric) */
 function getMarketPrices(type_ids, market_id, market_type) {
-  const data = postFetch(type_ids, market_id, market_type); // Using existing Fuz API function
-  const result = {};
-
+  const data = postFetch(type_ids, market_id, market_type);
+  const out = {};
   type_ids.forEach(id => {
-    const entry = data[id] || {};
-
-    const minSell    = parseFloat(entry.sell?.min)    > 0 ? parseFloat(entry.sell.min)    : null;
-    const maxBuy     = parseFloat(entry.buy?.max)     > 0 ? parseFloat(entry.buy.max)     : null;
-    const medianSell = parseFloat(entry.sell?.median) > 0 ? parseFloat(entry.sell.median) : null;
-    const medianBuy  = parseFloat(entry.buy?.median)  > 0 ? parseFloat(entry.buy.median)  : null;
-
-    result[id] = { minSell, maxBuy, medianSell, medianBuy };
+    const e = data[id] || {};
+    const minSell    = parseFloat(e.sell?.min)    > 0 ? parseFloat(e.sell.min)    : null;
+    const maxBuy     = parseFloat(e.buy?.max)     > 0 ? parseFloat(e.buy.max)     : null;
+    const medianSell = parseFloat(e.sell?.median) > 0 ? parseFloat(e.sell.median) : null;
+    const medianBuy  = parseFloat(e.buy?.median)  > 0 ? parseFloat(e.buy.median)  : null;
+    out[id] = { minSell, maxBuy, medianSell, medianBuy };
   });
-
-  return result;
+  return out;
 }
 
+/* ---------------------- Entry: record prices (baseline) ---------------------- */
 
-/**
- * Test consumer for getAllMarketAssignments().
- * Creates/clears a sheet named "Market Assignments Test"
- * and writes out all assignments.
- */
-function testConsumerAssignments() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheetName = "Market Assignments Test";
-
-  // Get the market assignments (array of objects)
-  const assignments = getAllMarketAssignments();
-
-  // Flatten each assignment into rows
-  const rows = [];
-  assignments.forEach(a => {
-    a.type_ids.forEach(type_id => {
-      rows.push([type_id, a.market_id, a.market_type]);
-    });
-  });
-
-  // Headers
-  const header = ["type_id", "market_id", "market_type"];
-
-  // Create/clear sheet
-  let sheet = ss.getSheetByName(sheetName);
-  if (!sheet) {
-    sheet = ss.insertSheet(sheetName);
-  } else {
-    sheet.clearContents();
-  }
-
-  // Write data
-  sheet.getRange(1, 1, 1, header.length).setValues([header]);
-  if (rows.length > 0) {
-    sheet.getRange(2, 1, rows.length, header.length).setValues(rows);
-  }
-
-  Logger.log(`Wrote ${rows.length} assignment rows to '${sheetName}'`);
-}
-
-function emergencyCompactMarketPrices() {
-  const NAME = 'Market Prices';       // <-- change if needed
-  const KEEP_DAYS = 14;               // keep last 14 days only
-  const MAX_ROWS = 120000;            // hard cap after prune
-
-  const ss = SpreadsheetApp.getActive();
-  const sh = ss.getSheetByName(NAME);
-  if (!sh) throw new Error('Sheet not found: ' + NAME);
+function getCurrentMarketPrices() {
+  const cfg = mtConfig();
+  const SHEET_NAME = cfg.sheets.prices;
+  const RETENTION  = cfg.retentionDays.prices;
+  const MAX_ROWS   = cfg.maxRows.prices;
+  const MAX_LOG    = cfg.maxLogIDs;
 
   const lock = LockService.getScriptLock();
-  if (!lock.tryLock(1000)) return;    // avoid overlap
+  if (!lock.tryLock(2000)) { LoggerEx && LoggerEx.warn("Prices: skip — lock busy"); return; }
 
   try {
-    const values = sh.getDataRange().getValues();
-    if (values.length <= 1) {
-      // nothing to prune, but still shrink excess empty rows
-      trimTrailingEmptyRows(sh);
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const headers = ["date","market_id","market_type","type_id","min_sell","max_buy","median_sell","median_buy"];
+    const sheet = getOrCreateSheet(ss, SHEET_NAME, headers);
+
+    // Light pre-prune (fast)
+    lightPrePrune_(sheet, MAX_ROWS);
+
+    // Collect prices
+    const typeIDs = getTypeIDsFromItemList(MAX_LOG);
+    const marketCombos = getMarketSettings();
+    if (!typeIDs.length || !marketCombos.length) {
+      LoggerEx && LoggerEx.warn("Prices: no typeIDs or no markets; aborting run.");
       return;
     }
-
-    const header = values[0];
-    const rows = values.slice(1);
-
-    // Find date column by header name (fallback to col 1 if not found)
-    let dateCol = header.findIndex(h => String(h).toLowerCase() === 'date');
-    if (dateCol < 0) dateCol = 0;
-
-    const cutoff = new Date(Date.now() - KEEP_DAYS*24*60*60*1000);
-
-    // Keep only rows with valid date >= cutoff
-    const recent = rows.filter(r => {
-      const d = r[dateCol];
-      return d && d instanceof Date && d >= cutoff;
+    const now = new Date();
+    const rows = [];
+    marketCombos.forEach(({ market_id, market_type }) => {
+      const prices = getMarketPrices(typeIDs, market_id, market_type);
+      typeIDs.forEach(type_id => {
+        const e = prices[type_id] || {};
+        rows.push([now, market_id, market_type, type_id, e.minSell ?? null, e.maxBuy ?? null, e.medianSell ?? null, e.medianBuy ?? null]);
+      });
     });
 
-    // Enforce hard cap (keep most recent slice at the end)
-    const keep = recent.slice(-Math.min(MAX_ROWS-1, recent.length));
-    const out = [header].concat(keep);
+    if (rows.length) {
+      const start = sheet.getLastRow() + 1;
+      sheet.getRange(start, 1, rows.length, headers.length).setValues(rows);
+      LoggerEx && LoggerEx.log("Prices: wrote", rows.length, "rows @", start);
+    } else {
+      LoggerEx && LoggerEx.warn("Prices: no rows produced this run.");
+    }
 
-    sh.clearContents(); // keep formats/filters; clears values fast
-    sh.getRange(1,1,out.length, out[0].length).setValues(out);
-
-    // Finally, remove the millions of empty rows below data
-    trimTrailingEmptyRows(sh);
+    // Tighten & simple retention (fast)
+    postTighten_(sheet);
+    if (RETENTION) pruneOldRows(sheet, RETENTION, /*dateCol=*/1);
+  } catch (e) {
+    LoggerEx && LoggerEx.error("getCurrentMarketPrices failed:", e);
+    throw e;
   } finally {
     lock.releaseLock();
   }
 }
 
+/* ---------------------- Light Mode hygiene ---------------------- */
 
-
-function trimTrailingEmptyRows(sh) {
-  const NAME = 'Market Prices'; // change if needed
-   sh = SpreadsheetApp.getActive().getSheetByName(NAME);
-  if (!sh) throw new Error('Sheet not found: ' + NAME);
-
-  // If a filter is applied, row deletes can fail—remove it first.
-  const filter = sh.getFilter && sh.getFilter();
-  if (filter) filter.remove();
-
-  const last = sh.getLastRow();   // e.g., 87500
-  const max  = sh.getMaxRows();   // e.g., 962306
-  let extra  = max - last;
-  if (extra <= 0) return;
-
-  const BLOCK = 20000;            // delete in chunks to avoid timeouts
-  while (extra > 0) {
-    const n = Math.min(BLOCK, extra);
-    sh.deleteRows(last + 1, n);
-    extra -= n;
-    // Utilities.sleep(100); // uncomment if you still hit rate limits
+function lightPrePrune_(sh, maxRows) {
+  const f = sh.getFilter && sh.getFilter(); if (f) f.remove();
+  _trimTrailing_(sh);
+  const last = sh.getLastRow();
+  if (maxRows && last > maxRows) {
+    const over = last - maxRows;
+    _deleteInBlocks_(sh, 2, over);
+    LoggerEx && LoggerEx.log('Prices: light prune removed oldest rows:', over);
   }
+}
+function postTighten_(sh) { _trimTrailing_(sh); }
+function _trimTrailing_(sh) {
+  const used = sh.getLastRow();
+  const alloc = sh.getMaxRows();
+  const extra = alloc - used;
+  if (extra > 0) _deleteInBlocks_(sh, used + 1, extra);
+}
+function _deleteInBlocks_(sh, startRow, count) {
+  const BLOCK = 20000;
+  let remaining = count, row = startRow;
+  while (remaining > 0) {
+    const n = Math.min(BLOCK, remaining);
+    sh.deleteRows(row, n);
+    remaining -= n;
+  }
+}
+
+/** Batch/contiguous prune for "older than N days" assuming chronological appends. */
+function pruneOldRows(sheet, retentionDays, dateCol /* 1-based */) {
+  if (!retentionDays) return;
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return;
+
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - retentionDays);
+
+  // Read the date column once
+  const dates = sheet.getRange(2, dateCol, lastRow - 1, 1).getValues().flat();
+
+  // Find the last index we should delete (contiguous block from the top)
+  let boundary = -1; // last index in 'dates' to delete (0-based over data rows)
+  for (let i = 0; i < dates.length; i++) {
+    const d = dates[i];
+    if (!(d instanceof Date)) continue;            // skip blanks
+    if (d < cutoff) boundary = i; else break;      // as soon as we hit fresh data, stop (chronological)
+  }
+
+  if (boundary >= 0) {
+    const rowsToDelete = boundary + 1;            // convert 0-based to count
+    _deleteInBlocks_(sheet, /*startRow=*/2, /*count=*/rowsToDelete);
+    LoggerEx && LoggerEx.log('Prices: pruned old rows (<= cutoff):', rowsToDelete);
+  }
+}
+
+/* ---------------------- Heavy Prune (daily) ---------------------- */
+
+function dailyHeavyPrune_Prices() {
+  const CFG = mtConfig();
+  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.sheets.prices);
+  if (!sh) { LoggerEx && LoggerEx.warn('HeavyPrune: sheet not found'); return; }
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(2000)) { LoggerEx && LoggerEx.warn('HeavyPrune skip: lock busy'); return; }
+  try {
+    const f = sh.getFilter && sh.getFilter(); if (f) f.remove();
+    heavyPruneSheet_(sh, CFG.retentionDays.prices, CFG.maxRows.prices, CFG.bucketMinutes);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Heavy prune: retention → dedupe (20m buckets) → cap → rewrite once → tighten */
+function heavyPruneSheet_(sh, retentionDays, maxRows, bucketMinutes) {
+  const lastRow = sh.getLastRow(), lastCol = sh.getLastColumn();
+  if (lastRow < 2) return;
+
+  const header = sh.getRange(1,1,1,lastCol).getValues()[0];
+  const lower  = header.map(h => String(h).trim().toLowerCase());
+  const find = (name) => lower.findIndex(h => h === name);
+
+  // Resolve key column indices (0-based for arrays)
+  const DATE = find('date');
+  const TYPE = find('type_id');
+  const MID  = find('market_id');
+  const MTP  = find('market_type');
+  if (DATE < 0 || TYPE < 0 || MID < 0 || MTP < 0) {
+    LoggerEx && LoggerEx.warn('HeavyPrune: missing required columns (date/type_id/market_id/market_type)');
+    return;
+  }
+
+  // Read all data rows once
+  const data = sh.getRange(2,1,lastRow-1,lastCol).getValues();
+
+  // 1) Retention window
+  const cutoff = new Date(Date.now() - retentionDays * 86400000);
+  const windowed = [];
+  for (let i=0;i<data.length;i++) {
+    const r = data[i];
+    const d = r[DATE];
+    if (d instanceof Date && d >= cutoff) windowed.push(r);
+  }
+
+  // 2) Dedupe by 20-min buckets — key = bucket|type_id|market_id|market_type
+  const msPerBucket = (bucketMinutes || 20) * 60 * 1000;
+  const keep = new Map();
+  for (let i=0;i<windowed.length;i++) {
+    const r = windowed[i];
+    const d = r[DATE];
+    if (!(d instanceof Date)) continue; // keep dedupe pure on dated rows
+    const bucket = Math.floor(d.getTime() / msPerBucket);
+    const key = bucket + '|' + r[TYPE] + '|' + r[MID] + '|' + r[MTP];
+
+    const prev = keep.get(key);
+    if (!prev || (r[DATE] > prev[DATE])) keep.set(key, r); // newest wins
+  }
+  let deduped = Array.from(keep.values());
+
+  // 3) Enforce cap (keep newest by date)
+  if (deduped.length > maxRows) {
+    deduped.sort((a,b) => a[DATE] - b[DATE]);            // oldest first
+    deduped = deduped.slice(deduped.length - maxRows);   // keep newest maxRows
+  }
+
+  // 4) Rewrite once (header + data) then tighten
+  sh.clearContents();
+  sh.getRange(1,1,1,lastCol).setValues([header]);
+  if (deduped.length) sh.getRange(2,1,deduped.length,lastCol).setValues(deduped);
+
+  // Tighten trailing blanks
+  const used = sh.getLastRow(), alloc = sh.getMaxRows();
+  if (alloc > used) sh.deleteRows(used + 1, alloc - used);
+
+  LoggerEx && LoggerEx.log('HeavyPrune kept:', deduped.length, 'rows | window(days):', retentionDays, '| bucket(min):', bucketMinutes);
 }
