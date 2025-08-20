@@ -416,3 +416,125 @@ function historySanityPeek(sampleCount = 3) {
   }
   Logger.log(`History today: rows=${todayCount}`);
 }
+
+
+/******************************
+ * _determinePhase() Test Harness
+ * - Assumes _determinePhase, _inWindow_, _toHM already exist.
+ * - Config times are LOCAL (project timezone).
+ ******************************/
+
+/** Helper: build a Date for “today” at local h:m:s */
+function _localToday(h, m, s=0, ms=0) {
+  const d = new Date();
+  d.setHours(h, m, s, ms);
+  return d;
+}
+
+/** Tiny assert */
+function _assert(name, cond, details="") {
+  if (!cond) {
+    console.error(`❌ FAIL: ${name} ${details ? " → " + details : ""}`);
+    return false;
+  }
+  console.log(`✅ PASS: ${name}`);
+  return true;
+}
+
+/** Compare the phase result to expected flags */
+function _expectPhase(name, res, exp) {
+  const ok =
+    res.allowed   === exp.allowed &&
+    res.isOpenRun === exp.isOpenRun &&
+    res.isCloseRun=== exp.isCloseRun;
+  return _assert(
+    name,
+    ok,
+    `got {allowed:${res.allowed}, open:${res.isOpenRun}, close:${res.isCloseRun}} ` +
+    `exp {allowed:${exp.allowed}, open:${exp.isOpenRun}, close:${exp.isCloseRun}}`
+  );
+}
+
+/** Main: run a suite of time-window tests */
+function test_determinePhase() {
+  const config = {
+    OpenTime:  "11:00",  // LOCAL
+    CloseTime: "18:00",  // LOCAL
+  };
+
+  let fails = 0;
+  const now_10_59 = _localToday(10,59,59);
+  const now_11_00 = _localToday(11,0,0);
+  const now_11_30 = _localToday(11,30,0);
+  const now_11_59 = _localToday(11,59,59);
+  const now_12_00 = _localToday(12,0,0);
+  const now_13_00 = _localToday(13,0,0);
+  const now_18_30 = _localToday(18,30,0);
+
+  // --- OPEN window tests (duration 60, end is exclusive) ---
+  fails += !_expectPhase("Open: just before window (10:59:59)",
+    _determinePhase(config, "auto", now_10_59),
+    {allowed:false, isOpenRun:false, isCloseRun:false});
+
+  fails += !_expectPhase("Open: at window start (11:00:00)",
+    _determinePhase(config, "auto", now_11_00),
+    {allowed:true, isOpenRun:true, isCloseRun:false});
+
+  fails += !_expectPhase("Open: mid window (11:30)",
+    _determinePhase(config, "auto", now_11_30),
+    {allowed:true, isOpenRun:true, isCloseRun:false});
+
+  fails += !_expectPhase("Open: last second inside (11:59:59)",
+    _determinePhase(config, "auto", now_11_59),
+    {allowed:true, isOpenRun:true, isCloseRun:false});
+
+  fails += !_expectPhase("Open: exclusive end (12:00:00) → outside",
+    _determinePhase(config, "auto", now_12_00),
+    {allowed:false, isOpenRun:false, isCloseRun:false});
+
+  // --- CLOSE window test ---
+  fails += !_expectPhase("Close: mid window (18:30)",
+    _determinePhase(config, "auto", now_18_30),
+    {allowed:true, isOpenRun:false, isCloseRun:true});
+
+  // --- Outside both windows ---
+  fails += !_expectPhase("Outside both (13:00)",
+    _determinePhase(config, "auto", now_13_00),
+    {allowed:false, isOpenRun:false, isCloseRun:false});
+
+  // --- Mode overrides ---
+  fails += !_expectPhase("Mode override: open",
+    _determinePhase(config, "open", now_13_00),
+    {allowed:true, isOpenRun:true, isCloseRun:false});
+
+  fails += !_expectPhase("Mode override: close",
+    _determinePhase(config, "close", now_11_30),
+    {allowed:true, isOpenRun:false, isCloseRun:true});
+
+  // --- Optional: AM/PM parsing robustness (if your _toHM supports it) ---
+  const configAmPm = { OpenTime: "11:00 AM", CloseTime: "6:00 PM" };
+  fails += !_expectPhase("AM/PM parsing: open mid (11:30)",
+    _determinePhase(configAmPm, "auto", now_11_30),
+    {allowed:true, isOpenRun:true, isCloseRun:false});
+  fails += !_expectPhase("AM/PM parsing: close mid (18:30)",
+    _determinePhase(configAmPm, "auto", now_18_30),
+    {allowed:true, isOpenRun:false, isCloseRun:true});
+
+  // Summary
+  if (fails) {
+    console.error(`\n❌ ${fails} test(s) failed in test_determinePhase`);
+    throw new Error(`${fails} _determinePhase test(s) failed`);
+  } else {
+    console.log("\n🎉 All _determinePhase tests passed");
+  }
+}
+
+/** Quick single-shot to reproduce your 11:53 case */
+function test_1153_case() {
+  const config = { OpenTime: "11:00", CloseTime: "18:00" };
+  const now = _localToday(11,53,0);
+  const res = _determinePhase(config, "auto", now);
+  console.log("TZ:", Session.getScriptTimeZone(), "now:", now.toLocaleString());
+  console.log("Result:", JSON.stringify(res));
+  return res;
+}

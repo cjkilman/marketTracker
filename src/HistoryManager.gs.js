@@ -204,35 +204,7 @@ function appendRowsToSheet(sheetName, rows) {
   sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
 }
 
-/** --------- Time-window helpers (1-hour trigger windows) --------- */
 
-function _inWindow_(now, startH, startM, durationMin) {
-  const start = new Date(now);
-   start.setHours(startH, startM, 0, 0);
-  const end   = new Date(start.getTime() + durationMin * 60 * 1000);
-  return now >= start && now < end;
-}
-
-/**
- * Returns { isOpenRun, isCloseRun, allowed }
- * - mode "auto": allowed only if within the 60m window after OpenTime or CloseTime
- * - mode "open"/"close": forced, always allowed
- */
-function _determinePhase(config, mode, now) {
-  if (mode === "open")  return { isOpenRun: true,  isCloseRun: false, allowed: true };
-  if (mode === "close") return { isOpenRun: false, isCloseRun: true,  allowed: true };
-
-  const [oH, oM] = _toHM(config.OpenTime  || "11:00");
-  const [cH, cM] = _toHM(config.CloseTime || "18:00");
-  const DUR = 60; // minutes
-
-  const inOpen  = _inWindow_(now, oH, oM, DUR);
-  const inClose = _inWindow_(now, cH, cM, DUR);
-
-  if (inOpen)  return { isOpenRun: true,  isCloseRun: false, allowed: true  };
-  if (inClose) return { isOpenRun: false, isCloseRun: true,  allowed: true  };
-  return { isOpenRun: false, isCloseRun: false, allowed: false };
-}
 
 /**
  * Upserts today's history rows into target sheet by reading the "Market Prices" sheet.
@@ -314,12 +286,7 @@ function _upsertHistoryRows(sheet, /*unused*/ marketData, phase) {
   Logger.log("[History] Skipped: not in open/close window.");
 }
 
-  // Perform one batch append if needed, then update rowMap for those new rows (not strictly necessary today)
-  if (appends.length > 0) {
-    const startRow = sheet.getLastRow() + 1;
-    sheet.getRange(startRow, 1, appends.length, headers.length).setValues(appends);
-    // (Optionally populate rowMap for appended rows if you upsert multiple passes in one invocation)
-  }
+  
 
 
 /** Build the row key from an existing row using header indices. */

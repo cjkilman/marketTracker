@@ -49,44 +49,112 @@ function getOrCreateSheet(ss, name, headers) {
   return sheet;
 }
 
-/**
- * Parse a Config time cell into [hour, minute] in project timezone.
- * Handles strings ("11:00", "6:30 PM"), Dates, or numeric fractions (Google Sheets TIME).
- */
-function _toHM(val) {
-  
-  const tz = _projectTZ();
-
-  // Case: Date object (common when cell is time-formatted)
-  if (Object.prototype.toString.call(val) === "[object Date]" && !isNaN(val)) {
-    const h = Number(Utilities.formatDate(val, tz, "H"));
-    const m = Number(Utilities.formatDate(val, tz, "m"));
-    return [h, m];
-  }
-
-  // Case: Number (fraction of a day)
-  if (typeof val === "number") {
-    let total = Math.round(val * 1440);             // minutes in a day
-    total = ((total % 1440) + 1440) % 1440;         // wrap safely
-    return [Math.floor(total / 60), total % 60];
-  }
-
-  // Case: String "HH:mm" or "h:mm AM/PM"
-  const s = String(val || "").trim();
-  const m = s.match(/^(\d{1,2}):(\d{2})(?:\s*(AM|PM))?$/i);
-  if (m) {
-    let h = Number(m[1]), mm = Number(m[2]);
-    const ap = (m[3] || "").toUpperCase();
-    if (ap === "AM" && h === 12) h = 0;
-    if (ap === "PM" && h < 12) h += 12;
-    return [h, mm];
-  }
-
-  throw new Error(`Unrecognized time value in Config: ${val}`);
-}
+/************************************************************
+ * Time helpers — consistent, defensive, and log-friendly
+ * Contract:
+ *   _toHM(val) -> { h:number, m:number }
+ *   _inWindow_(now, h, m, durationMin) -> boolean  (LOCAL tz)
+ ************************************************************/
 
 function _projectTZ() {
   return (typeof Session !== 'undefined' && Session.getScriptTimeZone)
     ? Session.getScriptTimeZone()
     : 'Etc/UTC';
+}
+
+/** Parse time-of-day from Date | number (sheet fraction) | string.
+ * Accepts:
+ *   Date                → local H:m
+ *   number (0..1 day)  → H:m
+ *   "11"               → 11:00
+ *   "11:0" / "11:00"   → 11:00
+ *   "6:00 PM" / "6 PM" → 18:00
+ */
+function _toHM(val) {
+  const tz = (typeof _projectTZ === "function" ? _projectTZ() : Session.getScriptTimeZone());
+
+  // Date object (e.g., time-formatted cell)
+  if (Object.prototype.toString.call(val) === "[object Date]" && !isNaN(val)) {
+    const h = Number(Utilities.formatDate(val, tz, "H"));
+    const m = Number(Utilities.formatDate(val, tz, "m"));
+    _assertFinite(h, m, `Bad Date in Config: ${val}`);
+    return { h, m };
+  }
+
+  // Number (fraction of day)
+  if (typeof val === "number") {
+    let total = Math.round(val * 1440);                       // minutes
+    total = ((total % 1440) + 1440) % 1440;                   // wrap
+    return { h: Math.floor(total / 60), m: total % 60 };
+  }
+
+  // String family
+  const s = String(val ?? "").trim().toUpperCase();
+  if (!s) throw new Error(`Time missing in Config`);
+
+  // Accept "H", "H:M", "H AM/PM", "H:M AM/PM"
+  const m = s.match(/^(\d{1,2})(?::(\d{1,2}))?\s*(AM|PM)?$/);
+  if (!m) throw new Error(`Unrecognized time value in Config: "${val}"`);
+
+  let hNum = parseInt(m[1], 10);
+  let mNum = (m[2] != null ? parseInt(m[2], 10) : 0);
+  const ap  = m[3]; // AM/PM or undefined
+
+  if (ap) {
+    if (ap === "PM" && hNum < 12) hNum += 12;
+    if (ap === "AM" && hNum === 12) hNum = 0;
+  }
+  _assertHM(hNum, mNum, `Invalid time from "${val}" → (${hNum},${mNum})`);
+  return { h: hNum, m: mNum };
+}
+
+function _assertFinite(h, m, msg) {
+  if (!Number.isFinite(h) || !Number.isFinite(m)) throw new Error(msg);
+}
+function _assertHM(h, m, msg) {
+  if (!(h >= 0 && h < 24) || !(m >= 0 && m < 60)) throw new Error(msg);
+}
+
+/** Local-tz window check with strict argument validation. */
+function _inWindow_(now, startH, startM, durationMin) {
+  if (!(now instanceof Date) || isNaN(now)) {
+    throw new Error(`_inWindow_: "now" must be a valid Date, got ${now}`);
+  }
+  if (!Number.isInteger(startH) || !Number.isInteger(startM)) {
+    throw new Error(`_inWindow_: startH/startM must be ints, got h=${startH} m=${startM}`);
+  }
+  if (!Number.isInteger(durationMin) || durationMin <= 0) {
+    throw new Error(`_inWindow_: durationMin must be a positive int, got ${durationMin}`);
+  }
+
+  const start = new Date(now);
+  start.setHours(startH, startM, 0, 0); // LOCAL tz
+  const end = new Date(start.getTime() + durationMin * 60 * 1000);
+  return now >= start && now < end;     // inclusive start, exclusive end
+}
+
+/** Decide phase based on config+mode at a given moment. */
+function _determinePhase(config, mode, now) {
+  if (mode === "open")  return { isOpenRun: true,  isCloseRun: false, allowed: true };
+  if (mode === "close") return { isOpenRun: false, isCloseRun: true,  allowed: true };
+
+  now = now || new Date();
+  const DUR = 60; // minutes
+
+  const { h: oH, m: oM } = _toHM(config?.OpenTime  ?? "11:00"); // LOCAL times
+  const { h: cH, m: cM } = _toHM(config?.CloseTime ?? "18:00");
+
+  const inOpen  = _inWindow_(now, oH, oM, DUR);
+  const inClose = _inWindow_(now, cH, cM, DUR);
+
+  // Debug trace: one glance tells you parse + window state.
+  console.log(
+    `[PHASE DEBUG] tz=${Session.getScriptTimeZone()} now=${now.toLocaleString()} `
+    + `OpenRaw="${config?.OpenTime}"→${oH}:${String(oM).padStart(2,"0")} inOpen=${inOpen} `
+    + `CloseRaw="${config?.CloseTime}"→${cH}:${String(cM).padStart(2,"0")} inClose=${inClose}`
+  );
+
+  if (inOpen)  return { isOpenRun: true,  isCloseRun: false, allowed: true };
+  if (inClose) return { isOpenRun: false, isCloseRun: true,  allowed: true };
+  return { isOpenRun: false, isCloseRun: false, allowed: false };
 }
