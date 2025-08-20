@@ -349,3 +349,70 @@ function Debug_Gatekeeper_At(isoLike) {
     Logger.log(`Mode=${mode} → allowed=${r.allowed}, isOpen=${r.isOpenRun}, isClose=${r.isCloseRun}`);
   });
 }
+
+function historySanityPeek(sampleCount = 3) {
+  const cfg = getConfig();
+  const PRICES = cfg["MarketPricesSheet"] || "Market Prices";
+  const HISTORY = cfg["HistorySheetName"] || "Market History";
+
+  const ss = SpreadsheetApp.getActive();
+  const psh = ss.getSheetByName(PRICES);
+  const hsh = ss.getSheetByName(HISTORY);
+  if (!psh || !hsh) { Logger.log("Missing sheets"); return; }
+
+  // --- resolve headers (Prices) ---
+  const ph = psh.getRange(1,1,1,psh.getLastColumn()).getValues()[0].map(x=>String(x).toLowerCase().trim());
+  const P_DATE = ph.indexOf("date"), P_TID = ph.indexOf("type_id"), P_MID = ph.indexOf("market_id"), P_MTP = ph.indexOf("market_type");
+  const P_MINSELL = ph.indexOf("min_sell"), P_MAXBUY = ph.indexOf("max_buy");
+  if ([P_DATE,P_TID,P_MID,P_MTP,P_MINSELL,P_MAXBUY].some(i=>i<0)) { Logger.log("Prices header mismatch"); return; }
+
+  // today's window in Project TZ
+  const { start, endNow } = projectDayWindowNow_();
+
+  // --- read Prices today ---
+  const pr = psh.getLastRow();
+  if (pr < 2) { Logger.log("No prices data"); return; }
+  const pvals = psh.getRange(2,1,pr-1,psh.getLastColumn()).getValues();
+
+  const groups = new Map(); // key -> {first,last,hiSell,loBuy}
+  for (const r of pvals) {
+    const d = r[P_DATE]; if (!(d instanceof Date)) continue;
+    if (d < start || d > endNow) continue;
+    const key = `${r[P_TID]}|${r[P_MID]}|${r[P_MTP]}`;
+    let g = groups.get(key);
+    if (!g) { g = { first:null, last:null, hiSell:null, loBuy:null }; groups.set(key, g); }
+    const minSell = Number(r[P_MINSELL]); const maxBuy = Number(r[P_MAXBUY]);
+    if (!g.first || d < g.first.d) g.first = { d, minSell, maxBuy };
+    if (!g.last  || d > g.last.d)  g.last  = { d, minSell, maxBuy };
+    if (isFinite(minSell)) g.hiSell = (g.hiSell==null)? minSell : Math.max(g.hiSell, minSell);
+    if (isFinite(maxBuy))  g.loBuy  = (g.loBuy ==null)? maxBuy  : Math.min(g.loBuy,  maxBuy);
+  }
+
+  // --- summary ---
+  Logger.log(`Prices today: keys=${groups.size} window=[${start}]..[${endNow}]`);
+  if (!groups.size) return;
+
+  // sample a few keys
+  const keys = Array.from(groups.keys()).slice(0, sampleCount);
+  for (const k of keys) {
+    const [tid, mid, mtp] = k.split("|");
+    const g = groups.get(k);
+    Logger.log(
+      `· ${tid}@${mid}/${mtp} ` +
+      `open(buy/sell)=(${g.first?.maxBuy ?? '-'}/${g.first?.minSell ?? '-'}) ` +
+      `close(buy/sell)=(${g.last?.maxBuy ?? '-'}/${g.last?.minSell ?? '-'}) ` +
+      `dayHi=${g.hiSell ?? '-'} dayLo=${g.loBuy ?? '-'}`
+    );
+  }
+
+  // --- history today count (quick sanity) ---
+  const hh = hsh.getRange(1,1,1,hsh.getLastColumn()).getValues()[0].map(x=>String(x).toLowerCase().trim());
+  const H_DATE = hh.indexOf("date");
+  let todayCount = 0;
+  if (hsh.getLastRow() > 1 && H_DATE >= 0) {
+    const hvals = hsh.getRange(2,1,hsh.getLastRow()-1,hsh.getLastColumn()).getValues();
+    const dayOnly = dateOnlyProjectTZ_(start);
+    for (const r of hvals) if (isSameProjectDay_(r[H_DATE], dayOnly)) todayCount++;
+  }
+  Logger.log(`History today: rows=${todayCount}`);
+}

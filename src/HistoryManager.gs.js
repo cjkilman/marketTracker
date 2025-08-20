@@ -320,7 +320,7 @@ function _upsertHistoryRows(sheet, /*unused*/ marketData, phase) {
     sheet.getRange(startRow, 1, appends.length, headers.length).setValues(appends);
     // (Optionally populate rowMap for appended rows if you upsert multiple passes in one invocation)
   }
-}
+
 
 /** Build the row key from an existing row using header indices. */
 function _keyForRow(row, idx) {
