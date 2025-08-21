@@ -256,15 +256,30 @@ function _id_crossKeys(log) {
   const ss = SpreadsheetApp.getActive();
   const mp = ss.getSheetByName("Market Prices");
   const mh = ss.getSheetByName("Market History");
-  if (!mp || !mh) return false;
 
+  // Market Prices is core: if it's missing, that's always an error.
+  if (!mp) { _id_err(log, "Missing sheet", "Market Prices"); return false; }
+
+  // Market History is optional unless required by flag.
+  if (!mh) {
+    if (ID_REQUIRE_MARKET_HISTORY) {
+      _id_err(log, "Missing sheet", "Market History");
+      return false;                 // fail when required
+    } else {
+      _id_info(log, "Skipped (sheet missing)", "Cross");
+      return true;                  // pass when optional
+    }
+  }
+
+  // Both present → do the key comparison (warn-only)
   const keysMP = _id_keys(mp, ["type_id","market_id","market_type"]);
   const keysMH = _id_keys(mh, ["type_id","market_id","market_type"]);
   let missing = 0;
   for (const k of keysMH) if (!keysMP.has(k)) missing++;
   if (missing > 0) _id_warn(log, "Some history keys not present in Market Prices", "Cross", null, { missing });
   else _id_info(log, "Cross-keys OK", "Cross");
-  return true; // warn-only; don’t fail deep check on this
+
+  return true; // comparison is warn-only
 }
 
 /** ---------------- Utilities ---------------- */
