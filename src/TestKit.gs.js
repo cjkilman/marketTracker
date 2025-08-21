@@ -293,8 +293,8 @@ function Debug_Gatekeeper() {
   const tz  = _projectTZ();
   const now = new Date();
 
-  const [oH,oM] = _toHM(cfg.OpenTime);
-  const [cH,cM] = _toHM(cfg.CloseTime);
+  const { h: oH, m: oM } = _toHM(cfg.OpenTime);
+  const { h: cH, m: cM } = _toHM(cfg.CloseTime);
   const DUR = 60; // minutes window for open/close
 
   // window membership
@@ -338,8 +338,8 @@ function Debug_Gatekeeper_At(isoLike) {
   const mock = new Date(isoLike); // e.g., "2025-08-18T11:15:00"
   Logger.log(`--- Simulating now=${_fmt(tz, mock)} ---`);
   const cfg = getConfig();
-  const [oH,oM] = _toHM(cfg.OpenTime);
-  const [cH,cM] = _toHM(cfg.CloseTime);
+  const { h: oH, m: oM } = _toHM(cfg.OpenTime);
+  const { h: cH, m: cM } = _toHM(cfg.CloseTime);
   const DUR=60;
   const inOpen  = _inWindow_(mock, oH, oM, DUR);
   const inClose = _inWindow_(mock, cH, cM, DUR);
@@ -348,6 +348,16 @@ function Debug_Gatekeeper_At(isoLike) {
     const r = _determinePhase(cfg, mode, mock);
     Logger.log(`Mode=${mode} → allowed=${r.allowed}, isOpen=${r.isOpenRun}, isClose=${r.isCloseRun}`);
   });
+}
+
+function _mockAtLocal(h, m, base) {
+  // base = any Date to take today's Y/M/D from (default: now)
+  base = base || new Date();
+  const tz = _projectTZ();
+  const y  = +Utilities.formatDate(base, tz, 'yyyy');
+  const mo = +Utilities.formatDate(base, tz, 'MM') - 1; // 0-based
+  const d  = +Utilities.formatDate(base, tz, 'dd');
+  return new Date(y, mo, d, h, m, 0, 0); // local script TZ
 }
 
 function historySanityPeek(sampleCount = 3) {

@@ -62,14 +62,8 @@ function _projectTZ() {
     : 'Etc/UTC';
 }
 
-/** Parse time-of-day from Date | number (sheet fraction) | string.
- * Accepts:
- *   Date                → local H:m
- *   number (0..1 day)  → H:m
- *   "11"               → 11:00
- *   "11:0" / "11:00"   → 11:00
- *   "6:00 PM" / "6 PM" → 18:00
- */
+/** @param {string|number|Date} val
+ *  @returns {{h:number, m:number}} */
 function _toHM(val) {
   const tz = (typeof _projectTZ === "function" ? _projectTZ() : Session.getScriptTimeZone());
 

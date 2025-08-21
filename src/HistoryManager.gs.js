@@ -396,7 +396,7 @@ function numOrNull_(v) { const n = Number(v); return Number.isFinite(n) ? n : nu
 // Build today's window [OpenTime .. now] in Project TZ
 function projectDayWindowNow_() {
   const c = getConfig();
-  const tz = projectTZ_();
+  const tz = _projectTZ();
 
   const now = new Date();
   const y  = Number(Utilities.formatDate(now, tz, "yyyy"));
@@ -412,7 +412,7 @@ function projectDayWindowNow_() {
 // Build today's full window [OpenTime .. CloseTime] in Project TZ
 function projectDayWindowFull_() {
   const c = getConfig();
-  const tz = projectTZ_();
+  const tz = _projectTZ();
 
   const now = new Date();
   const y  = Number(Utilities.formatDate(now, tz, "yyyy"));
@@ -430,7 +430,7 @@ function projectDayWindowFull_() {
 
 // Date-only (00:00) in Project TZ for one-row-per-day keys
 function dateOnlyProjectTZ_(dt) {
-  const tz = projectTZ_();
+  const tz = _projectTZ();
   const y  = Number(Utilities.formatDate(dt, tz, "yyyy"));
   const M  = Number(Utilities.formatDate(dt, tz, "MM")) - 1;
   const d  = Number(Utilities.formatDate(dt, tz, "dd"));
@@ -439,7 +439,7 @@ function dateOnlyProjectTZ_(dt) {
 
 function isSameProjectDay_(a, bDateOnly) {
   if (!(a instanceof Date) || !(bDateOnly instanceof Date)) return false;
-  const tz = projectTZ_();
+  const tz = _projectTZ();
   const A = Utilities.formatDate(a,       tz, "yyyy-MM-dd");
   const B = Utilities.formatDate(bDateOnly, tz, "yyyy-MM-dd");
   return A === B;
