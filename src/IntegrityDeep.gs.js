@@ -7,7 +7,21 @@ const OPTIONAL_MP_KEYS  = ["median_sell","median_buy"];
 const REQUIRED_MH_KEYS  = ["type_id","market_id","market_type","date","buy_open","buy_close","sell_open","sell_close"];
 const OPTIONAL_MH_KEYS  = ["daily_high","daily_low","median_buy","median_sell"];
 
+// Limit scan + log volume
+const ID_CHECK_WINDOW_HOURS = 3;  // set 0 to disable (scan all)
+const ID_WARN_SAMPLE_LIMIT  = 20;  // per warning-kind per sheet
+
+// If false, we only WARN/INFO when Market History is missing and continue.
+// If true, missing sheet is an error and Deep fails.
+const ID_REQUIRE_MARKET_HISTORY = false;
+
 /** ---------------- Header mapping (order-agnostic) ---------------- */
+function _id_asDate(v) {
+  if (Object.prototype.toString.call(v) === "[object Date]" && !isNaN(v)) return v;
+  const t = (typeof v === "string") ? Date.parse(v) : NaN;
+  return isNaN(t) ? null : new Date(t);
+}
+
 function _normHeader_(h) {
   return String(h || "")
     .replace(/\u00A0/g, " ")     // NBSP → space
@@ -35,8 +49,10 @@ function _aliasHeader_(k) {
     "median_buy": "median_buy",
     date: "date",
     buyopen: "buy_open",
+    buy_close: "buy_close",
     buyclose: "buy_close",
     sellopen: "sell_open",
+    sell_close: "sell_close",
     sellclose: "sell_close",
     dailyhigh: "daily_high",
     dailylow: "daily_low"
@@ -107,33 +123,71 @@ function _id_checkMarketPrices(log) {
 
   const data = sh.getRange(2, 1, lastRow - 1, lastCol).getValues();
 
+  // Compute cutoff
+  const cutoff = ID_CHECK_WINDOW_HOURS > 0
+    ? new Date(Date.now() - ID_CHECK_WINDOW_HOURS * 60 * 60 * 1000)
+    : null;
+
   let errors = 0, warns = 0;
+  let warnMissingBuy = 0, warnMissingSell = 0, warnInverted = 0;
+
+  const sampleCount = { missingBuy: 0, missingSell: 0, inverted: 0 };
+
   for (let i = 0; i < data.length; i++) {
     const row = data[i];
     const [date, market_id, market_type, type_id, max_buy, min_sell, median_sell, median_buy]
       = _canonicalRow_(row, idx, ["date","market_id","market_type","type_id","max_buy","min_sell","median_sell","median_buy"]);
+
+    // Skip by date window if configured
+    if (cutoff) {
+      const d = _id_asDate(date);
+      if (d && d < cutoff) continue;
+    }
 
     // basic validations
     if (!_id_posInt(type_id)) errors += _id_row(log, "type_id must be a positive integer", "Market Prices", i + 2);
     if (!_id_posInt(market_id)) errors += _id_row(log, "market_id must be a positive integer", "Market Prices", i + 2);
     if (_id_blank(market_type)) errors += _id_row(log, "market_type required", "Market Prices", i + 2);
 
+    // allow blanks (no active orders) → warn; non-blank non-numeric → error
     if (_id_blank(max_buy)) {
-    warns += _id_warn(log, "max_buy missing (no active buy orders?)", "Market Prices", i + 2);
+      warnMissingBuy++;
+      if (sampleCount.missingBuy < ID_WARN_SAMPLE_LIMIT) {
+        warns += _id_warn(log, "max_buy missing (no active buy orders?)", "Market Prices", i + 2);
+        sampleCount.missingBuy++;
+      }
     } else if (!_id_num(max_buy)) {
-    errors += _id_row(log, "max_buy must be numeric", "Market Prices", i + 2);
+      errors += _id_row(log, "max_buy must be numeric", "Market Prices", i + 2);
     }
 
     if (_id_blank(min_sell)) {
-    warns += _id_warn(log, "min_sell missing (no active sell orders?)", "Market Prices", i + 2);
+      warnMissingSell++;
+      if (sampleCount.missingSell < ID_WARN_SAMPLE_LIMIT) {
+        warns += _id_warn(log, "min_sell missing (no active sell orders?)", "Market Prices", i + 2);
+        sampleCount.missingSell++;
+      }
     } else if (!_id_num(min_sell)) {
-    errors += _id_row(log, "min_sell must be numeric", "Market Prices", i + 2);
+      errors += _id_row(log, "min_sell must be numeric", "Market Prices", i + 2);
     }
 
-    // Only compare spread when both are numeric
     if (_id_num(max_buy) && _id_num(min_sell) && Number(max_buy) > Number(min_sell)) {
-    warns += _id_warn(log, "max_buy > min_sell (spread inverted?)", "Market Prices", i + 2);
+      warnInverted++;
+      if (sampleCount.inverted < ID_WARN_SAMPLE_LIMIT) {
+        warns += _id_warn(log, "max_buy > min_sell (spread inverted?)", "Market Prices", i + 2);
+        sampleCount.inverted++;
+      }
     }
+
+    if (!_id_date(date)) errors += _id_row(log, "date must be a valid date", "Market Prices", i + 2);
+  }
+
+  // Summaries
+  if (warnMissingBuy   > sampleCount.missingBuy)
+    _id_info(log, `${warnMissingBuy} rows with missing max_buy (sampled ${sampleCount.missingBuy})`, "Market Prices");
+  if (warnMissingSell  > sampleCount.missingSell)
+    _id_info(log, `${warnMissingSell} rows with missing min_sell (sampled ${sampleCount.missingSell})`, "Market Prices");
+  if (warnInverted     > sampleCount.inverted)
+    _id_info(log, `${warnInverted} rows with inverted spread (sampled ${sampleCount.inverted})`, "Market Prices");
 
   _id_report(log, "Market Prices", data.length, errors, warns);
   return errors === 0;
@@ -142,7 +196,15 @@ function _id_checkMarketPrices(log) {
 /** ---------------- Market History check (order-agnostic) ---------------- */
 function _id_checkMarketHistory(log) {
   const sh = SpreadsheetApp.getActive().getSheetByName("Market History");
-  if (!sh) { _id_err(log, "Missing sheet", "Market History"); return false; }
+  if (!sh) {
+    if (ID_REQUIRE_MARKET_HISTORY) {
+      _id_err(log, "Missing sheet", "Market History");
+      return false;
+    } else {
+      _id_warn(log, "Skipped (sheet missing)", "Market History");
+      return true; // ← treat as skipped, not failure
+    }
+  }
 
   const lastCol = Math.max(1, sh.getLastColumn());
   const header = sh.getRange(1, 1, 1, lastCol).getValues()[0];
@@ -174,14 +236,14 @@ function _id_checkMarketHistory(log) {
     if (!_id_date(date)) errors += _id_row(log, "date must be a valid date", "Market History", i + 2);
 
     // numeric checks
-    const numFields = [buy_open, buy_close, sell_open, sell_close].map(_id_num);
-    if (numFields.some(v => !v)) errors += _id_row(log, "open/close fields must be numeric", "Market History", i + 2);
+    const numOK = [buy_open, buy_close, sell_open, sell_close].every(_id_num);
+    if (!numOK) errors += _id_row(log, "open/close fields must be numeric", "Market History", i + 2);
 
     // range sanity if highs/lows present
     if (_id_num(daily_high) && _id_num(daily_low) && Number(daily_high) >= Number(daily_low)) {
       const values = [buy_open, buy_close, sell_open, sell_close].filter(_id_num).map(Number);
-      const outOfRange = values.some(v => v > Number(daily_high) || v < Number(daily_low));
-      if (outOfRange) warns += _id_warn(log, "one or more price fields outside [daily_low, daily_high]", "Market History", i + 2);
+      const out = values.some(v => v > Number(daily_high) || v < Number(daily_low));
+      if (out) warns += _id_warn(log, "one or more price fields outside [daily_low, daily_high]", "Market History", i + 2);
     }
   }
 
@@ -203,17 +265,6 @@ function _id_crossKeys(log) {
   if (missing > 0) _id_warn(log, "Some history keys not present in Market Prices", "Cross", null, { missing });
   else _id_info(log, "Cross-keys OK", "Cross");
   return true; // warn-only; don’t fail deep check on this
-}
-
-function _id_toNumber(v) {
-  if (v === "" || v == null) return v;
-  if (typeof v === "number") return v;
-  if (typeof v === "string") {
-    const s = v.replace(/\u00A0/g, " ").replace(/[, ]/g, "").replace(/ISK$/i, "").trim();
-    const n = Number(s);
-    return Number.isFinite(n) ? n : v;
-  }
-  return v;
 }
 
 /** ---------------- Utilities ---------------- */
