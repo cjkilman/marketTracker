@@ -406,3 +406,271 @@ function isReactionCategory(catId) {
   return ['4', '17', '18', '19', '20', '24'].includes(String(catId));
 }
 
+/**
+ * Build a "Recipes_T1_Ammo" sheet from SDE tables.
+ * - Pulls T1 (metaLevel 0) ammo product runs and mineral material requirements (activityID = 1, manufacturing).
+ * - Aggregates only basic minerals: Tritanium, Pyerite, Mexallon, Isogen, Nocxium, Zydrine, Megacyte.
+ * - Uses Named Ranges for SDE tables if present; falls back to sheet names if not.
+ * - Batch reads and writes (no per-cell loops).
+ * - Designed to slot into your SDE update tool as a final step.
+ *
+ * Prereqs (preferred Named Ranges → fallback Sheet Names):
+ *   - SDE_industryActivityProducts  → "industryActivityProducts"
+ *   - SDE_industryActivityMaterials → "industryActivityMaterials"
+ *   - SDE_invTypes                  → "invTypes"
+ *   - SDE_dgmTypeAttributes         → "dgmTypeAttributes"   (optional; used to filter metaLevel = 0)
+ *   - SDE_invGroups                 → "invGroups"           (optional; used to detect categoryId = 8 Charge)
+ *   - SDE_invCategories             → "invCategories"       (optional)
+ *
+ * Output:
+ *   Sheet "Recipes_T1_Ammo" with columns:
+ *     Ammo | Units_per_Run | Tritanium | Pyerite | Mexallon | Isogen | Nocxium | Zydrine | Megacyte | productTypeID | blueprintTypeID
+ */
+
+function buildAmmoRecipesFromSDE() {
+  const ss = SpreadsheetApp.getActive();
+
+  // -------- helpers --------
+  const getByNameOrSheet = (name, fallback) => {
+    const rn = ss.getRangeByName(name);
+    if (rn) return rn.getDataRegion().getValues();
+    const sh = ss.getSheetByName(fallback || name);
+    if (!sh) return [];
+    const last = sh.getLastRow();
+    if (!last) return [];
+    return sh.getRange(1,1,last, sh.getLastColumn()).getValues();
+  };
+
+  const indexByHeader = (rows) => {
+    if (!rows || rows.length === 0) return { header: [], idx: {}, data: [] };
+    const header = rows[0].map(String);
+    const idx = Object.fromEntries(header.map((h,i)=>[h,i]));
+    return { header, idx, data: rows.slice(1) };
+  };
+
+  const toNum = (v) => (v === '' || v === null || v === undefined) ? null : Number(v);
+
+  // -------- load SDE tables (prefer named ranges) --------
+  const IAP  = indexByHeader(getByNameOrSheet('SDE_industryActivityProducts',  'industryActivityProducts'));
+  const IAM  = indexByHeader(getByNameOrSheet('SDE_industryActivityMaterials', 'industryActivityMaterials'));
+  const INV  = indexByHeader(getByNameOrSheet('SDE_invTypes',                  'invTypes'));
+  const DTA  = indexByHeader(getByNameOrSheet('SDE_dgmTypeAttributes',         'dgmTypeAttributes'));
+  const GRP  = indexByHeader(getByNameOrSheet('SDE_invGroups',                 'invGroups'));
+  const CAT  = indexByHeader(getByNameOrSheet('SDE_invCategories',             'invCategories'));
+
+  if (!IAP.data.length || !IAM.data.length || !INV.data.length) {
+    throw new Error('Missing SDE tables: industryActivityProducts, industryActivityMaterials, invTypes must be present (via named ranges or sheets).');
+  }
+
+  // Column names we expect (SDE schema compatible)
+  const COL = {
+    IAP: {
+      blueprintTypeID: IAP.idx.blueprintTypeID ?? IAP.idx.blueprintTypeId ?? IAP.idx.blueprintType ?? IAP.idx.blueprintTypeID,
+      activityID:      IAP.idx.activityID      ?? IAP.idx.activityId,
+      productTypeID:   IAP.idx.productTypeID   ?? IAP.idx.productTypeId,
+      quantity:        IAP.idx.quantity,
+    },
+    IAM: {
+      blueprintTypeID: IAM.idx.blueprintTypeID ?? IAM.idx.blueprintTypeId,
+      activityID:      IAM.idx.activityID      ?? IAM.idx.activityId,
+      materialTypeID:  IAM.idx.materialTypeID  ?? IAM.idx.materialTypeId,
+      quantity:        IAM.idx.quantity,
+    },
+    INV: {
+      typeID:   INV.idx.typeID   ?? INV.idx.typeId,
+      typeName: INV.idx.typeName ?? INV.idx.name,
+      groupID:  INV.idx.groupID  ?? INV.idx.groupId,
+      published:INV.idx.published,
+    },
+    DTA: {
+      typeID:      DTA.idx.typeID      ?? DTA.idx.typeId,
+      attributeID: DTA.idx.attributeID ?? DTA.idx.attributeId,
+      valueFloat:  DTA.idx.valueFloat,
+      valueInt:    DTA.idx.valueInt,
+    },
+    GRP: {
+      groupID:    GRP.idx.groupID    ?? GRP.idx.groupId,
+      categoryID: GRP.idx.categoryID ?? GRP.idx.categoryId,
+      groupName:  GRP.idx.groupName  ?? GRP.idx.name,
+    },
+    CAT: {
+      categoryID: CAT.idx.categoryID ?? CAT.idx.categoryId,
+      categoryName: CAT.idx.categoryName ?? CAT.idx.name,
+    }
+  };
+
+  const ACTIVITY_MANUFACTURING = 1; // SDE constant
+  const ATTR_META_LEVEL = 633;      // dgmTypeAttributes attributeID for metaLevel
+  const CHARGE_CATEGORY_ID = 8;     // invCategories.categoryID for Charges/Ammunition
+
+  // Build lookup maps for invTypes and optional meta level
+  const invByType = new Map();
+  for (const r of INV.data) {
+    const typeID = toNum(r[COL.INV.typeID]);
+    if (!typeID) continue;
+    invByType.set(typeID, {
+      typeName: r[COL.INV.typeName],
+      groupID: toNum(r[COL.INV.groupID]),
+      published: (''+r[COL.INV.published]).toLowerCase() === 'true' || r[COL.INV.published] === 1,
+    });
+  }
+
+  // Optional: metaLevel map (typeID -> meta value)
+  const metaLevelByType = new Map();
+  if (DTA.data.length && COL.DTA.attributeID !== undefined) {
+    for (const r of DTA.data) {
+      const attr = toNum(r[COL.DTA.attributeID]);
+      if (attr !== ATTR_META_LEVEL) continue;
+      const t  = toNum(r[COL.DTA.typeID]);
+      const vf = toNum(r[COL.DTA.valueFloat]);
+      const vi = toNum(r[COL.DTA.valueInt]);
+      const val = (vf !== null && !isNaN(vf)) ? vf : ((vi !== null && !isNaN(vi)) ? vi : null);
+      if (t) metaLevelByType.set(t, val);
+    }
+  }
+
+  // Optional: groupID -> categoryID
+  const categoryByGroup = new Map();
+  if (GRP.data.length && CAT.data.length) {
+    for (const r of GRP.data) {
+      const g = toNum(r[COL.GRP.groupID]);
+      const c = toNum(r[COL.GRP.categoryID]);
+      if (g) categoryByGroup.set(g, c);
+    }
+  }
+
+  // Build maps for materials by blueprint and product rows
+  const matsByBlueprint = new Map(); // blueprintTypeID -> array of {materialTypeID, quantity}
+  for (const r of IAM.data) {
+    const act = toNum(r[COL.IAM.activityID]);
+    if (act !== ACTIVITY_MANUFACTURING) continue;
+    const bp  = toNum(r[COL.IAM.blueprintTypeID]);
+    const mt  = toNum(r[COL.IAM.materialTypeID]);
+    const qty = toNum(r[COL.IAM.quantity]) || 0;
+    if (!bp || !mt || qty <= 0) continue;
+    const arr = matsByBlueprint.get(bp) || [];
+    arr.push({ materialTypeID: mt, quantity: qty });
+    matsByBlueprint.set(bp, arr);
+  }
+
+  // Mineral typeIDs map (resolve by name from invTypes)
+  const mineralNames = ['Tritanium','Pyerite','Mexallon','Isogen','Nocxium','Zydrine','Megacyte'];
+  const mineralTypeIDs = {};
+  for (const [typeID, info] of invByType.entries()) {
+    if (!info || !info.typeName) continue;
+    const idx = mineralNames.indexOf(info.typeName);
+    if (idx !== -1) mineralTypeIDs[info.typeName] = typeID;
+  }
+
+  const isBasicMineral = (typeID) => Object.values(mineralTypeIDs).includes(typeID);
+
+  // Iterate products, keep only T1 Charges (Ammo) if we can detect; else keep meta 0 filter only
+  const rowsOut = [];
+  for (const r of IAP.data) {
+    const act = toNum(r[COL.IAP.activityID]);
+    if (act !== ACTIVITY_MANUFACTURING) continue;
+
+    const bp  = toNum(r[COL.IAP.blueprintTypeID]);
+    const pt  = toNum(r[COL.IAP.productTypeID]);
+    const runQty = toNum(r[COL.IAP.quantity]) || 1; // units per run
+    if (!bp || !pt) continue;
+
+    const pInfo = invByType.get(pt);
+    if (!pInfo || !pInfo.published) continue;
+
+    // metaLevel == 0 for T1 (if attribute table is available). If no meta info, assume 0.
+    const meta = metaLevelByType.has(pt) ? (metaLevelByType.get(pt) || 0) : 0;
+    if (meta !== 0) continue;
+
+    // If we can detect category 8 (Charges), apply it; else accept and let user filter later.
+    if (categoryByGroup.size) {
+      const catId = categoryByGroup.get(pInfo.groupID);
+      if (catId !== CHARGE_CATEGORY_ID) continue; // keep only ammo/charges
+    }
+
+    const mats = matsByBlueprint.get(bp) || [];
+    if (!mats.length) continue;
+
+    // Sum only basic minerals
+    const sums = {
+      Tritanium: 0, Pyerite: 0, Mexallon: 0, Isogen: 0, Nocxium: 0, Zydrine: 0, Megacyte: 0
+    };
+    for (const m of mats) {
+      if (!isBasicMineral(m.materialTypeID)) continue;
+      const mName = invByType.get(m.materialTypeID)?.typeName;
+      if (mName && sums.hasOwnProperty(mName)) sums[mName] += m.quantity;
+    }
+
+    // If there are no mineral requirements at all (e.g., charges that only use PI or other mats), skip
+    const totalMins = Object.values(sums).reduce((a,b)=>a+b,0);
+    if (totalMins === 0) continue;
+
+    rowsOut.push([
+      pInfo.typeName,                 // Ammo name
+      runQty,                         // Units_per_Run
+      sums.Tritanium,
+      sums.Pyerite,
+      sums.Mexallon,
+      sums.Isogen,
+      sums.Nocxium,
+      sums.Zydrine,
+      sums.Megacyte,
+      pt,                             // productTypeID
+      bp                              // blueprintTypeID
+    ]);
+  }
+
+  // Sort alphabetically by ammo name for sanity
+  rowsOut.sort((a,b)=> String(a[0]).localeCompare(String(b[0])));
+
+  // Write to sheet (batch)
+  const outHeader = ['Ammo','Units_per_Run','Tritanium','Pyerite','Mexallon','Isogen','Nocxium','Zydrine','Megacyte','productTypeID','blueprintTypeID'];
+  const shName = 'Recipes_T1_Ammo';
+  const outSh = ss.getSheetByName(shName) || ss.insertSheet(shName);
+  outSh.clear({contentsOnly:true});
+  outSh.getRange(1,1,1,outHeader.length).setValues([outHeader]);
+  if (rowsOut.length) {
+    outSh.getRange(2,1,rowsOut.length,outHeader.length).setValues(rowsOut);
+  }
+
+  // Optional: define named range for downstream formulas
+  try {
+    ss.setNamedRange('Recipes_T1_Ammo', outSh.getDataRange());
+  } catch(e) {
+    // ignore if name is already taken by another range or protected; user can set manually
+  }
+
+  // Basic freeze + filter for UX
+  outSh.setFrozenRows(1);
+  outSh.getRange(1,1,Math.max(1,rowsOut.length+1), outHeader.length).createFilter();
+}
+
+/**
+ * Hook to call after your SDE import finishes.
+ * Example: add this call at the end of your existing SDE update pipeline.
+ */
+function sdeUpdate_postProcess_buildAmmoRecipes() {
+  buildAmmoRecipesFromSDE();
+}
+
+/**
+ * (Optional) Add a simple time-based trigger to regenerate daily after SDE refresh.
+ * Adjust to your project timezone concerns per your config.
+ */
+function addDailyAmmoRecipeRefreshTrigger() {
+  // Remove existing duplicates first
+  const trg = ScriptApp.getProjectTriggers().filter(t=>t.getHandlerFunction() === 'sdeUpdate_postProcess_buildAmmoRecipes');
+  trg.forEach(t=>ScriptApp.deleteTrigger(t));
+
+  ScriptApp.newTrigger('sdeUpdate_postProcess_buildAmmoRecipes')
+    .timeBased()
+    .everyDays(1)
+    .atHour(4) // early morning off-peak; adjust as needed
+    .create();
+}
+
+/**
+ * Utility: Safe number conversion for Sheets text inputs.
+ * (Kept inline for readability).
+ */
+function _num(v){ return (v===''||v==null)?null:Number(v); }

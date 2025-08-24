@@ -120,7 +120,7 @@ function getCurrentMarketPrices() {
       LoggerEx && LoggerEx.warn("Prices: no typeIDs or no markets; aborting run.");
       return;
     }
-    const now = new Date();
+    const now = new Date(); // timestamp stored in local tz (NY), not UTC)
     const rows = [];
     marketCombos.forEach(({ market_id, market_type }) => {
       const prices = getMarketPrices(typeIDs, market_id, market_type);

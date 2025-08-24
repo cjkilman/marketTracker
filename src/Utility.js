@@ -152,3 +152,43 @@ function _determinePhase(config, mode, now) {
   if (inClose) return { isOpenRun: false, isCloseRun: true,  allowed: true };
   return { isOpenRun: false, isCloseRun: false, allowed: false };
 }
+
+/**
+ * Normalize a “time of day” into hours/minutes.
+ * Accepts: "HH:MM" string, Date (including Sheets' 1899 time-only dates), or number (minutes since midnight).
+ * @returns {{h:number,m:number}}
+ */
+function normalizeHM(input) {
+  // Date object (or a string that parses into a Date)
+  if (input instanceof Date) {
+    return { h: input.getHours(), m: input.getMinutes() };
+  }
+  // number = minutes since midnight
+  if (typeof input === 'number' && isFinite(input)) {
+    const h = Math.floor(input / 60) % 24;
+    const m = Math.round(input % 60);
+    return { h, m };
+  }
+  // Try HH:MM
+  const s = String(input || '').trim();
+  const mm = s.match(/^(\d{1,2}):(\d{2})$/);
+  if (mm) {
+    const h = Math.max(0, Math.min(23, parseInt(mm[1], 10)));
+    const m = Math.max(0, Math.min(59, parseInt(mm[2], 10)));
+    return { h, m };
+  }
+  // Try parsing as Date string (covers "Sat Dec 30 1899 11:00:00 ..." from Sheets)
+  const d = new Date(s);
+  if (!isNaN(d.getTime())) {
+    return { h: d.getHours(), m: d.getMinutes() };
+  }
+  throw new Error("normalizeHM: unsupported time value: " + s);
+}
+
+/** Today at given time (project-local). Accepts same inputs as normalizeHM. */
+function todayAtHM_Local(hmLike) {
+  const { h, m } = normalizeHM(hmLike);
+  const d = new Date();
+  d.setHours(h, m, 0, 0);
+  return d;
+}
