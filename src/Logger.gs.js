@@ -30,9 +30,9 @@ var LoggerEx = (function () {
                + ' ' + ts.local + ' | ' + ts.utc + ' — ';
     Logger.log(prefix + msg);
     // Optional V8 console mirroring:
-    // if (levelName === 'ERROR') console.error(prefix + msg);
-    // else if (levelName === 'WARN') console.warn(prefix + msg);
-    // else console.log(prefix + msg);
+    if (levelName === 'ERROR') console.error(prefix + msg);
+    else if (levelName === 'WARN') console.warn(prefix + msg);
+    else console.log(prefix + msg);
   }
 
   function makeTagged(modTag) {
