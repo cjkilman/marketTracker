@@ -97,26 +97,7 @@ var Utility = (function(){
     const end = new Date(start.getTime() + durationMin * 60 * 1000);
     return now >= start && now < end;     // inclusive start, exclusive end
   }
-  /**
-   * inWindow(now, startH, startM, durationMin)
-   * Local-tz window check with strict argument validation.
-   */
-  function inWindow(now, startH, startM, durationMin) {
-    if (!(now instanceof Date) || isNaN(now)) {
-      throw new Error('_inWindow_: "now" must be a valid Date, got ' + now);
-    }
-    if (!Number.isInteger(startH) || !Number.isInteger(startM)) {
-      throw new Error('_inWindow_: startH/startM must be ints, got h=' + startH + ' m=' + startM);
-    }
-    if (!Number.isInteger(durationMin) || durationMin <= 0) {
-      throw new Error('_inWindow_: durationMin must be a positive int, got ' + durationMin);
-    }
 
-    var start = new Date(now);
-    start.setHours(startH, startM, 0, 0); // LOCAL tz
-    var end = new Date(start.getTime() + durationMin * 60 * 1000);
-    return now >= start && now < end;     // inclusive start, exclusive end
-  }
   /** HM wrappers that defer to PT.coerceHM, preserving legacy array API */
   function toHM(val) {
     var hm = (typeof PT !== 'undefined' && PT && typeof PT.coerceHM === 'function') ? PT.coerceHM(val) : {h:0, m:0};
@@ -134,7 +115,6 @@ var Utility = (function(){
     toHM: toHM,
     _toHM: _toHM,
     inWindow: inWindow,
-    _inWindow_: inWindow,
-    inWindow: inWindow
+    _inWindow_: inWindow
   };
 })();
