@@ -64,18 +64,7 @@ function getTypeIDsFromItemList(limit) {
   if (limit && ids.length > limit) ids = ids.slice(0, limit);
   return ids;
 }
-function getOrCreateSheet(ss, name, headers) {
-  let sh = ss.getSheetByName(name);
-  if (!sh) {
-    sh = ss.insertSheet(name);
-    sh.getRange(1,1,1,headers.length).setValues([headers]);
-    sh.setFrozenRows(1);
-  } else if (sh.getLastRow() === 0) {
-    sh.getRange(1,1,1,headers.length).setValues([headers]);
-    sh.setFrozenRows(1);
-  }
-  return sh;
-}
+
 
 
 /** Map Fuz result into math-friendly numbers (null for non-numeric) */
