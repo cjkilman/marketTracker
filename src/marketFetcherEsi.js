@@ -20,9 +20,9 @@ const SHEET_PUBLISH = 'Publish_ESI_Region';
 const NR_MARKET_RESULT = 'MarketResultESI_Region';
 
 // Worker cadence & batching
-const WORKER_EVERY_MIN = 5;     // chunk worker interval (minutes)
-const BATCH_SIZE = 25;    // items per chunk per region
-const CALL_PACE_MS = 500;   // sleep between GESI calls (ms)
+const WORKER_EVERY_MIN = 1;     // chunk worker interval (minutes)
+const BATCH_SIZE = 200;    // items per chunk per region
+const CALL_PACE_MS = 100;   // sleep between GESI calls (ms)
 
 // Daily kickoff time (EVE DT ~11:00 UTC)
 const DAILY_UTC_HOUR = 11;
@@ -78,6 +78,15 @@ function getGESIHistoryClient_() {
   // Requires GESI library + authorized character (Sheets Add-ons → GESI → Authorize)
   return GESI.getClient().setFunction('markets_region_history');
 }
+
+function isBeforeNoonET_() {
+  return +Utilities.formatDate(new Date(), 'America/New_York', 'H') < 12;
+}
+function getBatchSize_() {      // AM: 200, PM: 60
+  return isBeforeNoonET_() ? 200 : 60;
+}
+
+
 
 function buildHistoryRequests_(client, regionId, typeIds) {
   return typeIds.map(function (tid) {
@@ -370,7 +379,10 @@ function marketFetchChunk() {
     var ii = Math.min(cur.ii || 0, items.length - 1);
 
     var regionId = regions[ri];
-    var end = Math.min(ii + BATCH_SIZE, items.length);
+    var BS = (typeof getBatchSize_ === 'function') ? getBatchSize_() : BATCH_SIZE;
+    var end = Math.min(ii + BS, items.length);
+    LoggerEx.info('mf.batch.params', { BS: BS, cadence_min: WORKER_EVERY_MIN });
+
     var chunk = items.slice(ii, end);
 
     LoggerEx.log('mf.run.start rid=' + rid + ' regions=' + regions.length + ' items=' + items.length +
