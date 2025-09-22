@@ -38,6 +38,7 @@ var LoggerEx = (function () {
   function makeTagged(modTag) {
     return {
       setLevel: function (levelName) { current = LEVELS[String(levelName).toUpperCase()] || current; },
+      info:  function () { out('INFO',  LEVELS.INFO,  arguments, modTag); }, 
       log:   function () { out('INFO',  LEVELS.INFO,  arguments, modTag); },
       warn:  function () { out('WARN',  LEVELS.WARN,  arguments, modTag); },
       error: function () { out('ERROR', LEVELS.ERROR, arguments, modTag); },
@@ -59,6 +60,7 @@ var LoggerEx = (function () {
 
   return {
     setLevel: function (levelName) { current = LEVELS[String(levelName).toUpperCase()] || current; },
+    info:  function () { out('INFO',  LEVELS.INFO,  arguments); }, // ← add
     log:   function () { out('INFO',  LEVELS.INFO,  arguments); },
     warn:  function () { out('WARN',  LEVELS.WARN,  arguments); },
     error: function () { out('ERROR', LEVELS.ERROR, arguments); },
