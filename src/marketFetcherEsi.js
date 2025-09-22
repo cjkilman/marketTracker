@@ -20,7 +20,7 @@ const SHEET_PUBLISH = 'Publish_ESI_Region';
 const NR_MARKET_RESULT = 'MarketResultESI_Region';
 
 // Worker cadence & batching
-const WORKER_EVERY_MIN = 10;     // chunk worker interval (minutes)
+const WORKER_EVERY_MIN = 5;     // chunk worker interval (minutes)
 const BATCH_SIZE = 25;    // items per chunk per region
 const CALL_PACE_MS = 500;   // sleep between GESI calls (ms)
 
@@ -137,20 +137,6 @@ function testESIHistory() {
   console.log('history rows:', Array.isArray(res) ? res.length : res);
 }
 
-/* =============================== MENUS ================================= */
-function onOpen() {
-  SpreadsheetApp.getUi().createMenu('Engine')
-    .addItem('Setup Engine (first run)', 'setupEngine')
-    .addSeparator()
-    .addItem('Install daily kickoff', 'installDailyKickoff')
-    .addItem('Kickoff now (mark STALE & start worker)', 'kickoffMarketHistoryRefresh')
-    .addItem('Stop worker', 'stopWorker_')
-    .addSeparator()
-    .addItem('Publish now', 'publishMarketResultESIRegion')
-    .addItem('Debug sources (log counts)', 'debugListSources')
-    .addToUi();
-}
-
 
 /* =============================== SETUP ================================= */
 function setupEngine() {
@@ -228,96 +214,128 @@ function kickoffMarketHistoryRefresh() {
 
 /* ===================== WORKER: ESI → CACHE (GESI) ====================== */
 function marketFetchChunk() {
+  var t0 = Date.now();
+  var rid = Utilities.getUuid().slice(0, 8); // run id for grouping
+
   // prevent overlap
-  const lock = LockService.getScriptLock();
-  if (!lock.tryLock(1000)) return;
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) {
+    LoggerEx.warn('mf.lock.busy rid=' + rid);
+    return;
+  }
 
   try {
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    const cache = ss.getSheetByName(SHEET_REGION_CACHE);
-    if (!cache) return stopWorker_('no cache');
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var cache = ss.getSheetByName(SHEET_REGION_CACHE);
+    if (!cache) {
+      LoggerEx.warn('mf.early.no_cache rid=' + rid);
+      return stopWorker_('no cache');
+    }
 
-    const props = PropertiesService.getScriptProperties();
-    if (props.getProperty('mf_job_active') !== '1') return stopWorker_('no active job');
+    var props = PropertiesService.getScriptProperties();
+    if (props.getProperty('mf_job_active') !== '1') {
+      LoggerEx.log('mf.early.no_active_job rid=' + rid);
+      return stopWorker_('no active job');
+    }
 
-    const regions = readListFlex_(REGIONS_SOURCE, {
+    var regions = readListFlex_(REGIONS_SOURCE, {
       numeric: true, integer: true, dropZeros: true, validator: isValidRegionId_
     });
+    var items = readListFlex_(ITEMS_SOURCE, { numeric: true, integer: true });
 
-    const items = readListFlex_(ITEMS_SOURCE, { numeric: true, integer: true });
+    if (!items.length || !regions.length) {
+      LoggerEx.warn('mf.early.no_items_or_regions rid=' + rid + ' items=' + items.length + ' regions=' + regions.length);
+      return stopWorker_('no items/regions');
+    }
 
-    if (!items.length || !regions.length) return stopWorker_('no items/regions');
+    var cur = JSON.parse(props.getProperty('mf_cursor') || '{"ri":0,"ii":0}');
+    var ri = Math.min(cur.ri || 0, regions.length - 1);
+    var ii = Math.min(cur.ii || 0, items.length - 1);
 
-    const cur = JSON.parse(props.getProperty('mf_cursor') || '{"ri":0,"ii":0}');
-    let ri = Math.min(cur.ri || 0, regions.length - 1);
-    let ii = Math.min(cur.ii || 0, items.length - 1);
+    var regionId = regions[ri];
+    var end = Math.min(ii + BATCH_SIZE, items.length);
+    var chunk = items.slice(ii, end);
 
-    const regionId = regions[ri];
-    const end = Math.min(ii + BATCH_SIZE, items.length);
-    const chunk = items.slice(ii, end);
+    LoggerEx.log('mf.run.start rid=' + rid + ' regions=' + regions.length + ' items=' + items.length +
+                 ' cursorIn=' + JSON.stringify({ri:ri, ii:ii}) +
+                 ' region=' + regionId + ' window=' + JSON.stringify({from:ii, to:end, size:chunk.length}));
 
-    // --- replacement for the per-item loop ---
-    const rowsOut = [];
-    let processed = 0;
-    let hitRate = false;
+    var rowsOut = [];
+    var processed = 0;
+    var hitRate = false;
+    var ok = 0, err = 0;
 
-    for (const typeId of chunk) {
-      const res = fetchVol30One_(typeId, regionId);   // uses retries + pacer
+    for (var c = 0; c < chunk.length; c++) {
+      var typeId = chunk[c];
+      var res = fetchVol30One_(typeId, regionId); // retries + pacer inside
 
-      if (res.status === 'ERR_RATE') {                // hit bandwidth limit → pause chunk
+      if (res.status === 'ERR_RATE') {
         hitRate = true;
-        break;                                        // leave remaining items for next run
+        LoggerEx.warn('mf.rate.hit rid=' + rid + ' region=' + regionId + ' type=' + typeId + ' processed=' + processed);
+        break; // leave remaining items for next run
       }
 
-      const v30 = (res.status === 'OK') ? res.vol30 : "";
-      const vel = (res.status === 'OK') ? res.vel : "";
-
-      rowsOut.push([typeId, regionId, v30, vel, new Date(), res.status]);
-
-      // Optional debug: highlight surprising zeros
-      if ((res.vol30 | 0) === 0 && res.status === 'OK') {
-        (LoggerEx?.info || console.info)('zero vol30', {
-          typeId, regionId
-          // tip: you can log a sample hist row inside fetchVol30One_ if needed
-        });
+      if (res.status === 'OK') {
+        ok++;
+        rowsOut.push([typeId, regionId, res.vol30, res.vel, new Date(), res.status]);
+      } else {
+        err++;
+        rowsOut.push([typeId, regionId, "", "", new Date(), res.status]);
+        LoggerEx.warn('mf.item.err rid=' + rid + ' region=' + regionId + ' type=' + typeId + ' status=' + res.status);
       }
 
       processed++;
     }
 
-    // Flush this chunk’s results
-    if (rowsOut.length) upsertRegionCache_(cache, rowsOut);
-    publishMarketResultESIRegion();
+    // Flush once
+    if (rowsOut.length) {
+      upsertRegionCache_(cache, rowsOut);
+      publishMarketResultESIRegion();
+      LoggerEx.log('mf.flush.chunk rid=' + rid + ' rows=' + rowsOut.length);
+    } else {
+      LoggerEx.log('mf.flush.empty rid=' + rid);
+    }
 
-    // Advance cursor only by processed records
-    ii += processed;
-    if (ii >= items.length) { ii = 0; ri++; }
+    // Advance cursor only by actual work
+    var cursorBefore = { ri: ri, ii: ii };
+    if (hitRate && processed === 0) {
+      if (typeof hardenPacer_ === 'function') hardenPacer_();
+      LoggerEx.warn('mf.cursor.stay_due_to_rate rid=' + rid + ' region=' + regionId +
+                    ' cursor=' + JSON.stringify(cursorBefore));
+      // keep ri/ii unchanged
+    } else {
+      ii += processed;
+      if (ii >= items.length) { ii = 0; ri++; }
+      if (!hitRate && typeof relaxPacer_ === 'function') relaxPacer_();
+    }
 
-    // Relax pacer if we completed the chunk without rate limits
-    if (!hitRate) relaxPacer_();
+    var done = (ri >= regions.length);
+    var cursorAfter = done ? null : { ri: ri, ii: ii };
 
-    // (keep your existing "done?" check / cursor persistence below)
+    LoggerEx.log('mf.run.summary rid=' + rid + ' region=' + regionId +
+                 ' ok=' + ok + ' err=' + err + ' hitRate=' + hitRate +
+                 ' processed=' + processed + ' elapsedMs=' + (Date.now()-t0) +
+                 ' cursorBefore=' + JSON.stringify(cursorBefore) +
+                 ' cursorAfter=' + JSON.stringify(cursorAfter) + ' done=' + done);
 
-
-    upsertRegionCache_(cache, rowsOut);
-    publishMarketResultESIRegion(); // progressive publish
-
-    // advance cursor
-    ii = end;
-    if (ii >= items.length) { ii = 0; ri++; }
-
-    // done?
-    if (ri >= regions.length) {
+    if (done) {
       props.deleteProperty('mf_job_active');
       props.deleteProperty('mf_cursor');
+      LoggerEx.log('mf.done rid=' + rid);
       return stopWorker_('done');
     }
-    props.setProperty('mf_cursor', JSON.stringify({ ri, ii }));
 
+    props.setProperty('mf_cursor', JSON.stringify({ ri: ri, ii: ii }));
+
+  } catch (e) {
+    LoggerEx.error('mf.run.exception rid=' + rid + ' msg=' + (e && e.message));
+    throw e;
   } finally {
-    try { lock.releaseLock(); } catch (e) { }
+    try { lock.releaseLock(); } catch (e2) {}
+    LoggerEx.log('mf.run.end rid=' + rid + ' ms=' + (Date.now() - t0));
   }
 }
+
 
 function isValidRegionId_(n) {
   n = Math.floor(Number(n));
@@ -615,5 +633,102 @@ function pruneCacheToConfig_(mode='tombstone'){
     }
   }
   updates.forEach(u => sh.getRange(u.rn, 1, 1, h.length).setValues([u.row]));
+}
+
+
+/**
+ * Build a values-only table per client from Publish_ESI_Region.
+ * Input:  Sheet "Interface Clients" → A:Client, B:region_id_heartbeat
+ * Source: Sheet "Publish_ESI_Region" (A:E = type_id,region_id,volume30_region,last_updated,status)
+ * Output: Sheet "Publish_ESI_Region_<client>" with headers:
+ *         [type_id, volume30_region, last_updated, status]
+ * Named range for client: MarketResultESI_Region_<client>
+ */
+function ESI_publishClientInterfaces() {
+  const ss    = SpreadsheetApp.getActive();
+  const srcSh = ss.getSheetByName('Publish_ESI_Region');
+  const cliSh = ss.getSheetByName('Interface Clients');
+  if (!srcSh || !cliSh) throw new Error('Missing required sheets');
+
+  const src = srcSh.getDataRange().getValues();
+  if (src.length < 2) return;
+
+  // Build region → rows from source (A:E fixed schema)
+  // A=0 type_id, B=1 region_id, C=2 volume30_region, D=3 last_updated, E=4 status
+  const byRegion = new Map();
+  for (let r = 1; r < src.length; r++) {
+    const row = src[r];
+    const rid = Number(row[1]);
+    if (!Number.isFinite(rid)) continue;
+    const packed = [row[0], row[2], row[3], row[4]]; // [type_id, vol30, last_updated, status]
+    if (!byRegion.has(rid)) byRegion.set(rid, []);
+    byRegion.get(rid).push(packed);
+  }
+
+  // Read clients: A:Client, B:region_id_heartbeat, (optional) C:status_filter like "OK|STALE-ESI"
+  const lastCliRow = cliSh.getLastRow();
+  if (lastCliRow < 2) return;
+  const cliRows = cliSh.getRange(2, 1, lastCliRow - 1, 3).getValues();
+
+  const OUT_HEADERS = ['type_id','volume30_region','last_updated','status'];
+
+  // helper: normalize status to uppercase with hyphens
+  const normStatus = s => String(s || '').trim().toUpperCase().replace(/_/g, '-');
+
+  for (const [clientRaw, ridRaw, filtRaw] of cliRows) {
+    const client = String(clientRaw || '').trim();
+    const rid    = Number(ridRaw);
+    if (!client || !Number.isFinite(rid)) continue;
+
+    // Build allowed set (default: OK|STALE-ESI)
+    const allowed = new Set(
+      String(filtRaw || 'OK|STALE-ESI')
+        .split(/[|,]/)
+        .map(x => normStatus(x))
+        .filter(Boolean)
+    );
+
+    // Filter rows by region + status
+    const rows = (byRegion.get(rid) || []).filter(r => allowed.has(normStatus(r[3])));
+
+    const outName = 'Publish_ESI_Region_' + client;
+    const outSh   = getOrCreateSheet(ss, outName, OUT_HEADERS); // your Utility helper
+
+    // Clear data rows, keep header
+    const last = outSh.getLastRow();
+    if (last > 1) outSh.getRange(2, 1, last - 1, OUT_HEADERS.length).clearContent();
+
+    // Write values-only
+    if (rows.length) {
+      outSh.getRange(2, 1, rows.length, OUT_HEADERS.length).setValues(rows);
+      outSh.getRange(2, 3, rows.length, 1).setNumberFormat('yyyy-mm-dd'); // last_updated
+    }
+
+    // Named range for clients to IMPORTRANGE
+    const height = Math.max(1, rows.length + 1);
+    ss.setNamedRange('MarketResultESI_Region_' + client,
+      outSh.getRange(1, 1, height, OUT_HEADERS.length));
+  }
+}
+
+/**
+ * Install/replace a time trigger to republish client interfaces.
+ * @param {number} everyMinutes  One of: 1, 5, 10, 15, 30 (default 10)
+ */
+function ESI_installClientInterfaceRefresh(everyMinutes) {
+  const allowed = [1,5,10,15,30];
+  const n = Number(everyMinutes || 5);
+  if (!allowed.includes(n)) throw new Error('everyMinutes must be 1, 5, 10, 15, or 30.');
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'ESI_publishClientInterfaces')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('ESI_publishClientInterfaces').timeBased().everyMinutes(n).create();
+}
+
+/** Remove the refresh trigger */
+function ESI_stopClientInterfaceRefresh() {
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'ESI_publishClientInterfaces')
+    .forEach(t => ScriptApp.deleteTrigger(t));
 }
 
