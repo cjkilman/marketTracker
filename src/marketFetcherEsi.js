@@ -39,6 +39,116 @@ const PACER_PROP_LAST = 'esi_last_ms';
 const PACER_MIN_MS = 400;   // start ~2.5 rps
 const PACER_MAX_MS = 5000;  // cap 5s between calls
 
+/***** GESI batching + governor (≤300 req/min) ********************************/
+
+// Hard cap
+var ESI_TB_RATE_PER_MIN = 300;   // tokens added per minute
+var ESI_TB_BURST = 300;   // max token bucket
+var ESI_GROUP_SIZE = 50;    // requests per fetchAll group
+var ESI_MICRO_BREATH_MS = 100;   // tiny pause between groups
+
+function tbConsume_(need) {
+  var props = PropertiesService.getScriptProperties();
+  var now = Date.now();
+  var last = +props.getProperty('esi_tb_last_ms') || 0;
+  var tok = +props.getProperty('esi_tb_tokens') || 0;
+
+  if (!last) { last = now; tok = ESI_TB_BURST; } // start full to avoid first-stall
+
+  var ratePerMs = ESI_TB_RATE_PER_MIN / 60000;                  // tokens/ms
+  tok = Math.min(ESI_TB_BURST, tok + ratePerMs * (now - last)); // refill
+
+  if (tok >= need) {
+    tok -= need;
+    props.setProperty('esi_tb_tokens', String(tok));
+    props.setProperty('esi_tb_last_ms', String(now));
+    return 0;
+  }
+
+  var shortfall = need - tok;
+  var waitMs = Math.ceil(shortfall / ratePerMs);
+  props.setProperty('esi_tb_tokens', '0');
+  props.setProperty('esi_tb_last_ms', String(now));
+  (LoggerEx?.info || console.info)('esi.tb.wait', { ms: waitMs, need: need });
+  return waitMs;
+}
+
+// ----- Blacksmoke/GESI client -----
+function getGESIHistoryClient_() {
+  // Requires GESI library + authorized character (Sheets Add-ons → GESI → Authorize)
+  return GESI.getClient().setFunction('markets_region_history');
+}
+
+function buildHistoryRequests_(client, regionId, typeIds) {
+  return typeIds.map(function (tid) {
+    return client.buildRequest({
+      region_id: regionId,
+      type_id: tid,
+      show_column_headings: false,
+      version: 'latest'
+    });
+  });
+}
+
+function summarizeHistory30_(rows) {
+  if (!rows || !rows.length) return { vol30: 0, vel: 0 };
+  var start = Math.max(0, rows.length - 30);
+  var v = 0;
+  for (var i = start; i < rows.length; i++) v += (+rows[i].volume || 0);
+  var n = rows.length - start;
+  return { vol30: v, vel: (n ? v / n : 0) };
+}
+
+function mapGESIRespToResult_(resp, typeId) {
+  var code = resp.getResponseCode();
+  if (code === 200) {
+    try {
+      var arr = JSON.parse(resp.getContentText()) || [];
+      var m = summarizeHistory30_(arr);
+      return { typeId: typeId, status: 'OK', vol30: m.vol30, vel: m.vel };
+    } catch (e) {
+      return { typeId: typeId, status: 'ERR_PARSE' };
+    }
+  }
+  if (code === 401 || code === 403) return { typeId: typeId, status: 'ERR_AUTH', code: code };
+  if (code === 420 || code === 429) return { typeId: typeId, status: 'ERR_RATE', code: code };
+  if (code >= 500) return { typeId: typeId, status: 'ERR_5XX', code: code };
+  if (code >= 400) return { typeId: typeId, status: 'ERR_4XX', code: code };
+  return { typeId: typeId, status: 'ERR_' + code, code: code };
+}
+
+function fetchHistoryBatchGESI_(regionId, typeIds) {
+  var client = getGESIHistoryClient_();
+  var out = [];
+
+  for (var i = 0; i < typeIds.length; i += ESI_GROUP_SIZE) {
+    var ids = typeIds.slice(i, i + ESI_GROUP_SIZE);
+
+    // governor
+    var wait = tbConsume_(ids.length);
+    if (wait > 0) Utilities.sleep(Math.min(wait, 30000));
+
+    var reqs = buildHistoryRequests_(client, regionId, ids);
+    var resps = UrlFetchApp.fetchAll(reqs);
+
+    // log error-budget once per group when available
+    try {
+      var hdr = resps[0].getAllHeaders && resps[0].getAllHeaders();
+      var remain = +(hdr && (hdr['x-esi-error-limit-remain'] || hdr['X-Esi-Error-Limit-Remain']) || -1);
+      var reset = +(hdr && (hdr['x-esi-error-limit-reset'] || hdr['X-Esi-Error-Limit-Reset']) || -1);
+      if (remain >= 0) (LoggerEx?.info || console.info)('esi.errbudget', { remain: remain, reset: reset });
+    } catch (_) { }
+
+    for (var k = 0; k < resps.length; k++) {
+      out.push(mapGESIRespToResult_(resps[k], ids[k]));
+    }
+    Utilities.sleep(ESI_MICRO_BREATH_MS);
+  }
+  return out;
+}
+
+
+
 function isRateLimitedError_(e) {
   const s = String(e && e.message || e || '');
   return /bandwidth quota exceeded|error limit|too many|429|420/i.test(s);
@@ -96,8 +206,8 @@ function fetchVol30One_(typeId, regionId) {
   try {
     const hist = withRetries_(
       () => GESI.getClient()
-                .setFunction('markets_region_history')
-                .executeRaw({ type_id: typeId, region_id: regionId }),
+        .setFunction('markets_region_history')
+        .executeRaw({ type_id: typeId, region_id: regionId }),
       3, 800
     ); // -> [{date:"YYYY-MM-DD", volume:..., ...}]
 
@@ -133,8 +243,15 @@ function fetchVol30One_(typeId, regionId) {
 function testESIHistory() {
   const rid = 10000043; // Domain
   const tid = 34;       // Tritanium
-  const res = GESI.markets_region_history(tid, rid);
-  console.log('history rows:', Array.isArray(res) ? res.length : res);
+  const client = GESI.getClient().setFunction('markets_region_history');
+  const resp = UrlFetchApp.fetch(client.buildRequest({
+    region_id: rid,
+    type_id: tid,
+    show_column_headings: false,
+    version: 'latest'
+  }));
+  const rows = JSON.parse(resp.getContentText());
+  console.log('history rows:', Array.isArray(rows) ? rows.length : rows);
 }
 
 
@@ -257,35 +374,50 @@ function marketFetchChunk() {
     var chunk = items.slice(ii, end);
 
     LoggerEx.log('mf.run.start rid=' + rid + ' regions=' + regions.length + ' items=' + items.length +
-                 ' cursorIn=' + JSON.stringify({ri:ri, ii:ii}) +
-                 ' region=' + regionId + ' window=' + JSON.stringify({from:ii, to:end, size:chunk.length}));
+      ' cursorIn=' + JSON.stringify({ ri: ri, ii: ii }) +
+      ' region=' + regionId + ' window=' + JSON.stringify({ from: ii, to: end, size: chunk.length }));
 
     var rowsOut = [];
     var processed = 0;
     var hitRate = false;
     var ok = 0, err = 0;
 
-    for (var c = 0; c < chunk.length; c++) {
-      var typeId = chunk[c];
-      var res = fetchVol30One_(typeId, regionId); // retries + pacer inside
+    // --- GESI batch (auth handled by GESI, paced by token bucket) ---
+    var results = fetchHistoryBatchGESI_(regionId, chunk);
 
-      if (res.status === 'ERR_RATE') {
+    var rowsOut = [];
+    var processed = 0;
+    var hitRate = false;
+    var ok = 0, err = 0, errAuth = 0;
+
+    for (var i = 0; i < results.length; i++) {
+      var r = results[i];
+
+      if (r.status === 'ERR_RATE') {
         hitRate = true;
-        LoggerEx.warn('mf.rate.hit rid=' + rid + ' region=' + regionId + ' type=' + typeId + ' processed=' + processed);
-        break; // leave remaining items for next run
+        LoggerEx.warn('mf.rate.hit rid=' + rid + ' region=' + regionId + ' processed=' + processed);
+        break; // leave remainder for next run
       }
 
-      if (res.status === 'OK') {
+      if (r.status === 'ERR_AUTH') {
+        errAuth++;
+        rowsOut.push([r.typeId, regionId, "", "", new Date(), 'ERR_AUTH']);
+        continue; // do NOT advance processed; we'll fail-fast after flush
+      }
+
+      if (r.status === 'OK') {
         ok++;
-        rowsOut.push([typeId, regionId, res.vol30, res.vel, new Date(), res.status]);
+        rowsOut.push([r.typeId, regionId, r.vol30, r.vel, new Date(), 'OK']);
+        if (r.vol30 === 0) (LoggerEx?.info || console.info)('mf.vol30.zero', { regionId: regionId, typeId: r.typeId });
+        processed++;
       } else {
         err++;
-        rowsOut.push([typeId, regionId, "", "", new Date(), res.status]);
-        LoggerEx.warn('mf.item.err rid=' + rid + ' region=' + regionId + ' type=' + typeId + ' status=' + res.status);
+        rowsOut.push([r.typeId, regionId, "", "", new Date(), r.status]);
+        LoggerEx.warn('mf.item.err rid=' + rid + ' region=' + regionId + ' type=' + r.typeId + ' status=' + r.status);
+        processed++; // non-auth errors still advance so we avoid stalls
       }
-
-      processed++;
     }
+
 
     // Flush once
     if (rowsOut.length) {
@@ -296,12 +428,22 @@ function marketFetchChunk() {
       LoggerEx.log('mf.flush.empty rid=' + rid);
     }
 
+    // Auth fail-fast: stop job, preserve cursor. No recycling.
+    if (errAuth > 0) {
+      var props = PropertiesService.getScriptProperties();
+      props.setProperty('mf_blocked_auth', '1');              // breadcrumb if you want to gate startup
+      props.deleteProperty('mf_job_active');
+      LoggerEx.error('mf.auth.block rid=' + rid + ' region=' + regionId + ' errAuth=' + errAuth + ' hint="Sheets → Add-ons → GESI → Authorize Character"');
+      return stopWorker_('auth required');
+    }
+
+
     // Advance cursor only by actual work
     var cursorBefore = { ri: ri, ii: ii };
     if (hitRate && processed === 0) {
       if (typeof hardenPacer_ === 'function') hardenPacer_();
       LoggerEx.warn('mf.cursor.stay_due_to_rate rid=' + rid + ' region=' + regionId +
-                    ' cursor=' + JSON.stringify(cursorBefore));
+        ' cursor=' + JSON.stringify(cursorBefore));
       // keep ri/ii unchanged
     } else {
       ii += processed;
@@ -313,10 +455,10 @@ function marketFetchChunk() {
     var cursorAfter = done ? null : { ri: ri, ii: ii };
 
     LoggerEx.log('mf.run.summary rid=' + rid + ' region=' + regionId +
-                 ' ok=' + ok + ' err=' + err + ' hitRate=' + hitRate +
-                 ' processed=' + processed + ' elapsedMs=' + (Date.now()-t0) +
-                 ' cursorBefore=' + JSON.stringify(cursorBefore) +
-                 ' cursorAfter=' + JSON.stringify(cursorAfter) + ' done=' + done);
+      ' ok=' + ok + ' err=' + err + ' hitRate=' + hitRate +
+      ' processed=' + processed + ' elapsedMs=' + (Date.now() - t0) +
+      ' cursorBefore=' + JSON.stringify(cursorBefore) +
+      ' cursorAfter=' + JSON.stringify(cursorAfter) + ' done=' + done);
 
     if (done) {
       props.deleteProperty('mf_job_active');
@@ -331,7 +473,7 @@ function marketFetchChunk() {
     LoggerEx.error('mf.run.exception rid=' + rid + ' msg=' + (e && e.message));
     throw e;
   } finally {
-    try { lock.releaseLock(); } catch (e2) {}
+    try { lock.releaseLock(); } catch (e2) { }
     LoggerEx.log('mf.run.end rid=' + rid + ' ms=' + (Date.now() - t0));
   }
 }
@@ -407,21 +549,23 @@ function marketStatDataCache(type_ids, location_type, location_id, order_type, o
 
 /* =============================== HELPERS ================================ */
 function publishMarketResultESIRegion() {
-  const ss   = SpreadsheetApp.getActiveSpreadsheet();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
   const cache = ss.getSheetByName(SHEET_REGION_CACHE);
-  const pub   = ss.getSheetByName(SHEET_PUBLISH);
+  const pub = ss.getSheetByName(SHEET_PUBLISH);
   if (!cache || !pub) throw new Error('Missing sheets');
 
   const keepPairs = getConfigPairSet_();               // ← NEW
 
   const vals = cache.getDataRange().getValues();
-  const out  = [HEADERS_PUBLISH];
+  const out = [HEADERS_PUBLISH];
 
   if (vals.length > 1) {
-    const h  = vals[0];
-    const ix = { t:h.indexOf('type_id'), r:h.indexOf('region_id'),
-                 v:h.indexOf('volume30_region'), u:h.indexOf('last_updated'),
-                 s:h.indexOf('status') };
+    const h = vals[0];
+    const ix = {
+      t: h.indexOf('type_id'), r: h.indexOf('region_id'),
+      v: h.indexOf('volume30_region'), u: h.indexOf('last_updated'),
+      s: h.indexOf('status')
+    };
 
     for (let i = 1; i < vals.length; i++) {
       const row = vals[i];
@@ -577,59 +721,59 @@ function debugListSources() {
 }
 
 
-function _pairKey_(t, r){ return `${Math.floor(t)}:${Math.floor(r)}`; }
+function _pairKey_(t, r) { return `${Math.floor(t)}:${Math.floor(r)}`; }
 
-function getConfigPairSet_(){
-  const items   = readListFlex_(ITEMS_SOURCE,   { numeric:true, integer:true });
-  const regions = readListFlex_(REGIONS_SOURCE, { numeric:true, integer:true, dropZeros:true, validator: isValidRegionId_ });
+function getConfigPairSet_() {
+  const items = readListFlex_(ITEMS_SOURCE, { numeric: true, integer: true });
+  const regions = readListFlex_(REGIONS_SOURCE, { numeric: true, integer: true, dropZeros: true, validator: isValidRegionId_ });
   const set = new Set();
-  for (const t of items) for (const r of regions) set.add(_pairKey_(t,r));
+  for (const t of items) for (const r of regions) set.add(_pairKey_(t, r));
   return set;
 }
 
 
-function pruneCacheToConfig_(mode='tombstone'){
+function pruneCacheToConfig_(mode = 'tombstone') {
   const ss = SpreadsheetApp.getActive();
   const sh = ss.getSheetByName(SHEET_REGION_CACHE);
-  if (!sh) throw new Error('Missing '+SHEET_REGION_CACHE);
+  if (!sh) throw new Error('Missing ' + SHEET_REGION_CACHE);
 
   const vals = sh.getDataRange().getValues();
   if (vals.length <= 1) return;
 
-  const h   = vals[0];
-  const iT  = h.indexOf('type_id');
-  const iR  = h.indexOf('region_id');
-  const iV  = h.indexOf('volume30_region');
-  const iVel= h.indexOf('velocity_region');
-  const iU  = h.indexOf('last_updated');
-  const iS  = h.indexOf('status');
+  const h = vals[0];
+  const iT = h.indexOf('type_id');
+  const iR = h.indexOf('region_id');
+  const iV = h.indexOf('volume30_region');
+  const iVel = h.indexOf('velocity_region');
+  const iU = h.indexOf('last_updated');
+  const iS = h.indexOf('status');
 
   const keepPairs = getConfigPairSet_();
 
-  if (mode === 'hard'){
+  if (mode === 'hard') {
     // Rebuild the sheet with only configured rows
     const out = [h];
-    for (let i=1;i<vals.length;i++){
+    for (let i = 1; i < vals.length; i++) {
       const row = vals[i];
       if (keepPairs.has(_pairKey_(row[iT], row[iR]))) out.push(row);
     }
     sh.clear();
-    sh.getRange(1,1,out.length,out[0].length).setValues(out);
+    sh.getRange(1, 1, out.length, out[0].length).setValues(out);
     sh.setFrozenRows(1);
     return;
   }
 
   // tombstone: mark non-config rows as REMOVED and blank their numbers
   const updates = [];
-  for (let i=1;i<vals.length;i++){
+  for (let i = 1; i < vals.length; i++) {
     const row = vals[i];
     const keep = keepPairs.has(_pairKey_(row[iT], row[iR]));
     if (!keep) {
       row[iV] = "";               // blank numerics
       if (iVel > -1) row[iVel] = "";
-      if (iU > -1)   row[iU] = new Date();
+      if (iU > -1) row[iU] = new Date();
       row[iS] = "REMOVED";
-      updates.push({ rn:i+1, row });
+      updates.push({ rn: i + 1, row });
     }
   }
   updates.forEach(u => sh.getRange(u.rn, 1, 1, h.length).setValues([u.row]));
@@ -645,7 +789,7 @@ function pruneCacheToConfig_(mode='tombstone'){
  * Named range for client: MarketResultESI_Region_<client>
  */
 function ESI_publishClientInterfaces() {
-  const ss    = SpreadsheetApp.getActive();
+  const ss = SpreadsheetApp.getActive();
   const srcSh = ss.getSheetByName('Publish_ESI_Region');
   const cliSh = ss.getSheetByName('Interface Clients');
   if (!srcSh || !cliSh) throw new Error('Missing required sheets');
@@ -670,14 +814,14 @@ function ESI_publishClientInterfaces() {
   if (lastCliRow < 2) return;
   const cliRows = cliSh.getRange(2, 1, lastCliRow - 1, 3).getValues();
 
-  const OUT_HEADERS = ['type_id','volume30_region','last_updated','status'];
+  const OUT_HEADERS = ['type_id', 'volume30_region', 'last_updated', 'status'];
 
   // helper: normalize status to uppercase with hyphens
   const normStatus = s => String(s || '').trim().toUpperCase().replace(/_/g, '-');
 
   for (const [clientRaw, ridRaw, filtRaw] of cliRows) {
     const client = String(clientRaw || '').trim();
-    const rid    = Number(ridRaw);
+    const rid = Number(ridRaw);
     if (!client || !Number.isFinite(rid)) continue;
 
     // Build allowed set (default: OK|STALE-ESI)
@@ -692,7 +836,7 @@ function ESI_publishClientInterfaces() {
     const rows = (byRegion.get(rid) || []).filter(r => allowed.has(normStatus(r[3])));
 
     const outName = 'Publish_ESI_Region_' + client;
-    const outSh   = getOrCreateSheet(ss, outName, OUT_HEADERS); // your Utility helper
+    const outSh = getOrCreateSheet(ss, outName, OUT_HEADERS); // your Utility helper
 
     // Clear data rows, keep header
     const last = outSh.getLastRow();
@@ -716,7 +860,7 @@ function ESI_publishClientInterfaces() {
  * @param {number} everyMinutes  One of: 1, 5, 10, 15, 30 (default 10)
  */
 function ESI_installClientInterfaceRefresh(everyMinutes) {
-  const allowed = [1,5,10,15,30];
+  const allowed = [1, 5, 10, 15, 30];
   const n = Number(everyMinutes || 5);
   if (!allowed.includes(n)) throw new Error('everyMinutes must be 1, 5, 10, 15, or 30.');
   ScriptApp.getProjectTriggers()
