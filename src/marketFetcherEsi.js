@@ -513,50 +513,65 @@ function isValidRegionId_(n) {
 function marketStatDataCache(type_ids, location_type, location_id, order_type, order_level) {
   if (type_ids == null) return "";
 
+  // normalize location
   const lt = String(location_type || "").toLowerCase();
-  if (!["region", "system", "station"].includes(lt)) {
+  if (!["region","system","station"].includes(lt)) {
+    return Array.isArray(type_ids) ? type_ids.map(() => [""]) : "";
+  }
+  const loc = Number(location_id);
+  if (!Number.isFinite(loc)) {
     return Array.isArray(type_ids) ? type_ids.map(() => [""]) : "";
   }
 
+  // order normalization (default: sell/volume for cache reads)
   const norm = (typeof _normalizeOrder === "function")
-    ? _normalizeOrder(order_type, order_level)
+    ? _normalizeOrder(order_type, order_level || "volume")
     : {
-      type: (String(order_type || "sell").toLowerCase() === "buy" ? "buy" : "sell"),
-      level: String(order_level || "volume").toLowerCase()
-    };
+        type: (String(order_type || "sell").toLowerCase() === "buy" ? "buy" : "sell"),
+        level: String(order_level || "volume").toLowerCase()
+      };
 
   // preserve input shape
-  const in2D = Array.isArray(type_ids) ? type_ids : [[type_ids]];
+  const in2D = Array.isArray(type_ids)
+    ? (Array.isArray(type_ids[0]) ? type_ids : type_ids.map(v => [v]))
+    : [[type_ids]];
   const rows = in2D.length, cols = in2D[0].length;
 
-  // flatten ids, keep nulls for placeholders
+  // flatten ids (keep nulls as placeholders)
   const flatIds = [];
   for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
-    const n = Number(in2D[r][c]); flatIds.push(Number.isFinite(n) ? n : null);
+    const n = Number(in2D[r][c]);
+    flatIds.push(Number.isFinite(n) ? n : null);
   }
 
   if (typeof _getCachedFuz !== "function") {
-    throw new Error("_getCachedFuz not found — ensure marketStatData defines it (CacheService-backed).");
+    throw new Error("_getCachedFuz not found — ensure the Fuzz module is loaded.");
   }
 
+  // read cache only
   const uniq = Array.from(new Set(flatIds.filter(n => n != null)));
-  const { have } = _getCachedFuz(uniq, Number(location_id), lt); // {have:{[typeId]:row}}
+  const { have } = _getCachedFuz(uniq, loc, lt); // {have: {[typeId]: row}}
 
+  // picker (min|max|avg|median|volume)
   const pick = (row) => {
-    if (!row || !row[norm.type]) return null;
-    const v = row[norm.type][norm.level];  // min|max|avg|median|volume
+    if (!row) return null;
+    const node = row[norm.type];
+    if (!node) return null;
+    const v = node[norm.level];
     const num = Number(v);
     return Number.isFinite(num) ? num : null;
   };
 
-  let k = 0;
+  // map back to original shape
   const out = Array.from({ length: rows }, () => Array(cols).fill(""));
+  let k = 0;
   for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
     const id = flatIds[k++];
     out[r][c] = (id == null) ? "" : (pick(have[id]) ?? "");
   }
   return Array.isArray(type_ids) ? out : out[0][0];
 }
+
 
 
 /* =============================== HELPERS ================================ */
