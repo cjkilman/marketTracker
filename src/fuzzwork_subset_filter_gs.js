@@ -182,12 +182,7 @@ function normalizeConfig_(raw){
 }
 
 // ----------------------------- Sheet helpers ----------------------------------
-function getOrCreateSheet_(name) {
-  const ss = SpreadsheetApp.getActive();
-  let sh = ss.getSheetByName(name);
-  if (!sh) sh = ss.insertSheet(name);
-  return sh;
-}
+
 
 function writeTableChunked_(sheetName, table, chunkRows) {
   const sh = getOrCreateSheet_(sheetName);

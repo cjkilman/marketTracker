@@ -298,8 +298,8 @@ function Debug_Gatekeeper() {
   const DUR = 60; // minutes window for open/close
 
   // window membership
-  const inOpen  = _inWindow_(now, oH, oM, DUR);
-  const inClose = _inWindow_(now, cH, cM, DUR);
+  const inOpen  = inWindow(now, oH, oM, DUR);
+  const inClose = inWindow(now, cH, cM, DUR);
 
   // pretty prints
   const openStart = _fmt(tz, _atHM(now, oH, oM));
@@ -341,8 +341,8 @@ function Debug_Gatekeeper_At(isoLike) {
   const { h: oH, m: oM } = _toHM(cfg.OpenTime);
   const { h: cH, m: cM } = _toHM(cfg.CloseTime);
   const DUR=60;
-  const inOpen  = _inWindow_(mock, oH, oM, DUR);
-  const inClose = _inWindow_(mock, cH, cM, DUR);
+  const inOpen  = inWindow(mock, oH, oM, DUR);
+  const inClose = inWindow(mock, cH, cM, DUR);
   Logger.log(`Inside OPEN=${inOpen}, Inside CLOSE=${inClose}`);
   ["auto","open","close"].forEach(mode=>{
     const r = _determinePhase(cfg, mode, mock);

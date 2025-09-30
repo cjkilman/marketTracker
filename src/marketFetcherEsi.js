@@ -824,61 +824,120 @@ function ESI_publishClientInterfaces() {
   const src = srcSh.getDataRange().getValues();
   if (src.length < 2) return;
 
-  // Build region → rows from source (A:E fixed schema)
-  // A=0 type_id, B=1 region_id, C=2 volume30_region, D=3 last_updated, E=4 status
+  // ---- helpers ----
+  const normStatus = (s) => String(s || '').trim().toUpperCase().replace(/_/g, '-');
+  const toInt = (v) => {
+    const n = Number(String(v).replace(/[^\d\-]/g, ''));
+    return Number.isFinite(n) ? n : NaN;
+  };
+  const toDate = (v) => {
+    if (v instanceof Date) return v;
+    const s = String(v || '').trim();
+    if (!s) return null;
+    // Try YYYY-MM-DD first
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+    if (m) return new Date(Date.UTC(+m[1], +m[2]-1, +m[3]));
+    // Try serial / general number
+    const n = Number(s);
+    if (Number.isFinite(n)) return new Date(Math.round((n - 25569) * 86400000)); // Excel serial fallback
+    // Last resort: Date.parse
+    const t = Date.parse(s);
+    return isNaN(t) ? null : new Date(t);
+  };
+
+  // ---- group rows by region ----
+  // Build region → deduped rows keyed by type_id (prefer latest last_updated)
+  /** @type {Map<number, Map<number, any[]>>} */
   const byRegion = new Map();
+
+  // src schema A..E: [type_id, region_id, vol30, last_updated, status]
   for (let r = 1; r < src.length; r++) {
     const row = src[r];
-    const rid = Number(row[1]);
-    if (!Number.isFinite(rid)) continue;
-    const packed = [row[0], row[2], row[3], row[4]]; // [type_id, vol30, last_updated, status]
-    if (!byRegion.has(rid)) byRegion.set(rid, []);
-    byRegion.get(rid).push(packed);
+    const typeId = toInt(row[0]);
+    const regionId = toInt(row[1]);
+    if (!Number.isFinite(typeId) || !Number.isFinite(regionId)) continue;
+
+    const vol30 = Number(row[2]) || 0;
+    const last = toDate(row[3]);       // Date or null
+    const status = normStatus(row[4]);
+
+    if (!byRegion.has(regionId)) byRegion.set(regionId, new Map());
+    const bag = byRegion.get(regionId);
+
+    // dedupe by type_id: keep the row with the most recent last_updated
+    const prev = bag.get(typeId);
+    if (!prev) {
+      bag.set(typeId, [typeId, vol30, last || '', status]);
+    } else {
+      const prevDate = prev[2] instanceof Date ? prev[2] : toDate(prev[2]);
+      if ((last && !prevDate) || (last && prevDate && last > prevDate)) {
+        bag.set(typeId, [typeId, vol30, last, status]);
+      }
+    }
   }
 
-  // Read clients: A:Client, B:region_id_heartbeat, (optional) C:status_filter like "OK|STALE-ESI"
+  // ---- read clients ----
   const lastCliRow = cliSh.getLastRow();
   if (lastCliRow < 2) return;
   const cliRows = cliSh.getRange(2, 1, lastCliRow - 1, 3).getValues();
 
   const OUT_HEADERS = ['type_id', 'volume30_region', 'last_updated', 'status'];
 
-  // helper: normalize status to uppercase with hyphens
-  const normStatus = s => String(s || '').trim().toUpperCase().replace(/_/g, '-');
-
   for (const [clientRaw, ridRaw, filtRaw] of cliRows) {
     const client = String(clientRaw || '').trim();
-    const rid = Number(ridRaw);
-    if (!client || !Number.isFinite(rid)) continue;
+    const regionId = toInt(ridRaw);
+    if (!client || !Number.isFinite(regionId)) continue;
 
-    // Build allowed set (default: OK|STALE-ESI)
+    // Build allowed set (default OK|STALE-ESI; "ALL" skips filtering)
+    const filt = String(filtRaw || 'OK|STALE-ESI').trim();
+    const allowAll = normStatus(filt) === 'ALL';
     const allowed = new Set(
-      String(filtRaw || 'OK|STALE-ESI')
-        .split(/[|,]/)
-        .map(x => normStatus(x))
-        .filter(Boolean)
+      allowAll
+        ? []
+        : filt.split(/[|,]/).map((x) => normStatus(x)).filter(Boolean)
     );
 
-    // Filter rows by region + status
-    const rows = (byRegion.get(rid) || []).filter(r => allowed.has(normStatus(r[3])));
+    // Pull region rows and apply status filter
+    const bag = byRegion.get(regionId);
+    const rows = [];
+    if (bag && bag.size) {
+      for (const [, rec] of bag) {
+        if (!rec) continue;
+        const st = normStatus(rec[3]);
+        if (allowAll || allowed.has(st)) rows.push(rec);
+      }
+    }
+
+    // Optional: sort by volume desc, then type_id
+    rows.sort((a, b) => (b[1] - a[1]) || (a[0] - b[0]));
+
+    // Coerce last_updated to Date objects for formatting
+    for (let i = 0; i < rows.length; i++) {
+      const d = rows[i][2];
+      rows[i][2] = toDate(d) || '';
+    }
 
     const outName = 'Publish_ESI_Region_' + client;
-    const outSh = getOrCreateSheet(ss, outName, OUT_HEADERS); // your Utility helper
+    const outSh = getOrCreateSheet(ss, outName, OUT_HEADERS);
 
-    // Clear data rows, keep header
+    // Clear old data rows, keep header
     const last = outSh.getLastRow();
     if (last > 1) outSh.getRange(2, 1, last - 1, OUT_HEADERS.length).clearContent();
 
-    // Write values-only
     if (rows.length) {
       outSh.getRange(2, 1, rows.length, OUT_HEADERS.length).setValues(rows);
-      outSh.getRange(2, 3, rows.length, 1).setNumberFormat('yyyy-mm-dd'); // last_updated
+      // number/date formats
+      outSh.getRange(2, 1, rows.length, 1).setNumberFormat('0');              // type_id
+      outSh.getRange(2, 2, rows.length, 1).setNumberFormat('#,##0');          // volume30_region
+      outSh.getRange(2, 3, rows.length, 1).setNumberFormat('yyyy-mm-dd');     // last_updated
     }
 
-    // Named range for clients to IMPORTRANGE
+    // Update named range (header + data)
     const height = Math.max(1, rows.length + 1);
-    ss.setNamedRange('MarketResultESI_Region_' + client,
-      outSh.getRange(1, 1, height, OUT_HEADERS.length));
+    ss.setNamedRange(
+      'MarketResultESI_Region_' + client,
+      outSh.getRange(1, 1, height, OUT_HEADERS.length)
+    );
   }
 }
 

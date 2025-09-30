@@ -1,212 +1,352 @@
-/** ============================================================================
- * Fuzzworks Price Client + Cache Helpers (Apps Script / Sheets)
- * - Consistent DocumentCache usage
- * - Versioned cache keys
- * - Chunked POST requests + retries + tiny breath between chunks
- * - Safe with (optional) LoggerEx; falls back to console
- * - Functions:
- *     testfuzAPI()
- *     fuzzApiPriceDataJitaSell(type_ids, market_hub?, order_type?, order_level?)
- *     fuzzPriceDataByHub(type_ids, market_hub?, order_type?, order_level?)
- *     marketStatData(type_ids, location_type, location_id, order_type, order_level)
- * ----------------------------------------------------------------------------
- * Fuzzworks endpoint: https://market.fuzzwork.co.uk/aggregates/
- * Payload form: { station|system|region: <id>, types: "34,35,36,..."}
- * Returns: { <type_id>: { buy:{min,max,avg,median,volume}, sell:{...} }, ... }
- * ========================================================================== */
+/**
+ * FuzzApiPrice.js — coalesced fetch + script-scope cache + negative caching
+ * - ScriptCache + ScriptLock (aligned)
+ * - One aggregate per (location_type, location_id, type_id) containing both buy & sell
+ * - Claim + recheck so only one concurrent caller fetches a given id
+ * - Bytes check before caching (CacheService limit ≈ 100KB/key)
+ * - Negative caching: store JSON 'null' for not-found ids with longer TTL
+ * - Helpers + wrappers:
+ *    fuzzPriceDataByHub(type_ids, market_hub="Jita", order_type="sell", order_level=null)
+ *    fuzzApiPriceDataJitaSell(type_ids, market_hub=60003760, order_type=null, order_level=null)
+ *    marketStatData(type_ids, location_type, location_id, order_type, order_level)
+ *    marketStatDataCache(type_ids, location_type, location_id, order_type, order_level)
+ *    marketStatDataBoth(type_ids, location_type, location_id, order_level)
+ *    marketStatDataBothCache(type_ids, location_type, location_id, order_level)
+ */
 
-/* ------------------------------ Utilities -------------------------------- */
+const FUZ_CACHE_VER = 'v4';
+const FUZ_NEG_TTL = 6 * 60 * 60;  // 6 hours for negative (not-found)
+const CLAIM_TTL_S = 20;           // 20s claim lifetime (short)
+const FETCH_BATCH = 700;          // ids per POST
 
-function _L_warn(tag, obj) {
-  try {
-    if (typeof LoggerEx !== 'undefined' && LoggerEx.warn) LoggerEx.warn(tag, obj);
-    else console.warn(tag, obj);
-  } catch (_) {}
-}
-function _L_info(tag, obj) {
-  try {
-    if (typeof LoggerEx !== 'undefined' && LoggerEx.log) LoggerEx.log(tag, obj);
-    else console.log(tag, obj);
-  } catch (_) {}
-}
-
-/** Run fn with simple backoff on common transient errors. */
-function withRetries(fn, tries = 3, base = 300) {
-  for (let i = 0; i < tries; i++) {
-    try { return fn(); }
-    catch (e) {
-      const s = String(e && e.message || e);
-      if (!/429|420|5\d\d|temporar|rate|timeout/i.test(s) || i === tries - 1) throw e;
-      Utilities.sleep(base * Math.pow(2, i) + Math.floor(Math.random() * 200));
-    }
-  }
-}
-
-/** Hold a short document lock to avoid cache write thrash. */
-function withDocLock(fn, ms = 30000) {
-  const lock = LockService.getDocumentLock();
-  lock.waitLock(ms);
-  try { return fn(); }
-  finally { lock.releaseLock(); }
-}
-
-/** Normalize order_type/order_level. Defaults: sell/min. */
-function _normalizeOrder(order_type, order_level) {
-  let type  = order_type ? String(order_type).toLowerCase() : null;
-  let level = order_level ? String(order_level).toLowerCase() : null;
-
-  if (type === "bid") type = "buy";
-  if (type === "ask") type = "sell";
-  const levelAliases = { mean: "avg", average: "avg", med: "median", vol: "volume", qty: "volume", quantity: "volume" };
-  if (level && levelAliases[level]) level = levelAliases[level];
-
-  if (!type && !level)        { type = "sell"; level = "min"; }
-  else if (!type && level)    { type = (level === "max") ? "buy" : "sell"; }
-  else if (type && !level)    { level = (type === "buy") ? "max" : "min"; }
-
-  const validTypes  = ["buy","sell"];
-  const validLevels = ["min","max","avg","median","volume"];
-  if (!validTypes.includes(type))  throw new Error("order_type must be 'buy' or 'sell'");
-  if (!validLevels.includes(level)) throw new Error("order_level must be one of 'min','max','avg','median','volume'");
-  return { type, level };
-}
-
-/** 2D helpers to preserve the shape of input ranges */
-function _as2D(input) {
-  if (Array.isArray(input)) {
-    return Array.isArray(input[0]) ? input : input.map(v => [v]);
-  }
-  return [[input]];
-}
-function _flatten2D(a2d) {
-  const out = [];
-  for (let r = 0; r < a2d.length; r++) for (let c = 0; c < a2d[0].length; c++) out.push(a2d[r][c]);
-  return out;
-}
-function _reshape(flat, rows, cols) {
-  const out = Array.from({ length: rows }, () => Array(cols).fill(""));
-  let k = 0;
-  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) out[r][c] = flat[k++];
-  return out;
-}
-
-/* ------------------------- Cache key / scope helpers ---------------------- */
-
-const FUZ_CACHE_VER = 'v2';
-function cacheScope() { return CacheService.getDocumentCache(); } // swap to getScriptCache() to share across bound scripts
-
-function _fuzKey(location_type, location_id, type_id) {
-  return `fuz:${FUZ_CACHE_VER}:${location_type}:${location_id}:${type_id}`;
-}
 function ttlForScope(lt) {
   lt = String(lt || '').toLowerCase();
   return lt === 'region' ? 30 * 60 : lt === 'system' ? 20 * 60 : 10 * 60; // seconds
 }
 
-/* ------------------------------ Core fetcher ------------------------------ */
+function cacheScope() {
+  return CacheService.getScriptCache();
+}
 
-/**
- * Pull price aggregates for type_ids from Fuzzworks.
- * - Caches per (location_type, location_id, type_id) in DocumentCache
- * - Chunked POSTs + retries on transient errors
- * - Returns: { <type_id>: fullAggregateObject }
- */
-function postFetch(type_ids, location_id, location_type = "station") {
-  if (!type_ids) throw new Error('type_ids is required');
-  if (!Array.isArray(type_ids)) type_ids = [type_ids];
+// add near the top
+function toNumOrNull(x) {
+  if (x === null || x === undefined) return null;
+  if (typeof x === 'number') return Number.isFinite(x) ? x : null;
+  if (typeof x === 'string') {
+    const s = x.trim();
+    if (s === '') return null;                 // ← prevent Number('') -> 0
+    const n = Number(s);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
 
-  const ids = type_ids.map(Number).filter(Number.isFinite);
-  if (!ids.length) return {};
+ function withDocLock(fn, ms = 1200) {         // keep small (< 1.5s)
+   const lock = LockService.getScriptLock();
+   if (!lock.tryLock(ms)) return fn();         // skip claiming; proceed
+   try { return fn(); } finally { lock.releaseLock(); }
+ }
 
-  const uniq = Array.from(new Set(ids));
-  const lt = String(location_type).toLowerCase();
-  if (!["region","system","station"].includes(lt)) {
-    throw new Error("Invalid location_type; use 'region', 'system', or 'station'");
+function _fuzKey(location_type, location_id, type_id) {
+  return ['fuz', FUZ_CACHE_VER, location_type, location_id, type_id].join(':');
+}
+function _claimKey(location_type, location_id, type_id) {
+  return _fuzKey(location_type, location_id, type_id) + ':claim';
+}
+
+function _L_warn(tag, obj) { try { console.warn(tag, obj); } catch (_) { } }
+function _L_info(tag, obj) { try { console.log(tag, obj); } catch (_) { } }
+
+function _parseCached_(s) {
+  if (s == null) return undefined;              // true miss
+  s = String(s).trim();
+  if (s === '' || s === 'undefined') return undefined; // our “cleared” writes or junk
+  if (s === 'null') return null;                // NEG sentinel
+  // Fast filter: only JSON objects/arrays should reach JSON.parse
+  const c = s.charCodeAt(0);                    // '{' = 123, '[' = 91
+  if (c !== 123 && c !== 91) return undefined;
+  try {
+    const obj = JSON.parse(s);
+    return (obj && typeof obj === 'object') ? obj : undefined;
+  } catch (_) {
+    return undefined;                           // treat malformed as miss
+  }
+}
+
+/** Run fn with simple backoff on common transient errors. */
+function withRetries(fn, triesOrOpts, baseMs) {
+  // defaults
+  var tries = 3, base = 300;
+  // retry on: 429/420/5xx + common network terms (dns/ssl/socket/timeout/rate/quota)
+  var retryPattern = /(?:\b(429|420|5\d\d)\b|dns|socket|ssl|handsh|timeout|temporar|rate|quota|Service invoked)/i;
+
+  if (typeof triesOrOpts === 'number') {
+    tries = triesOrOpts;
+    if (baseMs != null) base = baseMs;
+  } else if (triesOrOpts && typeof triesOrOpts === 'object') {
+    // old callsites: {max, base, retryPattern?}
+    if (Number(triesOrOpts.max)) tries = triesOrOpts.max;
+    if (Number(triesOrOpts.base)) base = triesOrOpts.base;
+    if (triesOrOpts.retryPattern instanceof RegExp) retryPattern = triesOrOpts.retryPattern;
   }
 
+  for (var i = 0; i < tries; i++) {
+    try {
+      var res = fn();
+      // If caller passed muteHttpExceptions:true, non-200 won't throw.
+      // Force a retry for 429/420/5xx by throwing here.
+      if (res && typeof res.getResponseCode === 'function') {
+        var code = res.getResponseCode();
+        if (code === 429 || code === 420 || (code >= 500 && code < 600)) {
+          throw new Error('HTTP ' + code);
+        }
+      }
+      return res;
+    } catch (e) {
+      var s = String((e && e.message) || e);
+      if (!retryPattern.test(s) || i === tries - 1) throw e;
+      Utilities.sleep(base * Math.pow(2, i) + Math.floor(Math.random() * 200));
+    }
+  }
+}
+
+const _FUZZ_FIELDS = [
+  'min', 'max', 'avg', 'median', 'volume',
+  'weightedAverage', 'orderCount', 'fivePercent'
+];
+
+function sanitizeAgg_(row) {
+  if (!row || typeof row !== 'object') return null;
+
+  const normalizeSide = (side) => {
+    if (!side || typeof side !== 'object') return null;
+    const out = Object.create(null);
+    for (const k of _FUZZ_FIELDS) {
+      out[k] = toNumOrNull(side[k]);
+    }
+    if (out.avg == null && out.weightedAverage != null) out.avg = out.weightedAverage;
+    for (const k in out) { if (out[k] !== null) return out; }
+    return null;
+  };
+
+  const buy = normalizeSide(row.buy);
+  const sell = normalizeSide(row.sell);
+  if (!buy && !sell) return null;
+  return { buy: buy || {}, sell: sell || {} };
+}
+
+/**
+ * Batch-fetch aggregates from Fuzzwork using JSON POST.
+ * Returns: { id -> rawRow | null }  (null on error/missing)
+ */
+/**
+ * Batch-fetch aggregates from Fuzzwork with robust fallbacks.
+ * Prefers JSON POST, then falls back to form POST, then GET.
+ * Returns: { id -> rawRow | null }  (null on error/missing)
+ */
+function fetchFuzzAggsInBatches_(ids, location_type, location_id) {
+  if (!Array.isArray(ids)) ids = [ids];
+  ids = ids.map(Number).filter(Number.isFinite);
+  const out = Object.create(null);
+  if (!ids.length) return out;
+
+  const lt = String(location_type || 'station').toLowerCase();
+  if (!/^(region|system|station)$/.test(lt)) throw new Error('bad location_type: ' + location_type);
+
+  const url   = 'https://market.fuzzwork.co.uk/aggregates/';
+  const BATCH = Math.max(1, Math.min(FETCH_BATCH || 700, 1000));
+  const SLEEP = 100;
+
+  for (let i = 0; i < ids.length; i += BATCH) {
+    const slice = ids.slice(i, i + BATCH);
+    const typesCsv = slice.join(',');
+
+    // --- 1) JSON POST (preferred)
+    let json = {};
+    let ok = false;
+
+    try {
+      const payloadJson = JSON.stringify({ [lt]: location_id, types: typesCsv });
+      const resp = withRetries(() => UrlFetchApp.fetch(url, {
+        method: 'post',
+        contentType: 'application/json',
+        payload: payloadJson,
+        muteHttpExceptions: true,
+        validateHttpsCertificates: true
+      }), { max: 4, base: 300 });
+
+      const code = resp ? resp.getResponseCode() : -1;
+      if (code === 200) {
+        json = JSON.parse(resp.getContentText() || '{}');
+        ok = true;
+      } else {
+        _L_warn('fuz.fetch.json.non200', { code, lt, location_id, count: slice.length });
+      }
+    } catch (e) {
+      _L_warn('fuz.fetch.json.fail', { msg: String(e && e.message || e), lt, location_id, count: slice.length });
+    }
+
+    // --- 2) Form-POST fallback
+    if (!ok) {
+      try {
+        const formBody = lt + '=' + encodeURIComponent(String(location_id)) +
+                         '&types=' + encodeURIComponent(typesCsv);
+
+        const resp2 = withRetries(() => UrlFetchApp.fetch(url, {
+          method: 'post',
+          contentType: 'application/x-www-form-urlencoded',
+          payload: formBody,
+          muteHttpExceptions: true,
+          validateHttpsCertificates: true
+        }), { max: 3, base: 300 });
+
+        const code2 = resp2 ? resp2.getResponseCode() : -1;
+        if (code2 === 200) {
+          json = JSON.parse(resp2.getContentText() || '{}');
+          ok = true;
+        } else {
+          _L_warn('fuz.fetch.form.non200', { code: code2, lt, location_id, count: slice.length });
+        }
+      } catch (e2) {
+        _L_warn('fuz.fetch.form.fail', { msg: String(e2 && e2.message || e2), lt, location_id, count: slice.length });
+      }
+    }
+
+    // --- 3) GET fallback
+    if (!ok) {
+      try {
+        const getUrl = url + '?' + lt + '=' + encodeURIComponent(String(location_id)) +
+                             '&types=' + encodeURIComponent(typesCsv);
+
+        const resp3 = withRetries(() => UrlFetchApp.fetch(getUrl, {
+          method: 'get',
+          muteHttpExceptions: true,
+          validateHttpsCertificates: true
+        }), { max: 2, base: 300 });
+
+        const code3 = resp3 ? resp3.getResponseCode() : -1;
+        if (code3 === 200) {
+          json = JSON.parse(resp3.getContentText() || '{}');
+          ok = true;
+        } else {
+          _L_warn('fuz.fetch.get.non200', { code: code3, lt, location_id, count: slice.length });
+        }
+      } catch (e3) {
+        _L_warn('fuz.fetch.get.fail', { msg: String(e3 && e3.message || e3), lt, location_id, count: slice.length });
+      }
+    }
+
+    // Fill outputs for this batch
+    for (const id of slice) out[id] = ok ? (json[id] || null) : null;
+
+    if (SLEEP) Utilities.sleep(SLEEP);
+  }
+
+  return out;
+}
+
+
+
+function postFetch(type_ids, location_id, location_type = "station") {
+  const ids = [];
+  if (Array.isArray(type_ids)) {
+    for (let i = 0; i < type_ids.length; i++) {
+      const n = Number(type_ids[i]);
+      if (Number.isFinite(n)) ids.push(n);
+    }
+  } else {
+    const n1 = Number(type_ids);
+    if (Number.isFinite(n1)) ids.push(n1);
+  }
+  if (!ids.length) return {};
+
+  const seen = Object.create(null), uniq = [];
+  for (let i = 0; i < ids.length; i++) { const v = ids[i]; if (!seen[v]) { seen[v] = 1; uniq.push(v); } }
+
   const cache = cacheScope();
-  const ttlSec = ttlForScope(lt);
+  const ttlSec = ttlForScope(location_type);
 
-  // 1) cache-first
-  const keys = uniq.map(id => _fuzKey(lt, location_id, id));
-  const got = cache.getAll(keys) || {};
-  const result = {};
-  const missing = [];
+  const dataKeys = uniq.map(id => _fuzKey(location_type, location_id, id));
+  const got = cache.getAll(dataKeys) || {};
+  const result = Object.create(null);
+  const misses = [];
 
-  uniq.forEach((id, i) => {
-    const raw = got[keys[i]];
-    if (raw) {
-      try { result[id] = JSON.parse(raw); }
-      catch { missing.push(id); }
+  for (let i = 0; i < uniq.length; i++) {
+    const id = uniq[i];
+    const parsed = _parseCached_(got[dataKeys[i]]);
+    if (parsed === undefined) {
+      misses.push(id);
     } else {
-      missing.push(id);
+      result[id] = parsed;
+    }
+  }
+  if (!misses.length) return result;
+
+  let claimables = [];
+  withDocLock(() => {
+    const nowData = cache.getAll(misses.map(id => _fuzKey(location_type, location_id, id))) || {};
+    const nowClaim = cache.getAll(misses.map(id => _claimKey(location_type, location_id, id))) || {};
+    for (let i = 0; i < misses.length; i++) {
+      const id = misses[i];
+      const dk = _fuzKey(location_type, location_id, id);
+      const ck = _claimKey(location_type, location_id, id);
+      if (!nowData[dk] && !nowClaim[ck]) claimables.push(id);
+    }
+    if (claimables.length) {
+      const toPut = {};
+      const stamp = String(Date.now());
+      for (const id of claimables) toPut[_claimKey(location_type, location_id, id)] = stamp;
+      cache.putAll(toPut, CLAIM_TTL_S);
     }
   });
 
-  // 2) POST only the missing ids (chunked)
-  let fetched = {};
-  if (missing.length) {
-    const url = "https://market.fuzzwork.co.uk/aggregates/";
-    const MAX_IDS_PER_POST = 700;
+  const fetchList = claimables;
+  if (!fetchList.length) Utilities.sleep(150);
 
-    for (let i = 0; i < missing.length; i += MAX_IDS_PER_POST) {
-      const slice = missing.slice(i, i + MAX_IDS_PER_POST);
-      const payload = { [lt]: location_id, types: slice.join(",") };
-      const options = {
-        method: "post",
-        contentType: "application/json",
-        payload: JSON.stringify(payload),
-        muteHttpExceptions: true
-      };
+  let fetched = Object.create(null);
+  if (fetchList.length) {
+    fetched = fetchFuzzAggsInBatches_(fetchList, location_type, location_id);
+  }
 
-      try {
-        const resp = withRetries(() => UrlFetchApp.fetch(url, options));
-        const code = resp.getResponseCode();
-        if (code === 200) {
-          Object.assign(fetched, JSON.parse(resp.getContentText() || "{}"));
-        } else {
-          _L_warn('fuz.fetch.non200', { code, lt, location_id, count: slice.length });
+  const toPutPos = {};
+  const toPutNeg = {};
+  const re = cache.getAll(misses.map(id => _fuzKey(location_type, location_id, id))) || {};
+
+  for (let i = 0; i < misses.length; i++) {
+    const id = misses[i];
+    const dk = _fuzKey(location_type, location_id, id);
+
+    let row = _parseCached_(re[dk]);
+    if (row === undefined) {
+      row = sanitizeAgg_(fetched[id]);
+    }
+
+    if (row !== undefined) {
+      if (row) {
+        const s = JSON.stringify(row);
+        if (Utilities.newBlob(s).getBytes().length < 95000) {
+          toPutPos[dk] = s;
         }
-      } catch (e) {
-        _L_warn('fuz.fetch.fail', { msg: String(e && e.message || e), lt, location_id, count: slice.length });
-        // continue; we’ll return whatever we have
+        result[id] = row;
+      } else {
+        toPutNeg[dk] = 'null';
+        result[id] = null;
       }
-
-      Utilities.sleep(100); // tiny breath
     }
   }
 
-  // 3) short critical section: recheck + write cache + finalize
-  if (missing.length) {
+  if (Object.keys(toPutPos).length || Object.keys(toPutNeg).length) {
     withDocLock(() => {
-      const missKeys = missing.map(id => _fuzKey(lt, location_id, id));
-      const nowGot = cache.getAll(missKeys) || {};
-
-      const toPut = {};
-      missing.forEach((id, i) => {
-        const k = missKeys[i];
-        const pre = nowGot[k];
-
-        if (pre) {
-          try { result[id] = JSON.parse(pre); } catch {}
-          return;
-        }
-
-        const row = fetched[id];
-        if (row) {
-          const s = JSON.stringify(row);
-          if (s.length < 90000) {           // ← FIXED: numeric literal without underscore
-            toPut[k] = s;
-            result[id] = row;
-          }
-        }
-      });
-
-      if (Object.keys(toPut).length) {
-        const entries = Object.entries(toPut);
-        const CHUNK = 80;
+      if (Object.keys(toPutPos).length) {
+        const entries = Object.entries(toPutPos), CHUNK = 80;
         for (let i = 0; i < entries.length; i += CHUNK) {
           cache.putAll(Object.fromEntries(entries.slice(i, i + CHUNK)), ttlSec);
+        }
+      }
+      if (Object.keys(toPutNeg).length) {
+        const entries = Object.entries(toPutNeg), CHUNK = 200;
+        for (let i = 0; i < entries.length; i += CHUNK) {
+          cache.putAll(Object.fromEntries(entries.slice(i, i + CHUNK)), FUZ_NEG_TTL);
         }
       }
     });
@@ -215,29 +355,210 @@ function postFetch(type_ids, location_id, location_type = "station") {
   return result;
 }
 
-/** Read a batch from cache; identify truly missing ids. */
-function _getCachedFuz(type_ids, location_id, location_type) {
-  const lt = String(location_type || '').toLowerCase();
-  const cache = cacheScope();
-  const keys = type_ids.map(id => _fuzKey(lt, location_id, id));
-  const raw = cache.getAll(keys) || {};
+/////////////////////
+// Sheet Helpers   //
+/////////////////////
 
-  const have = {};
-  const missing = [];
-  for (let i = 0; i < type_ids.length; i++) {
-    const id = type_ids[i];
-    const s = raw[keys[i]];
-    if (s) {
-      try { have[id] = JSON.parse(s); }
-      catch { missing.push(id); }
-    } else {
-      missing.push(id);
+function _flattenTypeIds_(rangeOrArray) {
+  if (Array.isArray(rangeOrArray)) {
+    const out = [];
+    for (let i = 0; i < rangeOrArray.length; i++) {
+      const v = Array.isArray(rangeOrArray[i]) ? rangeOrArray[i][0] : rangeOrArray[i];
+      const n = Number(v);
+      if (Number.isFinite(n)) out.push(n);
     }
+    return out;
   }
-  return { have, missing };
+  const n1 = Number(rangeOrArray);
+  return Number.isFinite(n1) ? [n1] : [];
 }
 
-/* -------------------------- Public custom functions ----------------------- */
+function _canonSide_(s, fallback) {
+  s = (s == null ? fallback : s) || 'sell';
+  s = String(s).toLowerCase();
+  if (s === 'both') return 'both';
+  return (s === 'buy' || s === 'sell') ? s : 'sell';
+}
+
+function _canonField_(f, priceDefault) {
+  if (f == null) f = priceDefault || 'avg';
+  f = String(f).toLowerCase().trim();
+  if (f === 'weighted' || f === 'wa' || f === 'weightedaverage') return 'weightedAverage';
+  if (f === 'price' || f === 'mean' || f === 'average' || f === 'avg') return 'avg';
+  if (f === '5p' || f === 'five' || f === 'fivepercent' || f === 'five_percent') return 'fivePercent';
+  if (f === 'orders' || f === 'ordercount' || f === 'numorders') return 'orderCount';
+  if (f === 'min' || f === 'low') return 'min';
+  if (f === 'max' || f === 'high') return 'max';
+  if (f === 'median') return 'median';
+  if (f === 'vol' || f === 'volume') return 'volume';
+  return f;
+}
+
+function _hubToStationId_(hub) {
+  if (hub == null || hub === '') return 60003760; // Jita 4-4 CNAP
+  const n = Number(hub);
+  if (Number.isFinite(n)) return n;
+  const s = String(hub).toLowerCase();
+  if (s.indexOf('jita') > -1) return 60003760;
+  if (s.indexOf('amarr') > -1) return 60008494;
+  if (s.indexOf('dodixie') > -1) return 60011866;
+  if (s.indexOf('rens') > -1) return 60004588;
+  if (s.indexOf('hek') > -1) return 60005686;
+  return 60003760;
+}
+
+function _readAggsFromCache_(ids, location_type, location_id) {
+  const cache = CacheService.getScriptCache();
+  const keys = ids.map(id => ['fuz', FUZ_CACHE_VER, location_type, location_id, id].join(':'));
+  const got = cache.getAll(keys) || {};
+  const out = Object.create(null);
+  for (let i = 0; i < ids.length; i++) {
+    const s = got[keys[i]];
+    if (s == null) { /* miss */ }
+    else if (s === 'null') out[ids[i]] = null;
+    else { try { out[ids[i]] = JSON.parse(s); } catch (_) { /* leave undefined */ } }
+  }
+  return out;
+}
+
+function _extractMetric_(aggRow, side, field) {
+  if (!aggRow || typeof aggRow !== 'object') return "";
+  const node = aggRow[side];
+  if (!node || typeof node !== 'object') return "";
+  const raw = node[field];
+  if (raw === null || raw === undefined || raw === "") return "";  // ← don’t coerce to 0
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : "";
+}
+
+function _alignOutput_(type_ids, idList, valueById) {
+  const H = Array.isArray(type_ids) ? type_ids.length : 1;
+  const out = new Array(H);
+  for (let r = 0; r < H; r++) {
+    const v = Array.isArray(type_ids) ? (Array.isArray(type_ids[r]) ? type_ids[r][0] : type_ids[r]) : type_ids;
+    const id = Number(v);
+    out[r] = [(Number.isFinite(id) && Object.prototype.hasOwnProperty.call(valueById, id)) ? valueById[id] : ""];
+  }
+  return out;
+}
+
+function _alignOutput2_(type_ids, idList, sellById, buyById) {
+  const H = Array.isArray(type_ids) ? type_ids.length : 1;
+  const out = new Array(H);
+  for (let r = 0; r < H; r++) {
+    const v = Array.isArray(type_ids) ? (Array.isArray(type_ids[r]) ? type_ids[r][0] : type_ids[r]) : type_ids;
+    const id = Number(v);
+    const s = (Number.isFinite(id) && Object.prototype.hasOwnProperty.call(sellById, id)) ? sellById[id] : "";
+    const b = (Number.isFinite(id) && Object.prototype.hasOwnProperty.call(buyById, id)) ? buyById[id] : "";
+    out[r] = [s, b];
+  }
+  return out;
+}
+
+/////////////////////////////
+// Public wrappers         //
+/////////////////////////////
+
+function fuzzPriceDataByHub(type_ids, market_hub, order_type, order_level) {
+  try {
+    const ids = _flattenTypeIds_(type_ids);
+    const stationId = _hubToStationId_(market_hub);
+    const side = _canonSide_(order_type, 'sell');
+    const field = _canonField_(order_level, 'avg');
+    if (!ids.length) return _alignOutput_(type_ids, [], {});
+    const aggs = postFetch(ids, stationId, "station");
+    const values = {};
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i];
+      values[id] = _extractMetric_(aggs[id], side, field);
+    }
+    return _alignOutput_(type_ids, ids, values);
+  } catch (e) {
+    return _alignOutput_(type_ids, [], {});
+  }
+}
+
+function fuzzApiPriceDataJitaSell(type_ids, market_hub, order_type, order_level) {
+  try {
+    const ids = _flattenTypeIds_(type_ids);
+    const stationId = _hubToStationId_(market_hub == null ? 60003760 : market_hub);
+    const side = _canonSide_(order_type, 'sell');
+    const field = _canonField_(order_level, 'avg');
+    if (!ids.length) return _alignOutput_(type_ids, [], {});
+    const aggs = postFetch(ids, stationId, "station");
+    const values = {};
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i];
+      values[id] = _extractMetric_(aggs[id], side, field);
+    }
+    return _alignOutput_(type_ids, ids, values);
+  } catch (e) {
+    return _alignOutput_(type_ids, [], {});
+  }
+}
+
+function marketStatData(type_ids, location_type, location_id, order_type, order_level) {
+  try {
+    const ids = _flattenTypeIds_(type_ids);
+    const lt = String(location_type || 'station').toLowerCase();
+    const lid = Number(location_id);
+    const side = _canonSide_(order_type, 'sell');
+    const field = _canonField_(order_level, 'avg');
+    if (!ids.length || !Number.isFinite(lid)) return _alignOutput_(type_ids, [], {});
+    const aggs = postFetch(ids, lid, lt);
+    const values = {};
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i];
+      values[id] = _extractMetric_(aggs[id], side, field);
+    }
+    return _alignOutput_(type_ids, ids, values);
+  } catch (e) {
+    return _alignOutput_(type_ids, [], {});
+  }
+}
+
+function marketStatDataCache(type_ids, location_type, location_id, order_type, order_level) {
+  try {
+    const ids = _flattenTypeIds_(type_ids);
+    const lt = String(location_type || 'station').toLowerCase();
+    const lid = Number(location_id);
+    const side = _canonSide_(order_type, 'sell');
+    const field = _canonField_(order_level, 'avg');
+    if (!ids.length || !Number.isFinite(lid)) return _alignOutput_(type_ids, [], {});
+    const cacheMap = _readAggsFromCache_(ids, lt, lid);
+    const values = {};
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i];
+      values[id] = _extractMetric_(cacheMap[id], side, field);
+    }
+    return _alignOutput_(type_ids, ids, values);
+  } catch (e) {
+    return _alignOutput_(type_ids, [], {});
+  }
+}
+
+function marketStatDataBoth(type_ids, location_type, location_id, order_level) {
+  try {
+    const ids = _flattenTypeIds_(type_ids);
+    const lt = String(location_type || 'station').toLowerCase();
+    const lid = Number(location_id);
+    const field = _canonField_(order_level, 'avg');
+
+    if (!ids.length || !Number.isFinite(lid)) return _alignOutput2_(type_ids, [], {}, {});
+
+    const aggs = postFetch(ids, lid, lt);
+    const sMap = {}, bMap = {};
+
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i];
+      sMap[id] = _extractMetric_(aggs[id], 'sell', field);
+      bMap[id] = _extractMetric_(aggs[id], 'buy', field);
+    }
+    return _alignOutput2_(type_ids, ids, sMap, bMap);
+  } catch (e) {
+    return _alignOutput2_(type_ids, [], {}, {});
+  }
+}
 
 /**
  * Quick test against Jita station.
@@ -245,120 +566,32 @@ function _getCachedFuz(type_ids, location_id, location_type) {
  */
 function testfuzAPI() {
   const ids = [
-    16239,16243,24030,32881,17366,16273,
-    34206,34202,34203,34205,34204,34201,
-    19761,42695,42830
+    16239, 16243, 24030, 32881, 17366, 16273,
+    34206, 34202, 34203, 34205, 34204, 34201,
+    19761, 42695, 42830
   ];
   return fuzzApiPriceDataJitaSell(ids); // returns 2D aligned to input
 }
 
-/**
- * Generic API to get prices for an array/range of type_ids at a station id (default Jita).
- * Defaults to sell/min if not specified.
- * Preserves the input shape (rows x cols).
- * @customfunction
- */
-function fuzzApiPriceDataJitaSell(type_ids, market_hub = 60003760, order_type = null, order_level = null) {
-  if (!type_ids) throw new Error('type_ids is required');
+function marketStatDataBothCache(type_ids, location_type, location_id, order_level) {
+  try {
+    const ids = _flattenTypeIds_(type_ids);
+    const lt = String(location_type || 'station').toLowerCase();
+    const lid = Number(location_id);
+    const field = _canonField_(order_level, 'avg');
 
-  const in2D = _as2D(type_ids);
-  const rows = in2D.length, cols = in2D[0].length;
+    if (!ids.length || !Number.isFinite(lid)) return _alignOutput2_(type_ids, [], {}, {});
 
-  // normalize order fields
-  const norm = _normalizeOrder(order_type, order_level);
+    const cacheMap = _readAggsFromCache_(ids, lt, lid);
+    const sMap = {}, bMap = {};
 
-  // flatten, keep placeholders so we can re-align
-  const flat = _flatten2D(in2D);
-  const ids = flat.map(v => {
-    const n = Number(v);
-    return Number.isFinite(n) ? n : null;
-  });
-
-  const valid = Array.from(new Set(ids.filter(n => n != null)));
-  const fetched = valid.length ? postFetch(valid, Number(market_hub), "station") : {};
-
-  const pick = (row) => {
-    if (!row || !row[norm.type]) return null;
-    const v = row[norm.type][norm.level];
-    const num = Number(v);
-    return Number.isFinite(num) ? num : null;
-  };
-
-  const outFlat = ids.map(id => (id == null ? "" : (pick(fetched[id]) ?? "")));
-  return _reshape(outFlat, rows, cols);
-}
-
-/**
- * Hub-name helper (Jita/Amarr/Dodixie/Rens/Hek). Defaults sell/min.
- * Preserves input shape.
- * @customfunction
- */
-function fuzzPriceDataByHub(type_ids, market_hub = "Jita", order_type = "sell", order_level = null) {
-  if (!type_ids) throw new Error('type_ids is required');
-
-  let hub = String(market_hub || '').toLowerCase();
-  switch (hub) {
-    case 'amarr':   hub = 60008494; break;
-    case 'dodixie': hub = 60011866; break;
-    case 'rens':    hub = 60004588; break;
-    case 'hek':     hub = 60005686; break;
-    case 'jita':
-    default:        hub = 60003760;
-  }
-  return fuzzApiPriceDataJitaSell(type_ids, hub, order_type, order_level);
-}
-
-/**
- * marketStatData — cache-first accessor for Fuzzworks aggregates.
- * Supports: buy/sell × min|max|avg|median|volume
- * location_type ∈ {"region","system","station"}
- * Returns values aligned to the input shape.
- * @customfunction
- */
-function marketStatData(type_ids, location_type, location_id, order_type, order_level) {
-  if (!type_ids) throw new Error("type_ids is required");
-
-  const in2D = _as2D(type_ids);
-  const rows = in2D.length, cols = in2D[0].length;
-
-  // normalize ids but keep placeholders so we can re-align later
-  const flatIds = _flatten2D(in2D).map(v => {
-    const n = Number(v);
-    return Number.isFinite(n) ? n : null;
-  });
-
-  // location guard
-  const lt = String(location_type || "").toLowerCase();
-  if (!["region","system","station"].includes(lt)) {
-    throw new Error("Location Undefined (use 'region', 'system', or 'station')");
-  }
-
-  const { type: side, level: lvl } = _normalizeOrder(order_type, order_level);
-
-  // unique valid ids
-  const uniq = Array.from(new Set(flatIds.filter(n => n != null)));
-
-  // 1) cache-first
-  const { have, missing } = _getCachedFuz(uniq, Number(location_id), lt);
-
-  // 2) fetch only truly missing ids, then merge
-  if (missing.length) {
-    const fetched = postFetch(missing, Number(location_id), lt) || {};
-    for (const id of missing) {
-      if (fetched[id] != null) have[id] = fetched[id];
+    for (let i = 0; i < ids.length; i++) {
+      const id = ids[i];
+      sMap[id] = _extractMetric_(cacheMap[id], 'sell', field);
+      bMap[id] = _extractMetric_(cacheMap[id], 'buy', field);
     }
+    return _alignOutput2_(type_ids, ids, sMap, bMap);
+  } catch (e) {
+    return _alignOutput2_(type_ids, [], {}, {});
   }
-
-  // 3) picker strictly for Fuzzworks fields
-  function pick(row) {
-    if (!row || !row[side]) return null;
-    const node = row[side];
-    const v = node[lvl];            // min|max|avg|median|volume
-    const num = Number(v);
-    return Number.isFinite(num) ? num : null;
-  }
-
-  // 4) map back to original shape
-  const outFlat = flatIds.map(id => (id == null ? "" : (pick(have[id]) ?? "")));
-  return _reshape(outFlat, rows, cols);
 }
