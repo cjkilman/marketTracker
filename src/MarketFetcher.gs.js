@@ -66,21 +66,47 @@ function getTypeIDsFromItemList(limit) {
 }
 
 
+/**
+ * Coerces v into a positive finite number, else null.
+ * - Accepts numbers or strings (e.g. "12,345.67").
+ * - Treats 0/negatives/NaN/undefined as null.
+ */
+const toPosNumberOrNull = (v) => {
+  if (v == null) return null;
+  const n = typeof v === 'number' ? v : Number(String(v).replace(/[,\s]/g, ''));
+  return Number.isFinite(n) && n > 0 ? n : null;
+};
 
-/** Map Fuz result into math-friendly numbers (null for non-numeric) */
-function getMarketPrices(type_ids, market_id, market_type) {
-  const data = postFetch(type_ids, market_id, market_type);
+/** Map Fuz result into math-friendly numbers (null for non-numeric/≤0). */
+function getMarketPrices(typeIds, marketId, marketType) {
+  let data = {};
+  try {
+    // If postFetch can be async in your setup, make an async version and await it.
+    data = postFetch(typeIds, marketId, marketType) || {};
+  } catch (e) {
+    // If the call blows up, return all-null rows for requested ids.
+    return Object.fromEntries(
+      [...new Set(typeIds)].map(id => [id, {
+        minSell: null, maxBuy: null, medianSell: null, medianBuy: null
+      }])
+    );
+  }
+
   const out = {};
-  type_ids.forEach(id => {
-    const e = data[id] || {};
-    const minSell    = parseFloat(e.sell?.min)    > 0 ? parseFloat(e.sell.min)    : null;
-    const maxBuy     = parseFloat(e.buy?.max)     > 0 ? parseFloat(e.buy.max)     : null;
-    const medianSell = parseFloat(e.sell?.median) > 0 ? parseFloat(e.sell.median) : null;
-    const medianBuy  = parseFloat(e.buy?.median)  > 0 ? parseFloat(e.buy.median)  : null;
-    out[id] = { minSell, maxBuy, medianSell, medianBuy };
-  });
+  for (const id of typeIds) {
+    const e = data?.[id] ?? {};
+    const sell = e?.sell ?? {};
+    const buy  = e?.buy  ?? {};
+    out[id] = {
+      minSell:    toPosNumberOrNull(sell.min),
+      maxBuy:     toPosNumberOrNull(buy.max),
+      medianSell: toPosNumberOrNull(sell.median),
+      medianBuy:  toPosNumberOrNull(buy.median),
+    };
+  }
   return out;
 }
+
 
 /* ---------------------- Entry: record prices (baseline) ---------------------- */
 

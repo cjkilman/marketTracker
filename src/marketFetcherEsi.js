@@ -11,8 +11,8 @@
 
 /* ============================ CONFIG: ENGINE ============================ */
 // Sources can be a Named Range OR "Sheet!A1" range
-const ITEMS_SOURCE = "'Item List Back End'!A2:A";   // type_id list
-const REGIONS_SOURCE = "'Market Settings'!F3:F";      // region_id list
+const ITEMS_SOURCE = "'Item List Back End'!A2:A"; // type_id list
+const REGIONS_SOURCE = "'Market Settings'!F3:F";    // region_id list
 
 // Engine sheets & export name
 const SHEET_REGION_CACHE = 'Cache_Market_ESI_Region';
@@ -20,9 +20,9 @@ const SHEET_PUBLISH = 'Publish_ESI_Region';
 const NR_MARKET_RESULT = 'MarketResultESI_Region';
 
 // Worker cadence & batching
-const WORKER_EVERY_MIN = 1;     // chunk worker interval (minutes)
-const BATCH_SIZE = 200;    // items per chunk per region
-const CALL_PACE_MS = 100;   // sleep between GESI calls (ms)
+const WORKER_EVERY_MIN = 1;    // chunk worker interval (minutes)
+const BATCH_SIZE = 200;  // items per chunk per region (baseline)
+const CALL_PACE_MS = 100;  // sleep between GESI calls (ms)
 
 // Daily kickoff time (EVE DT ~11:00 UTC)
 const DAILY_UTC_HOUR = 11;
@@ -32,7 +32,6 @@ const DAILY_UTC_MIN = 20;
 const HEADERS_REGION = ['type_id', 'region_id', 'volume30_region', 'velocity_region', 'last_updated', 'status'];
 const HEADERS_PUBLISH = ['type_id', 'region_id', 'volume30_region', 'last_updated', 'status'];
 
-
 /** ---------- Rate limit + backoff (lightweight) ---------- **/
 const PACER_PROP_GAP = 'esi_gap_ms';
 const PACER_PROP_LAST = 'esi_last_ms';
@@ -40,13 +39,111 @@ const PACER_MIN_MS = 400;   // start ~2.5 rps
 const PACER_MAX_MS = 5000;  // cap 5s between calls
 
 /***** GESI batching + governor (≤300 req/min) ********************************/
-
 // Hard cap
-var ESI_TB_RATE_PER_MIN = 300;   // tokens added per minute
-var ESI_TB_BURST = 300;   // max token bucket
-var ESI_GROUP_SIZE = 50;    // requests per fetchAll group
-var ESI_MICRO_BREATH_MS = 100;   // tiny pause between groups
+var ESI_TB_RATE_PER_MIN = 300; // tokens added per minute
+var ESI_TB_BURST = 300; // max token bucket
+var ESI_GROUP_SIZE = 50;  // requests per fetchAll group
+var ESI_MICRO_BREATH_MS = 100; // tiny pause between groups
 
+/* ===================== CIRCUIT BREAKER & PROBE ======================== */
+const CB_PROP_UNTIL = 'esi_breaker_until_ms';
+const CB_PROP_FAILS = 'esi_fail_ct';
+const CB_PROP_WINDOW = 'esi_fail_window_start_ms';
+const RAMP_PROP_RUNS = 'esi_ramp_runs_left'; // gentle ramp after recovery
+
+function cbOpen_(ms) {
+  const p = PropertiesService.getScriptProperties();
+  p.setProperty(CB_PROP_UNTIL, String(Date.now() + ms));
+  try { ESI_installProbe(3); } catch (_) { }
+}
+
+function cbClose_() {
+  const p = PropertiesService.getScriptProperties();
+  p.deleteProperty(CB_PROP_UNTIL);
+  p.deleteProperty(CB_PROP_FAILS);
+  p.deleteProperty(CB_PROP_WINDOW);
+  // set ramp for first few runs after recovery
+  p.setProperty(RAMP_PROP_RUNS, String(3));
+}
+
+function cbIsOpen_() {
+  const until = +(PropertiesService.getScriptProperties().getProperty(CB_PROP_UNTIL) || 0);
+  return until && Date.now() < until;
+}
+
+/**
+ * Record a batch result into the breaker window.
+ * If error-limit is tight or we see many failures, open the breaker.
+ * opts: { groupFailures:number, errorLimitRemain?:number, errorLimitReset?:number }
+ */
+function cbRecord_(opts) {
+  // opts: { groupFailures:number, groupTotal?:number, errorLimitRemain?:number, errorLimitReset?:number }
+  var p = PropertiesService.getScriptProperties();
+  var now = Date.now();
+  var windowMs = 60000; // 1m window (no numeric separators for Apps Script safety)
+
+  var start = +(p.getProperty(CB_PROP_WINDOW) || 0);
+  var fails = +(p.getProperty(CB_PROP_FAILS) || 0);
+  var calls = +(p.getProperty('esi_call_ct') || 0);
+
+  // roll the window if stale
+  if (!start || (now - start) > windowMs) {
+    start = now; fails = 0; calls = 0;
+  }
+
+  var groupFails = Math.max(0, Number(opts.groupFailures || 0));
+  var groupTotal = Math.max(groupFails, Number(opts.groupTotal || 0)); // pass ids.length if you have it
+
+  fails += groupFails;
+  calls += groupTotal;
+
+  p.setProperty(CB_PROP_WINDOW, String(start));
+  p.setProperty(CB_PROP_FAILS, String(fails));
+  p.setProperty('esi_call_ct', String(calls));
+
+  var remain = (opts.errorLimitRemain != null) ? Number(opts.errorLimitRemain) : null;
+  var resetSec = (opts.errorLimitReset != null) ? Number(opts.errorLimitReset) : null;
+
+  var failRate = calls > 0 ? (fails / calls) : 0;
+  var budgetTight = (remain != null) && (remain <= 3);          // ESI error-budget nearly exhausted
+  var rateBad = (calls >= 20) && (failRate >= 0.35);        // ≥35% fail rate in the last minute
+  var burstBad = groupFails >= Math.max(5, Math.floor(groupTotal * 0.5)); // burst in this group
+
+  if (budgetTight || rateBad || burstBad) {
+    // If ESI tells us the reset window, honor it (plus a small buffer); else 15 minutes.
+    var holdMs = (resetSec && resetSec > 0) ? (resetSec * 1000 + 5000) : (15 * 60000);
+    (LoggerEx?.warn || console.warn)('esi.breaker.open', {
+      fails, calls, failRate: +failRate.toFixed(2), remain, resetSec, holdMs
+    });
+    cbOpen_(holdMs);
+  }
+}
+
+
+/** Canary probe: if a tiny call succeeds, close breaker and restart. */
+function ESI_probeAndMaybeCloseBreaker() {
+  if (!cbIsOpen_()) return;
+  try {
+    const regionId = 10000043; // Domain
+    const typeIds = [34];     // Tritanium
+    const res = fetchHistoryBatchGESI_(regionId, typeIds);
+    if (Array.isArray(res) && res[0] && res[0].status === 'OK') {
+      cbClose_();
+      (LoggerEx?.log || console.log)('esi.breaker.closed');
+      try { kickoffMarketHistoryRefresh(); } catch (_) { }
+    }
+  } catch (_) { /* stay open */ }
+}
+
+/** Install a periodic probe while breaker is open. */
+function ESI_installProbe(everyMinutes = 3) {
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'ESI_probeAndMaybeCloseBreaker')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('ESI_probeAndMaybeCloseBreaker').timeBased().everyMinutes(everyMinutes).create();
+}
+
+/* ============================ TOKEN BUCKET ============================= */
 function tbConsume_(need) {
   var props = PropertiesService.getScriptProperties();
   var now = Date.now();
@@ -73,6 +170,7 @@ function tbConsume_(need) {
   return waitMs;
 }
 
+/* ======================== GESI CLIENT HELPERS ========================= */
 // ----- Blacksmoke/GESI client -----
 function getGESIHistoryClient_() {
   // Requires GESI library + authorized character (Sheets Add-ons → GESI → Authorize)
@@ -82,11 +180,13 @@ function getGESIHistoryClient_() {
 function isBeforeNoonET_() {
   return +Utilities.formatDate(new Date(), 'America/New_York', 'H') < 12;
 }
-function getBatchSize_() {      // AM: 200, PM: 60
-  return isBeforeNoonET_() ? 200 : 60;
+
+// Batch size honors ramp runs if present
+function getBatchSize_() {
+  const base = isBeforeNoonET_() ? 200 : 60;
+  const left = Number(PropertiesService.getScriptProperties().getProperty(RAMP_PROP_RUNS) || 0);
+  return left > 0 ? Math.min(60, base) : base;
 }
-
-
 
 function buildHistoryRequests_(client, regionId, typeIds) {
   return typeIds.map(function (tid) {
@@ -126,6 +226,7 @@ function mapGESIRespToResult_(resp, typeId) {
   return { typeId: typeId, status: 'ERR_' + code, code: code };
 }
 
+/* ================== BATCH FETCH (Breaker-aware) ======================= */
 function fetchHistoryBatchGESI_(regionId, typeIds) {
   var client = getGESIHistoryClient_();
   var out = [];
@@ -140,24 +241,41 @@ function fetchHistoryBatchGESI_(regionId, typeIds) {
     var reqs = buildHistoryRequests_(client, regionId, ids);
     var resps = UrlFetchApp.fetchAll(reqs);
 
-    // log error-budget once per group when available
+    // track error-limit and failures
+    let failCt = 0, remain = -1, reset = -1;
     try {
-      var hdr = resps[0].getAllHeaders && resps[0].getAllHeaders();
-      var remain = +(hdr && (hdr['x-esi-error-limit-remain'] || hdr['X-Esi-Error-Limit-Remain']) || -1);
-      var reset = +(hdr && (hdr['x-esi-error-limit-reset'] || hdr['X-Esi-Error-Limit-Reset']) || -1);
-      if (remain >= 0) (LoggerEx?.info || console.info)('esi.errbudget', { remain: remain, reset: reset });
+      const hdr = resps[0].getAllHeaders && resps[0].getAllHeaders();
+      remain = +(hdr && (hdr['x-esi-error-limit-remain'] || hdr['X-Esi-Error-Limit-Remain']) || -1);
+      reset = +(hdr && (hdr['x-esi-error-limit-reset'] || hdr['X-Esi-Error-Limit-Reset']) || -1);
+      if (remain >= 0) (LoggerEx?.info || console.info)('esi.errbudget', { remain, reset });
     } catch (_) { }
 
     for (var k = 0; k < resps.length; k++) {
+      const code = resps[k].getResponseCode();
+      if (code === 420 || code === 429 || code >= 500) failCt++;
       out.push(mapGESIRespToResult_(resps[k], ids[k]));
     }
+
+    // feed the breaker so the worker can stand down if needed
+    cbRecord_({
+      groupFailures: failCt,
+      groupTotal: ids.length,              
+      errorLimitRemain: remain,
+      errorLimitReset: reset
+    });
+
+    // gentle nap if budget is tight
+    if (remain > -1 && remain <= 5) {
+      const nap = Math.max(1000, (reset > 0 ? reset * 250 : 1500));
+      Utilities.sleep(nap);
+    }
+
     Utilities.sleep(ESI_MICRO_BREATH_MS);
   }
   return out;
 }
 
-
-
+/* ============================ BACKOFF HELPERS ========================== */
 function isRateLimitedError_(e) {
   const s = String(e && e.message || e || '');
   return /bandwidth quota exceeded|error limit|too many|429|420/i.test(s);
@@ -211,6 +329,7 @@ function withRetries_(fn, tries = 3, baseDelay = 800) {
   }
 }
 
+/* ============================ ONE-OFF FETCH ============================ */
 function fetchVol30One_(typeId, regionId) {
   try {
     const hist = withRetries_(
@@ -241,9 +360,6 @@ function fetchVol30One_(typeId, regionId) {
   }
 }
 
-
-
-
 /* ============================ CONFIG: CLIENT ============================ */
 /* marketStatDataCache uses your CacheService via _getCachedFuz and _normalizeOrder.
  * It needs NO sheet/range config. In your Sheets formulas, add your own FUZ_TICK heartbeat.
@@ -262,7 +378,6 @@ function testESIHistory() {
   const rows = JSON.parse(resp.getContentText());
   console.log('history rows:', Array.isArray(rows) ? rows.length : rows);
 }
-
 
 /* =============================== SETUP ================================= */
 function setupEngine() {
@@ -302,7 +417,6 @@ function ensurePublishSheet_(ss) {
   SpreadsheetApp.getActive().setNamedRange(NR_MARKET_RESULT, sh.getRange('A:E'));
 }
 
-
 /* ============================ SCHEDULING =============================== */
 function installDailyKickoff() {
   // clear old triggers for a clean slate
@@ -317,7 +431,6 @@ function installDailyKickoff() {
     .inTimezone('Etc/UTC').create();
   SpreadsheetApp.getUi().alert(`Daily kickoff installed @ ${DAILY_UTC_HOUR}:${DAILY_UTC_MIN} UTC ✅`);
 }
-
 
 /* ========================= KICKOFF → WORKER ============================ */
 function kickoffMarketHistoryRefresh() {
@@ -337,7 +450,6 @@ function kickoffMarketHistoryRefresh() {
   ScriptApp.newTrigger('marketFetchChunk').timeBased().everyMinutes(WORKER_EVERY_MIN).create();
 }
 
-
 /* ===================== WORKER: ESI → CACHE (GESI) ====================== */
 function marketFetchChunk() {
   var t0 = Date.now();
@@ -348,6 +460,13 @@ function marketFetchChunk() {
   if (!lock.tryLock(5000)) {
     LoggerEx.warn('mf.lock.busy rid=' + rid);
     return;
+  }
+
+  // Stand down early if breaker is open
+  if (cbIsOpen_()) {
+    LoggerEx.warn('mf.breaker.open.standdown');
+    try { publishMarketResultESIRegion(); } catch (_) { }
+    return stopWorker_('breaker open');
   }
 
   try {
@@ -385,22 +504,20 @@ function marketFetchChunk() {
 
     var chunk = items.slice(ii, end);
 
-    LoggerEx.log('mf.run.start rid=' + rid + ' regions=' + regions.length + ' items=' + items.length +
+    LoggerEx.log(
+      'mf.run.start rid=' + rid + ' regions=' + regions.length + ' items=' + items.length +
       ' cursorIn=' + JSON.stringify({ ri: ri, ii: ii }) +
-      ' region=' + regionId + ' window=' + JSON.stringify({ from: ii, to: end, size: chunk.length }));
+      ' region=' + regionId + ' window=' + JSON.stringify({ from: ii, to: end, size: chunk.length })
+    );
 
-    var rowsOut = [];
     var processed = 0;
     var hitRate = false;
-    var ok = 0, err = 0;
+    var ok = 0, err = 0, errAuth = 0;
 
     // --- GESI batch (auth handled by GESI, paced by token bucket) ---
     var results = fetchHistoryBatchGESI_(regionId, chunk);
 
     var rowsOut = [];
-    var processed = 0;
-    var hitRate = false;
-    var ok = 0, err = 0, errAuth = 0;
 
     for (var i = 0; i < results.length; i++) {
       var r = results[i];
@@ -430,7 +547,6 @@ function marketFetchChunk() {
       }
     }
 
-
     // Flush once
     if (rowsOut.length) {
       upsertRegionCache_(cache, rowsOut);
@@ -442,20 +558,18 @@ function marketFetchChunk() {
 
     // Auth fail-fast: stop job, preserve cursor. No recycling.
     if (errAuth > 0) {
-      var props = PropertiesService.getScriptProperties();
-      props.setProperty('mf_blocked_auth', '1');              // breadcrumb if you want to gate startup
-      props.deleteProperty('mf_job_active');
+      var props2 = PropertiesService.getScriptProperties();
+      props2.setProperty('mf_blocked_auth', '1'); // breadcrumb if you want to gate startup
+      props2.deleteProperty('mf_job_active');
       LoggerEx.error('mf.auth.block rid=' + rid + ' region=' + regionId + ' errAuth=' + errAuth + ' hint="Sheets → Add-ons → GESI → Authorize Character"');
       return stopWorker_('auth required');
     }
-
 
     // Advance cursor only by actual work
     var cursorBefore = { ri: ri, ii: ii };
     if (hitRate && processed === 0) {
       if (typeof hardenPacer_ === 'function') hardenPacer_();
-      LoggerEx.warn('mf.cursor.stay_due_to_rate rid=' + rid + ' region=' + regionId +
-        ' cursor=' + JSON.stringify(cursorBefore));
+      LoggerEx.warn('mf.cursor.stay_due_to_rate rid=' + rid + ' region=' + regionId + ' cursor=' + JSON.stringify(cursorBefore));
       // keep ri/ii unchanged
     } else {
       ii += processed;
@@ -481,6 +595,12 @@ function marketFetchChunk() {
 
     props.setProperty('mf_cursor', JSON.stringify({ ri: ri, ii: ii }));
 
+    // Decrement ramp runs (if any) after each successful pass
+    try {
+      const left = Number(props.getProperty(RAMP_PROP_RUNS) || 0);
+      if (left > 0) props.setProperty(RAMP_PROP_RUNS, String(Math.max(0, left - 1)));
+    } catch (_) { }
+
   } catch (e) {
     LoggerEx.error('mf.run.exception rid=' + rid + ' msg=' + (e && e.message));
     throw e;
@@ -490,89 +610,10 @@ function marketFetchChunk() {
   }
 }
 
-
 function isValidRegionId_(n) {
   n = Math.floor(Number(n));
   return Number.isFinite(n) && n >= 10000000 && n < 20000000;
 }
-
-
-/* ============================ CLIENT SIDE ============================== */
-/**
- * marketStatDataCache — cache-only (no network, no tables).
- * Reads Fuz book stats from CacheService via your _getCachedFuz helper.
- * If a key isn’t cached yet, returns "".
- *
- * @param {number|range} type_ids
- * @param {string}       location_type  "region" | "system" | "station"
- * @param {number}       location_id
- * @param {string}       order_type     "sell" | "buy" (default "sell")
- * @param {string}       order_level    "volume" (default); supports min|max|avg|median if your cache holds them
- * @return {any[][]|number|string}      same shape as type_ids
- */
-function marketStatDataCache(type_ids, location_type, location_id, order_type, order_level) {
-  if (type_ids == null) return "";
-
-  // normalize location
-  const lt = String(location_type || "").toLowerCase();
-  if (!["region","system","station"].includes(lt)) {
-    return Array.isArray(type_ids) ? type_ids.map(() => [""]) : "";
-  }
-  const loc = Number(location_id);
-  if (!Number.isFinite(loc)) {
-    return Array.isArray(type_ids) ? type_ids.map(() => [""]) : "";
-  }
-
-  // order normalization (default: sell/volume for cache reads)
-  const norm = (typeof _normalizeOrder === "function")
-    ? _normalizeOrder(order_type, order_level || "volume")
-    : {
-        type: (String(order_type || "sell").toLowerCase() === "buy" ? "buy" : "sell"),
-        level: String(order_level || "volume").toLowerCase()
-      };
-
-  // preserve input shape
-  const in2D = Array.isArray(type_ids)
-    ? (Array.isArray(type_ids[0]) ? type_ids : type_ids.map(v => [v]))
-    : [[type_ids]];
-  const rows = in2D.length, cols = in2D[0].length;
-
-  // flatten ids (keep nulls as placeholders)
-  const flatIds = [];
-  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
-    const n = Number(in2D[r][c]);
-    flatIds.push(Number.isFinite(n) ? n : null);
-  }
-
-  if (typeof _getCachedFuz !== "function") {
-    throw new Error("_getCachedFuz not found — ensure the Fuzz module is loaded.");
-  }
-
-  // read cache only
-  const uniq = Array.from(new Set(flatIds.filter(n => n != null)));
-  const { have } = _getCachedFuz(uniq, loc, lt); // {have: {[typeId]: row}}
-
-  // picker (min|max|avg|median|volume)
-  const pick = (row) => {
-    if (!row) return null;
-    const node = row[norm.type];
-    if (!node) return null;
-    const v = node[norm.level];
-    const num = Number(v);
-    return Number.isFinite(num) ? num : null;
-  };
-
-  // map back to original shape
-  const out = Array.from({ length: rows }, () => Array(cols).fill(""));
-  let k = 0;
-  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
-    const id = flatIds[k++];
-    out[r][c] = (id == null) ? "" : (pick(have[id]) ?? "");
-  }
-  return Array.isArray(type_ids) ? out : out[0][0];
-}
-
-
 
 /* =============================== HELPERS ================================ */
 function publishMarketResultESIRegion() {
@@ -581,7 +622,7 @@ function publishMarketResultESIRegion() {
   const pub = ss.getSheetByName(SHEET_PUBLISH);
   if (!cache || !pub) throw new Error('Missing sheets');
 
-  const keepPairs = getConfigPairSet_();               // ← NEW
+  const keepPairs = getConfigPairSet_();
 
   const vals = cache.getDataRange().getValues();
   const out = [HEADERS_PUBLISH];
@@ -598,7 +639,7 @@ function publishMarketResultESIRegion() {
       const row = vals[i];
       const t = row[ix.t], r = row[ix.r];
       if (t === "" || r === "") continue;
-      if (!keepPairs.has(`${Math.floor(t)}:${Math.floor(r)}`)) continue;  // ← NEW
+      if (!keepPairs.has(`${Math.floor(t)}:${Math.floor(r)}`)) continue;
 
       let status = String(row[ix.s] || "").toUpperCase();
       if (status === "STALE") status = "STALE-ESI";
@@ -615,8 +656,6 @@ function publishMarketResultESIRegion() {
   pub.getRange('H1').setNumberFormat('yyyy-mm-dd\"T\"hh:mm:ss\"Z\"').setValue(new Date());
   SpreadsheetApp.getActive().setNamedRange(NR_MARKET_RESULT, pub.getRange('A:E'));
 }
-
-
 
 function markAllCacheStale_(sheet) {
   const data = sheet.getDataRange().getValues();
@@ -639,7 +678,6 @@ function markAllCacheStale_(sheet) {
   sheet.getRange(2, iStatus + 1, newStatuses.length, 1).setValues(newStatuses);
 }
 
-
 function stopWorker_(reason) {
   ScriptApp.getProjectTriggers()
     .filter(t => t.getHandlerFunction() === 'marketFetchChunk')
@@ -648,7 +686,7 @@ function stopWorker_(reason) {
   if (reason) console.log('marketFetchChunk: stopped (' + reason + ')');
 }
 
-// Sum last 30 days (objects or arrays)
+// Sum last N days (objects or arrays)
 function sumLastNDaysObj_(hist, days) {
   const startMs = Date.now() - days * 864e5;
   let sum = 0;
@@ -659,7 +697,6 @@ function sumLastNDaysObj_(hist, days) {
   return sum;
 }
 
-// Read list from Named Range OR "Sheet!A1" (numeric IDs; de-dupe; preserve order)
 // Read list from Named Range OR "Sheet!A1" (numeric/string IDs; de-dupe; preserve order)
 function readListFlex_(spec, opts) {
   opts = Object.assign({
@@ -709,7 +746,6 @@ function readListFlex_(spec, opts) {
   return out;
 }
 
-
 // Upsert (type_id, region_id) rows into Cache_Market_ESI_Region
 function upsertRegionCache_(sheet, rows) {
   if (!rows.length) return;
@@ -736,6 +772,21 @@ function upsertRegionCache_(sheet, rows) {
   }
 }
 
+/* Utility used by ESI_publishClientInterfaces (safe no-op if you already have one) */
+function getOrCreateSheet(ss, name, headers) {
+  let sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+  if (headers && headers.length) {
+    const hdr = sh.getRange(1, 1, 1, headers.length).getValues()[0];
+    const needs = !hdr[0] || headers.some((h, i) => hdr[i] !== h);
+    if (needs) {
+      sh.clear();
+      sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+      sh.setFrozenRows(1);
+    }
+  }
+  return sh;
+}
 
 /* =============================== DEBUG ================================= */
 function debugListSources() {
@@ -747,7 +798,6 @@ function debugListSources() {
   });
 }
 
-
 function _pairKey_(t, r) { return `${Math.floor(t)}:${Math.floor(r)}`; }
 
 function getConfigPairSet_() {
@@ -757,7 +807,6 @@ function getConfigPairSet_() {
   for (const t of items) for (const r of regions) set.add(_pairKey_(t, r));
   return set;
 }
-
 
 function pruneCacheToConfig_(mode = 'tombstone') {
   const ss = SpreadsheetApp.getActive();
@@ -806,7 +855,6 @@ function pruneCacheToConfig_(mode = 'tombstone') {
   updates.forEach(u => sh.getRange(u.rn, 1, 1, h.length).setValues([u.row]));
 }
 
-
 /**
  * Build a values-only table per client from Publish_ESI_Region.
  * Input:  Sheet "Interface Clients" → A:Client, B:region_id_heartbeat
@@ -836,7 +884,7 @@ function ESI_publishClientInterfaces() {
     if (!s) return null;
     // Try YYYY-MM-DD first
     const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
-    if (m) return new Date(Date.UTC(+m[1], +m[2]-1, +m[3]));
+    if (m) return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
     // Try serial / general number
     const n = Number(s);
     if (Number.isFinite(n)) return new Date(Math.round((n - 25569) * 86400000)); // Excel serial fallback
@@ -934,16 +982,13 @@ function ESI_publishClientInterfaces() {
 
     // Update named range (header + data)
     const height = Math.max(1, rows.length + 1);
-    ss.setNamedRange(
-      'MarketResultESI_Region_' + client,
-      outSh.getRange(1, 1, height, OUT_HEADERS.length)
-    );
+    ss.setNamedRange('MarketResultESI_Region_' + client, outSh.getRange(1, 1, height, OUT_HEADERS.length));
   }
 }
 
 /**
  * Install/replace a time trigger to republish client interfaces.
- * @param {number} everyMinutes  One of: 1, 5, 10, 15, 30 (default 10)
+ * @param {number} everyMinutes  One of: 1, 5, 10, 15, 30 (default 5)
  */
 function ESI_installClientInterfaceRefresh(everyMinutes) {
   const allowed = [1, 5, 10, 15, 30];
@@ -960,5 +1005,136 @@ function ESI_stopClientInterfaceRefresh() {
   ScriptApp.getProjectTriggers()
     .filter(t => t.getHandlerFunction() === 'ESI_publishClientInterfaces')
     .forEach(t => ScriptApp.deleteTrigger(t));
+}
+
+/* ========== OUTAGE RETRY (errors only, non-stranding, repo-native) ========== */
+/**
+ * ESI outage recovery — retry only rows with ERR_* (and IN_PROGRESS older than 5m).
+ * Uses existing fetchHistoryBatchGESI_ (GESI + TB governor). Never negative cache.
+ * Safe to run ad-hoc or via a short-lived time trigger. Does NOT pre-mark IN_PROGRESS.
+ */
+function ESI_RetryErrorsOnce(limit = 250, chunk = 20) {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Cache_Market_ESI_Region');
+  if (!sh) return;
+  const rng = sh.getDataRange().getValues();
+  if (rng.length < 2) return;
+  const h = rng[0], H = _hdr(h);
+
+  const isRetryable = s => /^ERR_(?:RATE|5|NET|FETCH|PARSE|4XX|ESI)$/i.test(String(s || ''));
+  const now = new Date();
+  const inProgCutoff = Date.now() - 5 * 60 * 1000; // retry IN_PROGRESS older than 5m
+
+  const q = [];
+  for (let r = 1; r < rng.length && q.length < limit; r++) {
+    const row = rng[r]; row.__rowNumber = r + 1;
+    const st = String(row[H.status] || '').toUpperCase();
+    const ts = (row[H.last_updated] instanceof Date) ? row[H.last_updated].getTime() : 0;
+    if (isRetryable(st) || (st === 'IN_PROGRESS' && (!ts || ts < inProgCutoff))) q.push(row);
+  }
+  if (!q.length) return;
+
+  const COLS = sh.getLastColumn();
+  const byRegion = _groupBy(q, r => String(r[H.region_id]));
+  const write = (rows) => rows.forEach(u => sh.getRange(u.rowNumber, 1, 1, COLS).setValues([u.values]));
+
+  for (const reg of Object.keys(byRegion)) {
+    const rows = byRegion[reg];
+    for (let i = 0; i < rows.length; i += chunk) {
+      const part = rows.slice(i, i + chunk);
+      const typeIds = part.map(r => Number(r[H.type_id]));
+      let res;
+
+      try { res = fetchHistoryBatchGESI_(+reg, typeIds); }
+      catch (e) {
+        (LoggerEx?.warn || console.warn)('[ESI][retry] batch threw; region=' + reg + ' msg=' + (e && e.message));
+        write(part.map(row => ({ rowNumber: row.__rowNumber, values: _rowWriteValues(row, H, { last_updated: now, status: 'ERR_5XX' }, true) })));
+        continue;
+      }
+
+      const updates = [];
+      part.forEach((row, idx) => {
+        const rec = Array.isArray(res) ? res[idx] : null;
+        if (rec && rec.status === 'OK') {
+          updates.push({
+            rowNumber: row.__rowNumber, values: _rowWriteValues(row, H, {
+              volume30_region: rec.vol30, velocity_region: rec.vel, last_updated: now, status: 'OK'
+            }, false)
+          });
+        } else {
+          const status = (rec && rec.status) ? rec.status : 'ERR_FETCH';
+          updates.push({ rowNumber: row.__rowNumber, values: _rowWriteValues(row, H, { last_updated: now, status }, true) });
+        }
+      });
+      write(updates);
+    }
+  }
+  try { publishMarketResultESIRegion(); } catch (_) { }
+}
+
+/* tiny local utils matching your existing style */
+function _cfg(cfg, key, def) {
+  if (cfg && cfg[key] != null && cfg[key] !== "") return cfg[key];
+  try { const v = PropertiesService.getScriptProperties().getProperty(key); if (v != null && v !== "") return v; } catch (_) { }
+  return def;
+}
+function _hdr(row) { const m = {}; row.forEach((h, i) => m[String(h).trim()] = i); return m; }
+function _groupBy(arr, keyFn) { const m = {}; arr.forEach(x => { const k = String(keyFn(x)); (m[k] || (m[k] = [])).push(x); }); return m; }
+function _rowWriteValues(row, H, patch, preserveComputed) {
+  const v = row.slice();
+  if (!preserveComputed) {
+    if (patch.volume30_region != null) v[H.volume30_region] = patch.volume30_region;
+    if (patch.velocity_region != null) v[H.velocity_region] = patch.velocity_region;
+  }
+  if (patch.last_updated != null) v[H.last_updated] = patch.last_updated;
+  if (patch.status != null) v[H.status] = patch.status;
+  return v;
+}
+function _compute30d(historyRows) {
+  if (!Array.isArray(historyRows) || !historyRows.length) return { vol30: 0, vel: 0 };
+  const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  let vol = 0;
+  for (let i = 0; i < historyRows.length; i++) {
+    const row = historyRows[i];
+    const d = new Date(row.date || row.day || row.Date || row.Day);
+    if (!isNaN(d) && d >= cutoff) vol += Number(row.volume || row.Volume || 0);
+  }
+  return { vol30: vol, vel: vol / 30 };
+}
+
+/* ============================ OPTIONAL TEST HOOKS ====================== */
+/** Manually open breaker for testing (minutes). */
+function ESI_breakerOpenFor(minutes) {
+  var m = Math.max(1, Number(minutes) || 1);
+  cbOpen_(m * 60000); // avoid 60_000
+}
+
+/** Close breaker and clear counters. */
+function ESI_breakerClose() { cbClose_(); }
+
+/** Is the breaker currently open? */
+function ESI_breakerIsOpen() {
+  return cbIsOpen_();
+}
+
+/** Inspect breaker status (remaining ms/mins + rolling fail window). */
+function ESI_breakerStatus() {
+  var p = PropertiesService.getScriptProperties();
+  var now = Date.now();
+  var until = +(p.getProperty(CB_PROP_UNTIL) || 0);
+  var msLeft = Math.max(0, until - now);
+  var fails  = +(p.getProperty(CB_PROP_FAILS) || 0);
+  var calls  = +(p.getProperty('esi_call_ct') || 0);
+  var failRate = calls ? (fails / calls) : 0;
+
+  var info = {
+    open: msLeft > 0,
+    ms_left: msLeft,
+    minutes_left: +(msLeft / 60000).toFixed(2),
+    window_fails: fails,
+    window_calls: calls,
+    window_fail_rate: +failRate.toFixed(3)
+  };
+  (LoggerEx?.log || console.log)('esi.breaker.status', info);
+  return info;
 }
 
