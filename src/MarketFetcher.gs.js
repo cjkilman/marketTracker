@@ -183,15 +183,49 @@ function _trimTrailing_(sh) {
   const extra = alloc - used;
   if (extra > 0) _deleteInBlocks_(sh, used + 1, extra);
 }
+// Deletes rows in blocks but never removes the last non-frozen row.
+// If the caller tries to delete the entire body, we leave one row and clear it.
 function _deleteInBlocks_(sh, startRow, count) {
   const BLOCK = 20000;
-  let remaining = count, row = startRow;
-  while (remaining > 0) {
-    const n = Math.min(BLOCK, remaining);
+
+  if (count <= 0) return;
+
+  const frozen = sh.getFrozenRows();
+  const bodyStart = frozen + 1;                  // first non-frozen row
+  const maxRows   = sh.getMaxRows();
+  const bodyRows  = Math.max(0, maxRows - frozen);
+
+  // normalize startRow to body
+  if (startRow < bodyStart) startRow = bodyStart;
+
+  // how many rows exist before our start within the body?
+  const keptTop = Math.max(0, startRow - bodyStart);
+
+  // We must leave at least 1 non-frozen row:
+  // deletable = bodyRows - 1 - keptTop
+  let safeCount = Math.min(count, Math.max(0, bodyRows - 1 - keptTop));
+  if (safeCount <= 0) {
+    // If the intent was "wipe everything", just clear the single kept row
+    if (startRow === bodyStart && count >= bodyRows) {
+      sh.getRange(bodyStart, 1, 1, sh.getMaxColumns()).clearContent();
+    }
+    return;
+  }
+
+  // Delete in chunks (row index stays the same because rows collapse upward)
+  let row = startRow;
+  while (safeCount > 0) {
+    const n = Math.min(BLOCK, safeCount);
     sh.deleteRows(row, n);
-    remaining -= n;
+    safeCount -= n;
+  }
+
+  // If the caller intended to delete the whole body, clear the one kept row
+  if (startRow === bodyStart && count >= bodyRows) {
+    sh.getRange(bodyStart, 1, 1, sh.getMaxColumns()).clearContent();
   }
 }
+
 
 /** Batch/contiguous prune for "older than N days" assuming chronological appends. */
 function pruneOldRows(sheet, retentionDays, dateCol /* 1-based */) {
@@ -235,6 +269,13 @@ function dailyHeavyPrune_Prices() {
   } finally {
     lock.releaseLock();
   }
+}
+
+function dailyHeavyPrune_History() {
+  const CFG = mtConfig();
+  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.sheets.history);
+  if (!sh) return;
+  heavyPruneSheet_(sh, CFG.retentionDays.history, CFG.maxRows.history, CFG.bucketMinutes);
 }
 
 /** Heavy prune: retention → dedupe (20m buckets) → cap → rewrite once → tighten */
