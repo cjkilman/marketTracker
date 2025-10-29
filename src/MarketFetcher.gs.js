@@ -1,8 +1,8 @@
 /** MarketFetcher.gs — Prices runner with Light/Heavy Prune + Lock
- * Assumes sheet "Market Prices" exists with header in row 1:
- * ["date","market_id","market_type","type_id","min_sell","max_buy","median_sell","median_buy"]
- * Depends on:
- * - getConfig(), getMarketSettings(), getTypeIDsFromItemList(), fuzAPI.requestItems()
+ * ASSUMES: Data is sourced from existing sheets ('Item List Back End' & 'Market Settings').
+ * DEPENDENCIES:
+ * - getOrCreateSheet (global)
+ * - fuzAPI.requestItems() (in Fuz API.js)
  * - LoggerEx
  */
 
@@ -37,11 +37,15 @@ function mtConfig() {
 }
 function getBucketMinutes() { return mtConfig().bucketMinutes; }
 
-/* ---------------------- Utilities ---------------------- */
+/* ---------------------- List Retrieval (Original Functions) ---------------------- */
 
 function sanitizeIDs(ids) {
   return [...new Set(ids.map(v => Number(v)).filter(v => !isNaN(v) && v > 0))];
 }
+
+/**
+ * Reads Market Settings and returns an array of unique location objects.
+ */
 function getMarketSettings() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName("Market Settings");
@@ -55,6 +59,10 @@ function getMarketSettings() {
   });
   return combos;
 }
+
+/**
+ * Reads Item IDs and returns a sanitized array of unique type_ids.
+ */
 function getTypeIDsFromItemList(limit) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName("Item List Back End");
@@ -66,10 +74,36 @@ function getTypeIDsFromItemList(limit) {
 }
 
 
+/* ---------------------- Simplified Master List Function ---------------------- */
+
+/**
+ * NEW: Combines the output of Item List and Market Settings into a single
+ * master list of requests (Masterlist pattern).
+ */
+function getMasterMarketRequests() {
+    const typeIDs = getTypeIDsFromItemList();
+    const marketCombos = getMarketSettings();
+
+    const masterRequests = [];
+
+    // Perform the cross-product join
+    typeIDs.forEach(type_id => {
+        marketCombos.forEach(({ market_id, market_type }) => {
+            masterRequests.push({ 
+                type_id, 
+                market_id, 
+                market_type 
+            });
+        });
+    });
+
+    return masterRequests;
+}
+
+/* ---------------------- Price Fetching Core ---------------------- */
+
 /**
  * Coerces v into a positive finite number, else null.
- * - Accepts numbers or strings (e.g. "12,345.67").
- * - Treats 0/negatives/NaN/undefined as null.
  */
 const toPosNumberOrNull = (v) => {
   if (v == null) return null;
@@ -81,15 +115,13 @@ const toPosNumberOrNull = (v) => {
 function getMarketPrices(typeIds, marketId, marketType) {
   let dataMap = {};
   try {
-    // [PATCH START] Replace old postFetch with new fuzAPI.requestItems
-    // fuzAPI.requestItems returns an Array of { type_id, buy, sell, ... } objects
+    // fuzAPI.requestItems handles the batch fetching for all typeIds in this location
     const resultsArray = fuzAPI.requestItems(marketId, marketType, typeIds) || [];
     
     // Convert array to a map { type_id: {buy:..., sell:...} } for easier access by ID
     resultsArray.forEach(item => {
         dataMap[item.type_id] = item;
     });
-    // [PATCH END]
   } catch (e) {
     // If the call blows up, return all-null rows for requested ids.
     return Object.fromEntries(
@@ -101,12 +133,10 @@ function getMarketPrices(typeIds, marketId, marketType) {
 
   const out = {};
   for (const id of typeIds) {
-    // Accessing the new FuzDataObject structure: dataMap?.[id] = { buy: {max, median, ...}, sell: {...} }
     const e = dataMap?.[id] ?? {};
     const sell = e?.sell ?? {};
     const buy  = e?.buy  ?? {};
     out[id] = {
-      // The keys min, max, median, etc., are now accessed from the new FuzDataObject structure.
       minSell:    toPosNumberOrNull(sell.min),
       maxBuy:     toPosNumberOrNull(buy.max),
       medianSell: toPosNumberOrNull(sell.median),
@@ -124,7 +154,6 @@ function getCurrentMarketPrices() {
   const SHEET_NAME = cfg.sheets.prices;
   const RETENTION  = cfg.retentionDays.prices;
   const MAX_ROWS   = cfg.maxRows.prices;
-  const MAX_LOG    = cfg.maxLogIDs;
 
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(2000)) { LoggerEx && LoggerEx.warn("Prices: skip — lock busy"); return; }
@@ -132,22 +161,44 @@ function getCurrentMarketPrices() {
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     const headers = ["date","market_id","market_type","type_id","min_sell","max_buy","median_sell","median_buy"];
+    // Assumes getOrCreateSheet exists
     const sheet = getOrCreateSheet(ss, SHEET_NAME, headers);
 
     // Light pre-prune (fast)
     lightPrePrune_(sheet, MAX_ROWS);
 
-    // Collect prices
-    const typeIDs = getTypeIDsFromItemList(MAX_LOG);
-    const marketCombos = getMarketSettings();
-    if (!typeIDs.length || !marketCombos.length) {
-      LoggerEx && LoggerEx.warn("Prices: no typeIDs or no markets; aborting run.");
+    // --- STEP 1: Get Master List (Cross-Product) ---
+    const allMarketRequests = getMasterMarketRequests();
+
+    if (!allMarketRequests.length) {
+      LoggerEx && LoggerEx.warn("Prices: Master Market Requests list is empty; aborting run.");
       return;
     }
-    const now = new Date(); // timestamp stored in local tz (NY), not UTC)
+
+    // --- STEP 2: Group requests by location for Fuzzwork batch efficiency ---
+    const groupedRequests = {}; // { 'marketId_marketType': {market_id, market_type, typeIDs: []} }
+
+    allMarketRequests.forEach(req => {
+        const key = `${req.market_id}_${req.market_type}`;
+        if (!groupedRequests[key]) {
+            groupedRequests[key] = { 
+                market_id: req.market_id, 
+                market_type: req.market_type, 
+                typeIDs: [] 
+            };
+        }
+        groupedRequests[key].typeIDs.push(req.type_id);
+    });
+
+    const now = new Date(); // timestamp stored in local tz
     const rows = [];
-    marketCombos.forEach(({ market_id, market_type }) => {
+    
+    // --- STEP 3: Process each unique market location (one efficient API call per location) ---
+    Object.values(groupedRequests).forEach(({ market_id, market_type, typeIDs }) => {
+      // Fetch prices for all items in this location
       const prices = getMarketPrices(typeIDs, market_id, market_type);
+      
+      // Write results to rows
       typeIDs.forEach(type_id => {
         const e = prices[type_id] || {};
         rows.push([now, market_id, market_type, type_id, e.minSell ?? null, e.maxBuy ?? null, e.medianSell ?? null, e.medianBuy ?? null]);
@@ -193,7 +244,6 @@ function _trimTrailing_(sh) {
   if (extra > 0) _deleteInBlocks_(sh, used + 1, extra);
 }
 // Deletes rows in blocks but never removes the last non-frozen row.
-// If the caller tries to delete the entire body, we leave one row and clear it.
 function _deleteInBlocks_(sh, startRow, count) {
   const BLOCK = 20000;
 
@@ -211,25 +261,19 @@ function _deleteInBlocks_(sh, startRow, count) {
   const keptTop = Math.max(0, startRow - bodyStart);
 
   // We must leave at least 1 non-frozen row:
-  // deletable = bodyRows - 1 - keptTop
   let safeCount = Math.min(count, Math.max(0, bodyRows - 1 - keptTop));
   if (safeCount <= 0) {
-    // If the intent was "wipe everything", just clear the single kept row
     if (startRow === bodyStart && count >= bodyRows) {
       sh.getRange(bodyStart, 1, 1, sh.getMaxColumns()).clearContent();
     }
     return;
   }
-
-  // Delete in chunks (row index stays the same because rows collapse upward)
   let row = startRow;
   while (safeCount > 0) {
     const n = Math.min(BLOCK, safeCount);
     sh.deleteRows(row, n);
     safeCount -= n;
   }
-
-  // If the caller intended to delete the whole body, clear the one kept row
   if (startRow === bodyStart && count >= bodyRows) {
     sh.getRange(bodyStart, 1, 1, sh.getMaxColumns()).clearContent();
   }
@@ -245,19 +289,17 @@ function pruneOldRows(sheet, retentionDays, dateCol /* 1-based */) {
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - retentionDays);
 
-  // Read the date column once
   const dates = sheet.getRange(2, dateCol, lastRow - 1, 1).getValues().flat();
 
-  // Find the last index we should delete (contiguous block from the top)
-  let boundary = -1; // last index in 'dates' to delete (0-based over data rows)
+  let boundary = -1;
   for (let i = 0; i < dates.length; i++) {
     const d = dates[i];
-    if (!(d instanceof Date)) continue;            // skip blanks
-    if (d < cutoff) boundary = i; else break;      // as soon as we hit fresh data, stop (chronological)
+    if (!(d instanceof Date)) continue;
+    if (d < cutoff) boundary = i; else break;
   }
 
   if (boundary >= 0) {
-    const rowsToDelete = boundary + 1;            // convert 0-based to count
+    const rowsToDelete = boundary + 1;
     _deleteInBlocks_(sheet, /*startRow=*/2, /*count=*/rowsToDelete);
     LoggerEx && LoggerEx.log('Prices: pruned old rows (<= cutoff):', rowsToDelete);
   }
@@ -296,7 +338,6 @@ function heavyPruneSheet_(sh, retentionDays, maxRows, bucketMinutes) {
   const lower  = header.map(h => String(h).trim().toLowerCase());
   const find = (name) => lower.findIndex(h => h === name);
 
-  // Resolve key column indices (0-based for arrays)
   const DATE = find('date');
   const TYPE = find('type_id');
   const MID  = find('market_id');
@@ -306,10 +347,8 @@ function heavyPruneSheet_(sh, retentionDays, maxRows, bucketMinutes) {
     return;
   }
 
-  // Read all data rows once
   const data = sh.getRange(2,1,lastRow-1,lastCol).getValues();
 
-  // 1) Retention window
   const cutoff = new Date(Date.now() - retentionDays * 86400000);
   const windowed = [];
   for (let i=0;i<data.length;i++) {
@@ -318,33 +357,29 @@ function heavyPruneSheet_(sh, retentionDays, maxRows, bucketMinutes) {
     if (d instanceof Date && d >= cutoff) windowed.push(r);
   }
 
-  // 2) Dedupe by 20-min buckets — key = bucket|type_id|market_id|market_type
   const msPerBucket = (bucketMinutes || 20) * 60 * 1000;
   const keep = new Map();
   for (let i=0;i<windowed.length;i++) {
     const r = windowed[i];
     const d = r[DATE];
-    if (!(d instanceof Date)) continue; // keep dedupe pure on dated rows
+    if (!(d instanceof Date)) continue;
     const bucket = Math.floor(d.getTime() / msPerBucket);
     const key = bucket + '|' + r[TYPE] + '|' + r[MID] + '|' + r[MTP];
 
     const prev = keep.get(key);
-    if (!prev || (r[DATE] > prev[DATE])) keep.set(key, r); // newest wins
+    if (!prev || (r[DATE] > prev[DATE])) keep.set(key, r);
   }
   let deduped = Array.from(keep.values());
 
-  // 3) Enforce cap (keep newest by date)
   if (deduped.length > maxRows) {
-    deduped.sort((a,b) => a[DATE] - b[DATE]);            // oldest first
-    deduped = deduped.slice(deduped.length - maxRows);   // keep newest maxRows
+    deduped.sort((a,b) => a[DATE] - b[DATE]);
+    deduped = deduped.slice(deduped.length - maxRows);
   }
 
-  // 4) Rewrite once (header + data) then tighten
   sh.clearContents();
   sh.getRange(1,1,1,lastCol).setValues([header]);
   if (deduped.length) sh.getRange(2,1,deduped.length,lastCol).setValues(deduped);
 
-  // Tighten trailing blanks
   const used = sh.getLastRow(), alloc = sh.getMaxRows();
   if (alloc > used) sh.deleteRows(used + 1, alloc - used);
 
