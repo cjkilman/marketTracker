@@ -1,9 +1,9 @@
 /** MarketFetcher.gs — Prices runner with Light/Heavy Prune + Lock
- *  Assumes sheet "Market Prices" exists with header in row 1:
- *  ["date","market_id","market_type","type_id","min_sell","max_buy","median_sell","median_buy"]
- *  Depends on:
- *    - getConfig(), getMarketSettings(), getTypeIDsFromItemList(), postFetch()
- *    - LoggerEx
+ * Assumes sheet "Market Prices" exists with header in row 1:
+ * ["date","market_id","market_type","type_id","min_sell","max_buy","median_sell","median_buy"]
+ * Depends on:
+ * - getConfig(), getMarketSettings(), getTypeIDsFromItemList(), fuzAPI.requestItems()
+ * - LoggerEx
  */
 
 /* ---------------------- Config helpers ---------------------- */
@@ -79,10 +79,17 @@ const toPosNumberOrNull = (v) => {
 
 /** Map Fuz result into math-friendly numbers (null for non-numeric/≤0). */
 function getMarketPrices(typeIds, marketId, marketType) {
-  let data = {};
+  let dataMap = {};
   try {
-    // If postFetch can be async in your setup, make an async version and await it.
-    data = postFetch(typeIds, marketId, marketType) || {};
+    // [PATCH START] Replace old postFetch with new fuzAPI.requestItems
+    // fuzAPI.requestItems returns an Array of { type_id, buy, sell, ... } objects
+    const resultsArray = fuzAPI.requestItems(marketId, marketType, typeIds) || [];
+    
+    // Convert array to a map { type_id: {buy:..., sell:...} } for easier access by ID
+    resultsArray.forEach(item => {
+        dataMap[item.type_id] = item;
+    });
+    // [PATCH END]
   } catch (e) {
     // If the call blows up, return all-null rows for requested ids.
     return Object.fromEntries(
@@ -94,10 +101,12 @@ function getMarketPrices(typeIds, marketId, marketType) {
 
   const out = {};
   for (const id of typeIds) {
-    const e = data?.[id] ?? {};
+    // Accessing the new FuzDataObject structure: dataMap?.[id] = { buy: {max, median, ...}, sell: {...} }
+    const e = dataMap?.[id] ?? {};
     const sell = e?.sell ?? {};
     const buy  = e?.buy  ?? {};
     out[id] = {
+      // The keys min, max, median, etc., are now accessed from the new FuzDataObject structure.
       minSell:    toPosNumberOrNull(sell.min),
       maxBuy:     toPosNumberOrNull(buy.max),
       medianSell: toPosNumberOrNull(sell.median),
