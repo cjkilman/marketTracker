@@ -2,15 +2,11 @@
  * Manages fetching Fuzzwork prices based on state properties.
  * Called by the masterOrchestrator.
  *
- * NOW INCLUDES:
- * - Stateful Heavy Prune worker (`_heavyPruneWorker`)
- * - Daily Job Reset (`dailyJobReset`)
- *
- * NOTE: This file has been modified for an APPEND-ONLY workflow.
- * It no longer uses the atomic sheet swap method.
+ * NOTE: This file has been modified for an APPEND-ONLY workflow and implements 
+ * a "Cold Start Sentinel" to preserve data integrity on all subsequent runs.
  */
 
-/* global LockService, PropertiesService, SpreadsheetApp, LoggerEx, fuzAPI, getMasterMarketRequests, getOrCreateSheet, scheduleOneTimeTrigger, STATE_FLAGS, JOB_LEASE_DURATION_MS, pruneOldRows, _trimTrailing_, getConfig */ 
+/* global LockService, PropertiesService, SpreadsheetApp, LoggerEx, fuzAPI, getMarketPrices, getMasterMarketRequests, getOrCreateSheet, scheduleOneTimeTrigger, STATE_FLAGS, JOB_LEASE_DURATION_MS, pruneOldRows, _trimTrailing_, getConfig */
 
 // --- Constants ---
 const FUZZ_JOB_PREFIX = 'fuzzJob'; // Prefix for state properties
@@ -18,6 +14,7 @@ const FUZZ_PROP_STEP = FUZZ_JOB_PREFIX + 'Step';
 const FUZZ_PROP_INDEX = FUZZ_JOB_PREFIX + 'RequestIndex';
 const FUZZ_PROP_ROW = FUZZ_JOB_PREFIX + 'WriteRow';
 const FUZZ_PROP_LEASE = FUZZ_JOB_PREFIX + 'LeaseUntil';
+const FUZZ_PROP_INIT = FUZZ_JOB_PREFIX + 'Initialized'; // NEW: Cold start sentinel
 const FUZZ_SHEET_FINAL = 'Market Prices';     // Final destination sheet (used for direct append)
 const FUZZ_SHEET_HEADERS = ["date", "market_id", "market_type", "type_id", "min_sell", "max_buy", "median_sell", "median_buy"];
 
@@ -49,7 +46,7 @@ function updateFuzzMarketDataSheet() {
 
 /**
  * Resets the state of the Fuzz market data job.
- * Note: No longer deletes temp/old sheets or finalizer triggers.
+ * Note: FUZZ_PROP_INIT is NOT cleared to preserve the sheet structure.
  */
 function _resetFuzzMarketDataJobState(error) {
   LOG_FUZZ.warn(`RESETTING Fuzz Market Data Job State. Reason: ${error ? error.message : 'Completion/Manual'}`);
@@ -99,7 +96,7 @@ function _updateFuzzMarketDataWorker() {
   let finalSheet = null; // Changed from tempSheet
 
   try {
-    // --- State: NEW_RUN (Setup Phase - Get Final Sheet and Starting Row) ---
+    // --- State: NEW_RUN (Setup Phase - Conditional Initialization) ---
     if (currentState === STATE_FLAGS.NEW_RUN) {
       LOG_FUZZ.info(`State: ${STATE_FLAGS.NEW_RUN}. Preparing final sheet for append.`);
 
@@ -107,9 +104,20 @@ function _updateFuzzMarketDataWorker() {
       const docLock = LockService.getDocumentLock();
       if (docLock.tryLock(FUZZ_DOC_LOCK_TIMEOUT)) {
         try {
-          // Ensure the final sheet exists with correct headers
-          finalSheet = getOrCreateSheet(ss, FUZZ_SHEET_FINAL, FUZZ_SHEET_HEADERS);
-          SpreadsheetApp.flush(); // Ensure sheet operations complete
+          const isColdStart = !SCRIPT_PROP.getProperty(FUZZ_PROP_INIT);
+          finalSheet = ss.getSheetByName(FUZZ_SHEET_FINAL);
+
+          if (isColdStart || !finalSheet) {
+            // First time run or sheet was manually deleted: use getOrCreateSheet to guarantee headers
+            finalSheet = getOrCreateSheet(ss, FUZZ_SHEET_FINAL, FUZZ_SHEET_HEADERS);
+            SCRIPT_PROP.setProperty(FUZZ_PROP_INIT, 'TRUE');
+            LOG_FUZZ.info("COLD START: Sheet created/headers guaranteed.");
+          } else {
+            // Subsequent run: use existing sheet handle
+            LOG_FUZZ.info("WARM START: Using existing sheet for append.");
+          }
+          
+          SpreadsheetApp.flush(); 
 
           // Initialize state for processing
           SCRIPT_PROP.setProperty(FUZZ_PROP_INDEX, '0');
@@ -179,7 +187,7 @@ function _updateFuzzMarketDataWorker() {
 
         LOG_FUZZ.info(`Processing batch indices ${requestStartIndex}-${requestEndIndex - 1} (${requestsForThisRun.length} reqs, ${Object.keys(groupedRequests).length} markets).`);
 
-        // --- Fetch Data ---
+       // --- Fetch Data ---
         const now = new Date();
         const rowsToWrite = [];
         let fetchErrorOccurred = false;
@@ -190,11 +198,32 @@ function _updateFuzzMarketDataWorker() {
           typeIDs
         }) => {
           try {
-            // Note: getMarketPrices is expected to exist globally now
+            // This function now returns the full fuzObject map
             const prices = getMarketPrices(typeIDs, market_id, market_type); 
+            
             typeIDs.forEach(type_id => {
-              const e = prices[type_id] || {};
-              rowsToWrite.push([now, market_id, market_type, type_id, e.minSell ?? null, e.maxBuy ?? null, e.medianSell ?? null, e.medianBuy ?? null]);
+              // 'e' is now the full fuzObject, or an empty object
+              const fuzObject = prices[type_id] || {};
+              
+              // --- REFACTORED: Access nested structure ---
+              const sell = fuzObject.sell || {};
+              const buy = fuzObject.buy || {};
+              
+              // --- REFACTORED: 0-ORDER-COUNT CHECK (using nested structure) ---
+              // Check if both buy and sell order counts are 0 or undefined/null
+              const totalOrderCount = (buy.orderCount || 0) + (sell.orderCount || 0);
+              
+              if (totalOrderCount > 0) {
+                // Only push if there are orders
+                rowsToWrite.push([
+                  now, market_id, market_type, type_id, 
+                  sell.min ?? null,   // Was e.minSell
+                  buy.max ?? null,    // Was e.maxBuy
+                  sell.median ?? null,// Was e.medianSell
+                  buy.median ?? null  // Was e.medianBuy
+                ]);
+              }
+              // --- END REFACTORED CHECK ---
             });
           } catch (apiError) {
             LOG_FUZZ.error(`API error for ${market_type}:${market_id} (items: ${typeIDs.length}): ${apiError.message}`);
@@ -259,11 +288,9 @@ function _updateFuzzMarketDataWorker() {
   }
 }
 
-// NOTE: The _finalizeFuzzDataUpdate function has been removed.
+// ... (pruneOldRows, _deleteInBlocks_, _trimTrailing_ remain the same) ...
 
 /* ---------------------- Light Mode hygiene ---------------------- */
-
-// ... (pruneOldRows, _deleteInBlocks_, _trimTrailing_ remain the same) ...
 
 function lightPrePrune_(sh, maxRows) {
   const f = sh.getFilter && sh.getFilter();
@@ -363,6 +390,8 @@ function dailyJobReset() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const cfg = getConfig(); // Corrected config call
   const sheetName = FUZZ_SHEET_FINAL; // Use final sheet name for prune
+  // We use getOrCreateSheet here to ensure the sheet exists and has headers,
+  // but it will NOT clear contents due to the new logic in _updateFuzzMarketDataWorker.
   const sheet = getOrCreateSheet(ss, sheetName, FUZZ_SHEET_HEADERS);
 
   if (!sheet) {
@@ -457,7 +486,7 @@ function _heavyPruneWorker() {
           docLock.releaseLock();
         }
       } else {
-        LOG.warn(`Document Lock busy during prune setup. Rescheduling.`);
+        LOG_FUZZ.warn(`Document Lock busy during prune setup. Rescheduling.`);
         scheduleOneTimeTrigger('_heavyPruneWorker', FUZZ_RESCHEDULE_MS);
         return;
       }
@@ -465,7 +494,7 @@ function _heavyPruneWorker() {
 
     // --- State: PROCESSING (Processing While Loop) ---
     if (currentState === STATE_FLAGS.PROCESSING) {
-      LOG.info(`State: ${STATE_FLAGS.PROCESSING}. Reading/deduping batches.`);
+      LOG_FUZZ.info(`State: ${STATE_FLAGS.PROCESSING}. Reading/deduping batches.`);
       
       const sourceSheet = ss.getSheetByName(sourceSheetName);
       const tempSheet = ss.getSheetByName(tempSheetName);
@@ -481,8 +510,13 @@ function _heavyPruneWorker() {
       const lower = header.map(h => String(h).trim().toLowerCase());
       const find = (name) => lower.findIndex(h => h === name);
       const DATE = find('date'), TYPE = find('type_id'), MID = find('market_id'), MTP = find('market_type');
-      if (DATE < 0 || TYPE < 0 || MID < 0 || MTP < 0) {
-        throw new Error('Missing required columns (date/type_id/market_id/market_type) in source sheet.');
+      
+      // --- REFACTORED: Find price columns for filtering ---
+      const MIN_SELL = find('min_sell');
+      const MAX_BUY = find('max_buy');
+      
+      if (DATE < 0 || TYPE < 0 || MID < 0 || MTP < 0 || MIN_SELL < 0 || MAX_BUY < 0) {
+        throw new Error('Missing required columns (date/type_id/market_id/market_type/min_sell/max_buy) in source sheet.');
       }
       
       // --- Processing Loop ---
@@ -491,7 +525,7 @@ function _heavyPruneWorker() {
         if (Date.now() - START_TIME > FUZZ_TIME_LIMIT_MS) {
           SCRIPT_PROP.setProperty(PRUNE_PROP_READ_ROW, readRow.toString());
           scheduleOneTimeTrigger('_heavyPruneWorker', FUZZ_RESCHEDULE_MS);
-          LOG.warn(`Time limit hit. Saved state. Rescheduled. Next read row: ${readRow}`);
+          LOG_FUZZ.warn(`Time limit hit. Saved state. Rescheduled. Next read row: ${readRow}`);
           return;
         }
 
@@ -499,7 +533,7 @@ function _heavyPruneWorker() {
         const rowsToRead = Math.min(PRUNE_BATCH_SIZE, lastRow - readRow + 1);
         if (rowsToRead <= 0) break; 
         
-        LOG.info(`Reading ${rowsToRead} rows from ${sourceSheetName} (starting row ${readRow})...`);
+        LOG_FUZZ.info(`Reading ${rowsToRead} rows from ${sourceSheetName} (starting row ${readRow})...`);
         const data = sourceSheet.getRange(readRow, 1, rowsToRead, header.length).getValues();
         
         // --- 3. Process Batch (Retention, Bucket, Dedupe) ---
@@ -514,6 +548,17 @@ function _heavyPruneWorker() {
           const r = data[i];
           const d = r[DATE];
           if (!(d instanceof Date) || d < cutoff) continue; // Retention filter
+
+          // --- REFACTORED: VALID PRICE CHECK ---
+          // A row is invalid *only if* BOTH min_sell AND max_buy are non-positive.
+          const validMinSell = (r[MIN_SELL] != null && r[MIN_SELL] !== "" && Number(r[MIN_SELL]) > 0);
+          const validMaxBuy = (r[MAX_BUY] != null && r[MAX_BUY] !== "" && Number(r[MAX_BUY]) > 0);
+
+          // If NEITHER price is valid (min_sell is invalid AND max_buy is invalid), skip the row.
+          if (!validMinSell && !validMaxBuy) {
+            continue; // Skip row as it has no valid data
+          }
+          // --- END REFACTOR ---
 
           const bucket = Math.floor(d.getTime() / msPerBucket);
           const key = bucket + '|' + r[TYPE] + '|' + r[MID] + '|' + r[MTP];
@@ -532,13 +577,13 @@ function _heavyPruneWorker() {
           if (docLock.tryLock(FUZZ_DOC_LOCK_TIMEOUT)) {
             try {
               tempSheet.getRange(tempSheet.getLastRow() + 1, 1, rowsToWrite.length, rowsToWrite[0].length).setValues(rowsToWrite);
-              LOG.info(`Appended ${rowsToWrite.length} deduped rows to ${tempSheetName}.`);
+              LOG_FUZZ.info(`Appended ${rowsToWrite.length} deduped rows to ${tempSheetName}.`);
             } finally {
               docLock.releaseLock();
             }
           } else {
             // RETRIGGER ON WRITE FAILURE
-            LOG.warn(`Document Lock busy for prune write. Rescheduling (will re-process batch).`);
+            LOG_FUZZ.warn(`Document Lock busy for prune write. Rescheduling (will re-process batch).`);
             scheduleOneTimeTrigger('_heavyPruneWorker', FUZZ_RESCHEDULE_MS);
             return;
           }
@@ -552,7 +597,7 @@ function _heavyPruneWorker() {
 
       // --- Post-Loop Check ---
       if (readRow > lastRow) {
-        LOG.info("All source rows processed. Transitioning to FINALIZING.");
+        LOG_FUZZ.info("All source rows processed. Transitioning to FINALIZING.");
         currentState = STATE_FLAGS.FINALIZING;
         SCRIPT_PROP.setProperty(PRUNE_PROP_STEP, currentState);
         scheduleOneTimeTrigger('_finalizePrune', 1000); // 1 sec delay
@@ -560,7 +605,7 @@ function _heavyPruneWorker() {
     } // --- End PROCESSING ---
 
   } catch (e) {
-    LOG.error(`Unhandled error in prune worker: ${e.message}\nStack: ${e.stack}`);
+    LOG_FUZZ.error(`Unhandled error in prune worker: ${e.message}\nStack: ${e.stack}`);
     // Reset prune state on error
     SCRIPT_PROP.deleteProperty(PRUNE_PROP_STEP);
     SCRIPT_PROP.deleteProperty(PRUNE_PROP_READ_ROW);
@@ -610,9 +655,25 @@ function _finalizePrune() {
         const lower = header.map(h => String(h).trim().toLowerCase());
         const find = (name) => lower.findIndex(h => h === name);
         const DATE = find('date'), TYPE = find('type_id'), MID = find('market_id'), MTP = find('market_type');
+        
+        // --- REFACTORED: Find price columns for filtering ---
+        const MIN_SELL = find('min_sell');
+        const MAX_BUY = find('max_buy');
 
         for (let i = 0; i < data.length; i++) {
           const r = data[i];
+
+          // --- REFACTORED: VALID PRICE CHECK ---
+          // (This check is redundant if _heavyPruneWorker worked, but good for safety)
+          const validMinSell = (r[MIN_SELL] != null && r[MIN_SELL] !== "" && Number(r[MIN_SELL]) > 0);
+          const validMaxBuy = (r[MAX_BUY] != null && r[MAX_BUY] !== "" && Number(r[MAX_BUY]) > 0);
+
+          // If NEITHER price is valid, skip the row.
+          if (!validMinSell && !validMaxBuy) {
+            continue; // Skip this row
+          }
+          // --- END REFACTOR ---
+
           const d = r[DATE];
           if (!(d instanceof Date)) continue; 
 
@@ -643,7 +704,7 @@ function _finalizePrune() {
         }
         _trimTrailing_(tempSheet);
         SpreadsheetApp.flush();
-        LOG.info("Final data written to temp sheet.");
+        LOG_FUZZ.info("Final data written to temp sheet.");
 
         // --- 4. Atomic Swap (Prune Edition) ---
         const finalSheet = ss.getSheetByName(finalSheetName);
@@ -652,14 +713,14 @@ function _finalizePrune() {
         if (oldSheet) ss.deleteSheet(oldSheet);
         if (finalSheet) finalSheet.setName(oldSheetName);
         tempSheet.setName(finalSheetName);
-        finalSheet.showSheet(); // Use finalSheet handle which now points to the original sheet
+        tempSheet.showSheet(); // Use tempSheet handle which is now the final sheet
         SpreadsheetApp.flush();
-        LOG.info("Atomic sheet swap successful.");
+        LOG_FUZZ.info("Atomic sheet swap successful.");
 
         // --- 5. Reset Prune Job State ---
         SCRIPT_PROP.deleteProperty(PRUNE_PROP_STEP);
         SCRIPT_PROP.deleteProperty(PRUNE_PROP_READ_ROW);
-        LOG.info("Heavy Prune job state reset complete.");
+        LOG_FUZZ.info("Heavy Prune job state reset complete.");
 
       } catch (swapError) {
         LOG.error(`CRITICAL error during prune swap: ${swapError.message}. State NOT reset.`);

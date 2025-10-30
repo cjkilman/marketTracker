@@ -492,6 +492,10 @@ function marketStatDataBothCache(type_ids, location_type, location_id, order_lev
  * NEW: Wrapper function required by MarketFetcher.gs.js to fetch prices.
  * Returns a map where the value for each type_id is an object containing the
  * four required price points (minSell, maxBuy, medianSell, medianBuy).
+ *
+ * REFACTORED: Now returns the *entire* FuzDataObject (fuzObject) for
+ * each type_id, allowing the caller to access all nested data (prices,
+ * order counts, etc.).
  */
 function getMarketPrices(type_ids, market_id, market_type) {
   // Call the core API logic
@@ -499,18 +503,12 @@ function getMarketPrices(type_ids, market_id, market_type) {
   const priceMap = {};
 
   results.forEach(fuzObject => {
-    // Determine if the object is a FuzDataObject instance or a simple JSON object from cache
-    const sell = fuzObject.sell || {};
-    const buy = fuzObject.buy || {};
+    // Use the type_id from the object as the key
     const typeId = fuzObject.type_id;
 
-    // Create the object structure expected by MarketFetcher.gs.js
-    priceMap[typeId] = {
-      minSell: sell.min,
-      maxBuy: buy.max,
-      medianSell: sell.median,
-      medianBuy: buy.median
-    };
+    // Assign the *entire* fuzObject as the value
+    priceMap[typeId] = fuzObject;
   });
+
   return priceMap;
 }
