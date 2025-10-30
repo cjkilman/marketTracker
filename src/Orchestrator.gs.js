@@ -156,32 +156,52 @@ function masterOrchestrator() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const NOW_MS = Date.now();
 
+  const ESI_STAGNATION_TIMEOUT_MS = 30 * 60 * 1000; // Define a 30-minute threshold for no progress
+
   // --- 1. Check Fuzz Snapshot Job (MarketFetcher.gs.js) ---
-  // We check the lease property that MarketFetcher.gs.js already uses
   const fuzzLease = parseInt(SCRIPT_PROP.getProperty('fuzzJobLeaseUntil') || '0', 10);
   if (fuzzLease > NOW_MS) {
-    // Lease is active, so the job is already running. Do nothing.
     LOG.warn(`Fuzz job is already active (Lease expires in ${((fuzzLease - NOW_MS) / 60000).toFixed(1)} min). Skipping dispatch.`);
   } else {
-    // Lease is expired. "Bump" the job by starting it.
     LOG.info("Fuzz job is not active. Dispatching 'bump' (starting updateFuzzMarketDataSheet).");
     const newFuzzLease = NOW_MS + JOB_LEASE_DURATION_MS; // Give it a new 5 min lease
     SCRIPT_PROP.setProperty('fuzzJobLeaseUntil', newFuzzLease.toString());
     updateFuzzMarketDataSheet(); // Call the job
   }
 
-  // --- 2. Check "ESI" Job (marketFetcherEsi.js) ---
-  // THIS JOB IS PARKED / DISABLED TO FIX THE OVERLAP
-  const esiLease = parseInt(SCRIPT_PROP.getProperty('esiJobLeaseUntil') || '0', 10);
-  if (esiLease > NOW_MS) {
-    LOG.warn(`ESI job (marketFetcherEsi.js) is active but is PARKED. Skipping.`);
-  } else {
-    // LOG.info("ESI job is not active. Dispatching 'bump' (starting updateEsiHistorySheet).");
-    // const newEsiLease = NOW_MS + JOB_LEASE_DURATION_MS; // Give it a new 5 min lease
-    // SCRIPT_PROP.setProperty('esiJobLeaseUntil', newEsiLease.toString());
-    // updateEsiHistorySheet(); // Call the job
-    LOG.info("ESI job (marketFetcherEsi.js) is PARKED. Skipping dispatch.");
-  }
+  // --- 2. Check "ESI" Job (marketFetcherEsi.js) - HANG DETECTION LOGIC ---
+  const esiActive = SCRIPT_PROP.getProperty('mf_job_active');
+  const currentCursor = SCRIPT_PROP.getProperty('mf_cursor');
+  const lastCheckedCursor = SCRIPT_PROP.getProperty('mf_hang_check_cursor');
+  const lastCheckTime = parseInt(SCRIPT_PROP.getProperty('mf_hang_check_time_ms') || '0', 10);
+
+  if (esiActive === '1') {
+    const isFirstCheck = lastCheckedCursor === null;
+    
+    // Stagnation is detected if the cursor hasn't moved AND the check time exceeds 30 minutes
+    const isStagnated = (currentCursor === lastCheckedCursor && NOW_MS - lastCheckTime > ESI_STAGNATION_TIMEOUT_MS);
+    
+    if (isFirstCheck) {
+        LOG.info("ESI Job is active. Starting progress monitoring.");
+    } else if (isStagnated) {
+        LOG.error(`ESI Job HANG DETECTED! Cursor (${currentCursor}) has not advanced for over 30 minutes. Forcing state reset.`);
+        
+        // Execute the necessary cleanup and reset
+        if (typeof _resetEsiHistoryJobState === 'function') {
+            _resetEsiHistoryJobState(new Error("Progress Stagnation Detected by Orchestrator"));
+        } else {
+            LOG.error("Cannot reset ESI state: _resetEsiHistoryJobState function is missing.");
+        }
+    } 
+    
+    // Always update the check properties for the NEXT 15-minute cycle
+    if (currentCursor !== null) {
+        SCRIPT_PROP.setProperty('mf_hang_check_cursor', currentCursor);
+        SCRIPT_PROP.setProperty('mf_hang_check_time_ms', String(NOW_MS));
+    }
+
+    LOG.warn(`ESI job is active and progressing. Skipping dispatch.`);
+}
 
   LOG.info("Master orchestrator finished lease checks.");
 }

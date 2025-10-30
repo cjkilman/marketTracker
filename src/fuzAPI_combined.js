@@ -487,3 +487,30 @@ function marketStatDataBothCache(type_ids, location_type, location_id, order_lev
   const in2D = _as2D(type_ids);
   return in2D.map(row => ["", ""]);
 }
+
+/**
+ * NEW: Wrapper function required by MarketFetcher.gs.js to fetch prices.
+ * Returns a map where the value for each type_id is an object containing the
+ * four required price points (minSell, maxBuy, medianSell, medianBuy).
+ */
+function getMarketPrices(type_ids, market_id, market_type) {
+  // Call the core API logic
+  const results = fuzAPI.requestItems(market_id, market_type, type_ids);
+  const priceMap = {};
+
+  results.forEach(fuzObject => {
+    // Determine if the object is a FuzDataObject instance or a simple JSON object from cache
+    const sell = fuzObject.sell || {};
+    const buy = fuzObject.buy || {};
+    const typeId = fuzObject.type_id;
+
+    // Create the object structure expected by MarketFetcher.gs.js
+    priceMap[typeId] = {
+      minSell: sell.min,
+      maxBuy: buy.max,
+      medianSell: sell.median,
+      medianBuy: buy.median
+    };
+  });
+  return priceMap;
+}
