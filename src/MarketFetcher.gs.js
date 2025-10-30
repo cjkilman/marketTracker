@@ -7,7 +7,7 @@
  * - Daily Job Reset (`dailyJobReset`)
  */
 
-/* global LockService, PropertiesService, SpreadsheetApp, LoggerEx, fuzAPI, getMasterMarketRequests, getOrCreateSheet, scheduleOneTimeTrigger, STATE_FLAGS, JOB_LEASE_DURATION_MS, mtConfig, executeWithTryLock, pruneOldRows, _trimTrailing_ */
+/* global LockService, PropertiesService, SpreadsheetApp, LoggerEx, fuzAPI, getMasterMarketRequests, getOrCreateSheet, scheduleOneTimeTrigger, STATE_FLAGS, JOB_LEASE_DURATION_MS, mtConfig, executeWithTryLock, pruneOldRows, _trimTrailing_, getConfig */ // <-- Added getConfig
 
 // --- Constants ---
 const FUZZ_JOB_PREFIX = 'fuzzJob'; // Prefix for state properties
@@ -422,7 +422,7 @@ function dailyJobReset() {
   LOG.info("Starting 24-hour state check and job reset...");
 
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const cfg = mtConfig(); //
+  const cfg = getConfig(); // <-- CORRECTED
   const sheetName = cfg.sheets.prices;
   const sheet = ss.getSheetByName(sheetName);
 
@@ -492,7 +492,7 @@ function _heavyPruneWorker() {
   const START_TIME = Date.now();
   
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const cfg = mtConfig();
+  const cfg = getConfig(); // <-- CORRECTED
   const sourceSheetName = cfg.sheets.prices;
   const tempSheetName = PRUNE_SHEET_TEMP;
 
@@ -644,7 +644,7 @@ function _finalizePrune() {
 
   LOG.info("Starting finalization: Secondary deduplication and atomic swap.");
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const cfg = mtConfig();
+  const cfg = getConfig(); // <-- CORRECTED
   const tempSheetName = PRUNE_SHEET_TEMP;
   const finalSheetName = cfg.sheets.prices;
   const oldSheetName = FUZZ_SHEET_OLD; // Use the same "Old" sheet as the Fuzz worker
