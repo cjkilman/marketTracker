@@ -3,11 +3,11 @@
  * REWRITTEN to be a stateful, batch-processing worker
  * to avoid 6-minute timeouts on large data.
  *
- * Source sheet:  "Market Prices"
- * Target sheet:  "Market History"
+ * Source sheet:  "Market Prices"
+ * Target sheet:  "Market History"
  */
 
-/* global LockService, PropertiesService, SpreadsheetApp, LoggerEx, STATE_FLAGS, 
+/* global LockService, PropertiesService, SpreadsheetApp, LoggerEx, 
    executeWithTryLock, scheduleOneTimeTrigger, getOrCreateSheet, _trimTrailing_,
    FUZZ_TIME_LIMIT_MS, FUZZ_RESCHEDULE_MS, FUZZ_DOC_LOCK_TIMEOUT, PT, mtConfig */
 
@@ -228,14 +228,16 @@ function updateHistory() {
 
   // Check if it's already running
   const currentState = SCRIPT_PROP.getProperty(HIST_PROP_STEP);
-  if (currentState && currentState !== 'COMPLETE' && currentState !== STATE_FLAGS.NEW_RUN) {
+  // REFACTORED: Use strings directly, remove STATE_FLAGS dependency
+  if (currentState && currentState !== 'COMPLETE' && currentState !== "NEW_RUN") {
     LOG.warn(`History Manager is already running (State: ${currentState}). Skipping new start.`);
     scheduleOneTimeTrigger('_historyWorker', 5000);
     return;
   }
 
   LOG.info("Starting new History Manager cycle.");
-  SCRIPT_PROP.setProperty(HIST_PROP_STEP, STATE_FLAGS.NEW_RUN);
+  // REFACTORED: Use strings directly
+  SCRIPT_PROP.setProperty(HIST_PROP_STEP, "NEW_RUN");
 
   // Use executeWithTryLock
   const result = executeWithTryLock(_historyWorker, '_historyWorker');
@@ -260,13 +262,15 @@ function _historyWorker() {
   const sourceSheetName = cfg.sheets.prices;
   const tempSheetName = HIST_SHEET_TEMP;
 
-  let currentState = SCRIPT_PROP.getProperty(HIST_PROP_STEP) || STATE_FLAGS.NEW_RUN;
+  // REFACTORED: Use strings directly
+  let currentState = SCRIPT_PROP.getProperty(HIST_PROP_STEP) || "NEW_RUN";
   LOG.info(`Starting worker. Current State: ${currentState}`);
 
   try {
     // --- State: NEW_RUN (Start) ---
-    if (currentState === STATE_FLAGS.NEW_RUN) {
-      LOG.info(`State: ${STATE_FLAGS.NEW_RUN}. Preparing history temp sheet.`);
+    // REFACTORED: Use strings directly
+    if (currentState === "NEW_RUN") {
+      LOG.info(`State: NEW_RUN. Preparing history temp sheet.`);
       const docLock = LockService.getDocumentLock();
       if (docLock.tryLock(FUZZ_DOC_LOCK_TIMEOUT)) {
         try {
@@ -278,7 +282,8 @@ function _historyWorker() {
           SpreadsheetApp.flush();
 
           SCRIPT_PROP.setProperty(HIST_PROP_READ_ROW, '2'); // Data starts row 2
-          currentState = STATE_FLAGS.PROCESSING;
+          // REFACTORED: Use strings directly
+          currentState = "PROCESSING";
           SCRIPT_PROP.setProperty(HIST_PROP_STEP, currentState);
           LOG.info(`Temp sheet '${tempSheetName}' prepared. Transitioning to ${currentState}.`);
         } finally {
@@ -292,8 +297,9 @@ function _historyWorker() {
     } // --- End NEW_RUN ---
 
     // --- State: PROCESSING (Processing While Loop) ---
-    if (currentState === STATE_FLAGS.PROCESSING) {
-      LOG.info(`State: ${STATE_FLAGS.PROCESSING}. Reading/aggregating batches.`);
+    // REFACTORED: Use strings directly
+    if (currentState === "PROCESSING") {
+      LOG.info(`State: PROCESSING. Reading/aggregating batches.`);
       
       const sourceSheet = ss.getSheetByName(sourceSheetName);
       const tempSheet = ss.getSheetByName(tempSheetName);
@@ -369,7 +375,8 @@ function _historyWorker() {
       // --- Post-Loop Check ---
       if (readRow > lastRow) {
         LOG.info("All source rows processed. Transitioning to FINALIZING.");
-        currentState = STATE_FLAGS.FINALIZING;
+        // REFACTORED: Use strings directly
+        currentState = "FINALIZING";
         SCRIPT_PROP.setProperty(HIST_PROP_STEP, currentState);
         scheduleOneTimeTrigger('_finalizeHistory', 1000); // 1 sec delay
       }
@@ -391,7 +398,8 @@ function _finalizeHistory() {
   const LOG = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('HistoryFinalizer') : console);
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   
-  if (SCRIPT_PROP.getProperty(HIST_PROP_STEP) !== STATE_FLAGS.FINALIZING) {
+  // REFACTORED: Use strings directly
+  if (SCRIPT_PROP.getProperty(HIST_PROP_STEP) !== "FINALIZING") {
     LOG.warn(`Finalizer called in incorrect state (${SCRIPT_PROP.getProperty(HIST_PROP_STEP)}). Aborting.`);
     return;
   }
