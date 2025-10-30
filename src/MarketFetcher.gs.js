@@ -5,9 +5,12 @@
  * NOW INCLUDES:
  * - Stateful Heavy Prune worker (`_heavyPruneWorker`)
  * - Daily Job Reset (`dailyJobReset`)
+ *
+ * NOTE: This file has been modified for an APPEND-ONLY workflow.
+ * It no longer uses the atomic sheet swap method.
  */
 
-/* global LockService, PropertiesService, SpreadsheetApp, LoggerEx, fuzAPI, getMasterMarketRequests, getOrCreateSheet, scheduleOneTimeTrigger, STATE_FLAGS, JOB_LEASE_DURATION_MS, mtConfig, executeWithTryLock, pruneOldRows, _trimTrailing_, getConfig */ // <-- Added getConfig
+/* global LockService, PropertiesService, SpreadsheetApp, LoggerEx, fuzAPI, getMasterMarketRequests, getOrCreateSheet, scheduleOneTimeTrigger, STATE_FLAGS, JOB_LEASE_DURATION_MS, pruneOldRows, _trimTrailing_, getConfig */ 
 
 // --- Constants ---
 const FUZZ_JOB_PREFIX = 'fuzzJob'; // Prefix for state properties
@@ -15,9 +18,7 @@ const FUZZ_PROP_STEP = FUZZ_JOB_PREFIX + 'Step';
 const FUZZ_PROP_INDEX = FUZZ_JOB_PREFIX + 'RequestIndex';
 const FUZZ_PROP_ROW = FUZZ_JOB_PREFIX + 'WriteRow';
 const FUZZ_PROP_LEASE = FUZZ_JOB_PREFIX + 'LeaseUntil';
-const FUZZ_SHEET_TEMP = 'Market_Prices_Temp'; // Temporary sheet for writes
-const FUZZ_SHEET_FINAL = 'Market Prices';     // Final destination sheet
-const FUZZ_SHEET_OLD = 'Market_Prices_Old';   // Intermediate for swap delete
+const FUZZ_SHEET_FINAL = 'Market Prices';     // Final destination sheet (used for direct append)
 const FUZZ_SHEET_HEADERS = ["date", "market_id", "market_type", "type_id", "min_sell", "max_buy", "median_sell", "median_buy"];
 
 const FUZZ_BATCH_SIZE = 750; // How many requests to process per execution run
@@ -25,7 +26,7 @@ const FUZZ_TIME_LIMIT_MS = 280000;      // Soft limit (4m 40s) before rescheduli
 const FUZZ_RESCHEDULE_MS = 5000;        // Delay for rescheduling (5s)
 const FUZZ_DOC_LOCK_TIMEOUT = 10000;    // Wait 10s for DocumentLock on write
 
-// --- [NEW PRUNE CONSTANTS] ---
+// --- [PRUNE CONSTANTS] ---
 const PRUNE_JOB_PREFIX = 'heavyPruneJob'; // Prefix for state properties
 const PRUNE_PROP_STEP = PRUNE_JOB_PREFIX + 'Step';
 const PRUNE_PROP_READ_ROW = PRUNE_JOB_PREFIX + 'ReadRow';
@@ -48,6 +49,7 @@ function updateFuzzMarketDataSheet() {
 
 /**
  * Resets the state of the Fuzz market data job.
+ * Note: No longer deletes temp/old sheets or finalizer triggers.
  */
 function _resetFuzzMarketDataJobState(error) {
   LOG_FUZZ.warn(`RESETTING Fuzz Market Data Job State. Reason: ${error ? error.message : 'Completion/Manual'}`);
@@ -59,7 +61,6 @@ function _resetFuzzMarketDataJobState(error) {
     SCRIPT_PROP.deleteProperty(FUZZ_PROP_LEASE);
     // Delete potential triggers
     deleteTriggersByName('updateFuzzMarketDataSheet');
-    deleteTriggersByName('_finalizeFuzzDataUpdate'); // Ensure finalizer trigger is cleared
   } catch (propError) {
     LOG_FUZZ.error(`Error deleting script properties: ${propError.message}`);
   }
@@ -68,7 +69,7 @@ function _resetFuzzMarketDataJobState(error) {
 
 
 /**
- * The core stateful worker function for fetching Fuzz data.
+ * The core stateful worker function for fetching Fuzz data (APPEND-ONLY).
  */
 function _updateFuzzMarketDataWorker() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
@@ -95,34 +96,29 @@ function _updateFuzzMarketDataWorker() {
 
 
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let tempSheet = null; // Initialize
+  let finalSheet = null; // Changed from tempSheet
 
   try {
-    // --- State: NEW_RUN (Setup Phase) ---
+    // --- State: NEW_RUN (Setup Phase - Get Final Sheet and Starting Row) ---
     if (currentState === STATE_FLAGS.NEW_RUN) {
-      LOG_FUZZ.info(`State: ${STATE_FLAGS.NEW_RUN}. Preparing temporary sheet.`);
+      LOG_FUZZ.info(`State: ${STATE_FLAGS.NEW_RUN}. Preparing final sheet for append.`);
 
-      // Use Document Lock for sheet creation/clearing
+      // Use Document Lock for concurrency during setup
       const docLock = LockService.getDocumentLock();
       if (docLock.tryLock(FUZZ_DOC_LOCK_TIMEOUT)) {
         try {
-          // Delete old sheet if it exists
-          const oldSheet = ss.getSheetByName(FUZZ_SHEET_OLD);
-          if (oldSheet) ss.deleteSheet(oldSheet);
-
-          tempSheet = getOrCreateSheet(ss, FUZZ_SHEET_TEMP, FUZZ_SHEET_HEADERS);
-          if (tempSheet.getLastRow() > 1) {
-            tempSheet.getRange(2, 1, tempSheet.getLastRow() - 1, tempSheet.getMaxColumns()).clearContent();
-          }
-          tempSheet.hideSheet();
+          // Ensure the final sheet exists with correct headers
+          finalSheet = getOrCreateSheet(ss, FUZZ_SHEET_FINAL, FUZZ_SHEET_HEADERS);
           SpreadsheetApp.flush(); // Ensure sheet operations complete
 
           // Initialize state for processing
           SCRIPT_PROP.setProperty(FUZZ_PROP_INDEX, '0');
-          SCRIPT_PROP.setProperty(FUZZ_PROP_ROW, '2'); // Data starts row 2
+          // Start appending at the very next empty row
+          SCRIPT_PROP.setProperty(FUZZ_PROP_ROW, finalSheet.getLastRow() + 1); 
+          
           currentState = STATE_FLAGS.PROCESSING;
           SCRIPT_PROP.setProperty(FUZZ_PROP_STEP, currentState);
-          LOG_FUZZ.info(`Temp sheet '${FUZZ_SHEET_TEMP}' prepared. Transitioning to ${currentState}.`);
+          LOG_FUZZ.info(`Sheet '${FUZZ_SHEET_FINAL}' prepared. Next append row: ${finalSheet.getLastRow() + 1}. Transitioning to ${currentState}.`);
 
         } finally {
           docLock.releaseLock();
@@ -149,9 +145,9 @@ function _updateFuzzMarketDataWorker() {
         return;
       }
 
-      tempSheet = ss.getSheetByName(FUZZ_SHEET_TEMP); // Ensure we have the sheet object
-      if (!tempSheet) {
-        throw new Error(`Sheet '${FUZZ_SHEET_TEMP}' missing during PROCESSING phase.`);
+      finalSheet = ss.getSheetByName(FUZZ_SHEET_FINAL); // Ensure we have the sheet object
+      if (!finalSheet) {
+        throw new Error(`Sheet '${FUZZ_SHEET_FINAL}' missing during PROCESSING phase.`);
       }
 
       let batchesProcessedThisRun = 0;
@@ -194,7 +190,8 @@ function _updateFuzzMarketDataWorker() {
           typeIDs
         }) => {
           try {
-            const prices = getMarketPrices(typeIDs, market_id, market_type); // Calls fuzAPI internally
+            // Note: getMarketPrices is expected to exist globally now
+            const prices = getMarketPrices(typeIDs, market_id, market_type); 
             typeIDs.forEach(type_id => {
               const e = prices[type_id] || {};
               rowsToWrite.push([now, market_id, market_type, type_id, e.minSell ?? null, e.maxBuy ?? null, e.medianSell ?? null, e.medianBuy ?? null]);
@@ -210,11 +207,12 @@ function _updateFuzzMarketDataWorker() {
           const docLock = LockService.getDocumentLock();
           if (docLock.tryLock(FUZZ_DOC_LOCK_TIMEOUT)) {
             try {
-              const range = tempSheet.getRange(nextWriteRow, 1, rowsToWrite.length, FUZZ_SHEET_HEADERS.length);
+              // Write directly to the final sheet, starting at the calculated nextWriteRow
+              const range = finalSheet.getRange(nextWriteRow, 1, rowsToWrite.length, FUZZ_SHEET_HEADERS.length);
               range.setValues(rowsToWrite);
               nextWriteRow += rowsToWrite.length;
               batchesProcessedThisRun++;
-              LOG_FUZZ.info(`Batch write success. ${rowsToWrite.length} rows written. Next row: ${nextWriteRow}`);
+              LOG_FUZZ.info(`Batch append success. ${rowsToWrite.length} rows written. Next row: ${nextWriteRow}`);
             } catch (writeError) {
               LOG_FUZZ.error(`Error during batch write: ${writeError.message}. Rescheduling.`);
               SCRIPT_PROP.setProperty(FUZZ_PROP_INDEX, requestStartIndex.toString()); // Save current index
@@ -242,13 +240,12 @@ function _updateFuzzMarketDataWorker() {
 
       } // --- End while loop ---
 
-      // --- Post-Loop Check ---
+      // --- Post-Loop Check (Completion) ---
       if (requestStartIndex >= allMarketRequests.length) {
-        LOG_FUZZ.info("All batches processed. Transitioning to FINALIZING.");
-        currentState = STATE_FLAGS.FINALIZING;
-        SCRIPT_PROP.setProperty(FUZZ_PROP_STEP, currentState);
-        // Immediately schedule the finalizer
-        scheduleOneTimeTrigger('_finalizeFuzzDataUpdate', 1000); // 1 sec delay
+        LOG_FUZZ.info("All batches processed. Job Complete.");
+        currentState = STATE_FLAGS.COMPLETE;
+        // Reset job state immediately upon successful completion
+        _resetFuzzMarketDataJobState(null);
       }
 
     } // --- End PROCESSING ---
@@ -262,69 +259,11 @@ function _updateFuzzMarketDataWorker() {
   }
 }
 
-/**
- * Performs the atomic sheet swap using DocumentLock. Triggered after PROCESSING.
- */
-function _finalizeFuzzDataUpdate() {
-  const LOG = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('FuzzFinalizer') : console);
-  const SCRIPT_PROP = PropertiesService.getScriptProperties();
-
-  // Ensure state is correct
-  if (SCRIPT_PROP.getProperty(FUZZ_PROP_STEP) !== STATE_FLAGS.FINALIZING) {
-    LOG.warn(`Finalizer called in incorrect state (${SCRIPT_PROP.getProperty(FUZZ_PROP_STEP)}). Resetting job.`);
-    _resetFuzzMarketDataJobState(new Error("Finalizer called in incorrect state"));
-    return;
-  }
-
-  LOG.info("Starting finalization: Atomic sheet swap.");
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const docLock = LockService.getDocumentLock();
-
-  try {
-    if (docLock.tryLock(30000)) { // Wait up to 30s for the lock
-      try {
-        const tempSheet = ss.getSheetByName(FUZZ_SHEET_TEMP);
-        const finalSheet = ss.getSheetByName(FUZZ_SHEET_FINAL);
-        const oldSheet = ss.getSheetByName(FUZZ_SHEET_OLD);
-
-        if (!tempSheet || tempSheet.getLastRow() <= 1) {
-          throw new Error(`Temp sheet '${FUZZ_SHEET_TEMP}' is missing or empty! Cannot finalize.`);
-        }
-
-        // 1. Delete previous "Old" sheet (if exists)
-        if (oldSheet) ss.deleteSheet(oldSheet);
-
-        // 2. Rename current "Final" sheet to "Old" (if exists)
-        if (finalSheet) finalSheet.setName(FUZZ_SHEET_OLD);
-
-        // 3. Rename "Temp" sheet to "Final"
-        tempSheet.setName(FUZZ_SHEET_FINAL);
-        tempSheet.showSheet(); // Make it visible
-        SpreadsheetApp.flush(); // Ensure changes apply
-
-        LOG.info("Atomic sheet swap successful.");
-
-        // 4. Reset job state ONLY on successful swap
-        _resetFuzzMarketDataJobState(null); // Pass null for successful completion
-
-      } catch (swapError) {
-        LOG.error(`CRITICAL error during sheet swap: ${swapError.message}. State NOT reset. Manual intervention likely needed.`);
-        scheduleOneTimeTrigger('_finalizeFuzzDataUpdate', 60000); // Retry in 1 min
-        throw swapError; // Re-throw
-      } finally {
-        docLock.releaseLock();
-      }
-    } else {
-      LOG.warn("Document Lock busy during finalization. Rescheduling finalizer.");
-      scheduleOneTimeTrigger('_finalizeFuzzDataUpdate', FUZZ_RESCHEDULE_MS);
-    }
-  } catch (e) {
-    LOG.error(`Error in finalizer lock acquisition: ${e.message}`);
-    scheduleOneTimeTrigger('_finalizeFuzzDataUpdate', 60000); // Retry in 1 min
-  }
-}
+// NOTE: The _finalizeFuzzDataUpdate function has been removed.
 
 /* ---------------------- Light Mode hygiene ---------------------- */
+
+// ... (pruneOldRows, _deleteInBlocks_, _trimTrailing_ remain the same) ...
 
 function lightPrePrune_(sh, maxRows) {
   const f = sh.getFilter && sh.getFilter();
@@ -422,16 +361,16 @@ function dailyJobReset() {
   LOG.info("Starting 24-hour state check and job reset...");
 
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const cfg = getConfig(); // <-- CORRECTED
-  const sheetName = cfg.sheets.prices;
-  const sheet = ss.getSheetByName(sheetName);
+  const cfg = getConfig(); // Corrected config call
+  const sheetName = FUZZ_SHEET_FINAL; // Use final sheet name for prune
+  const sheet = getOrCreateSheet(ss, sheetName, FUZZ_SHEET_HEADERS);
 
   if (!sheet) {
     LOG.error(`Sheet not found: ${sheetName}. Skipping light prune.`);
   } else {
     try {
       // 1. Run the "Light Prune"
-      const retentionDays = cfg.retentionDays.prices || 1;
+      const retentionDays = cfg.PriceRetentionDays || 1; // Use PriceRetentionDays from config
       LOG.info(`Running light prune (pruneOldRows) for ${retentionDays} day(s) on ${sheetName}...`);
       pruneOldRows(sheet, retentionDays, 1); // 1 = date column
       LOG.info("Light prune complete.");
@@ -455,9 +394,6 @@ function dailyJobReset() {
 
 /**
  * REWRITTEN: This is now the "Starter" function for the stateful heavy prune.
- * It just acquires a lock, sets the state, and calls the worker.
- *
- * This is what you should schedule on your daily trigger (a few hours after dailyJobReset).
  */
 function dailyHeavyPrune_Prices() {
   const LOG = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('HeavyPrune') : console);
@@ -484,7 +420,7 @@ function dailyHeavyPrune_Prices() {
 
 /**
  * NEW: The "Processing While Loop" worker for the heavy prune.
- * This function reads, processes, and writes in batches to avoid timeouts.
+ * Note: This function remains swap-based for safety/atomicity during the deduplication process.
  */
 function _heavyPruneWorker() {
   const LOG = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('PruneWorker') : console);
@@ -492,8 +428,8 @@ function _heavyPruneWorker() {
   const START_TIME = Date.now();
   
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const cfg = getConfig(); // <-- CORRECTED
-  const sourceSheetName = cfg.sheets.prices;
+  const cfg = getConfig(); // Corrected config call
+  const sourceSheetName = FUZZ_SHEET_FINAL; // Market Prices is now the source
   const tempSheetName = PRUNE_SHEET_TEMP;
 
   let currentState = SCRIPT_PROP.getProperty(PRUNE_PROP_STEP) || STATE_FLAGS.NEW_RUN;
@@ -567,9 +503,11 @@ function _heavyPruneWorker() {
         const data = sourceSheet.getRange(readRow, 1, rowsToRead, header.length).getValues();
         
         // --- 3. Process Batch (Retention, Bucket, Dedupe) ---
-        const { bucketMinutes, retentionDays } = cfg;
-        const cutoff = new Date(Date.now() - retentionDays.prices * 86400000);
-        const msPerBucket = (bucketMinutes || 20) * 60 * 1000;
+        const retentionDays = cfg.PriceRetentionDays || 1; // Use PriceRetentionDays from config
+        const bucketMinutes = cfg.BucketMinutes || 20; // Use BucketMinutes from config
+
+        const cutoff = new Date(Date.now() - retentionDays * 86400000);
+        const msPerBucket = bucketMinutes * 60 * 1000;
         const keep = new Map(); // Keep latest record *within this batch*
 
         for (let i = 0; i < data.length; i++) {
@@ -644,10 +582,10 @@ function _finalizePrune() {
 
   LOG.info("Starting finalization: Secondary deduplication and atomic swap.");
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const cfg = getConfig(); // <-- CORRECTED
+  const cfg = getConfig(); // Corrected config call
   const tempSheetName = PRUNE_SHEET_TEMP;
-  const finalSheetName = cfg.sheets.prices;
-  const oldSheetName = FUZZ_SHEET_OLD; // Use the same "Old" sheet as the Fuzz worker
+  const finalSheetName = FUZZ_SHEET_FINAL; // Market Prices is the final sheet
+  const oldSheetName = finalSheetName + "_Prune_Old"; // Unique name for clarity
 
   const docLock = LockService.getDocumentLock();
   try {
@@ -662,8 +600,10 @@ function _finalizePrune() {
         LOG.info("Reading temp sheet for final deduplication...");
         const data = tempSheet.getRange(2, 1, tempSheet.getLastRow() - 1, tempSheet.getLastColumn()).getValues();
         
-        const { bucketMinutes, maxRows } = cfg;
-        const msPerBucket = (bucketMinutes || 20) * 60 * 1000;
+        const bucketMinutes = cfg.BucketMinutes || 20; // Use BucketMinutes from config
+        const maxRows = cfg.PricesMaxRows || 100000; // Use PricesMaxRows from config
+
+        const msPerBucket = bucketMinutes * 60 * 1000;
         const keep = new Map();
         
         const header = tempSheet.getRange(1, 1, 1, tempSheet.getLastColumn()).getValues()[0];
@@ -689,10 +629,10 @@ function _finalizePrune() {
         LOG.info(`Final deduplication complete. Kept ${deduped.length} rows.`);
 
         // --- 2. Cap Rows ---
-        if (deduped.length > maxRows.prices) {
+        if (deduped.length > maxRows) {
           deduped.sort((a,b) => a[DATE] - b[DATE]); // Sort by date ascending
-          deduped = deduped.slice(deduped.length - maxRows.prices); // Keep the newest rows
-          LOG.info(`Capped rows to ${deduped.length} (max: ${maxRows.prices}).`);
+          deduped = deduped.slice(deduped.length - maxRows); // Keep the newest rows
+          LOG.info(`Capped rows to ${deduped.length} (max: ${maxRows}).`);
         }
         
         // --- 3. Rewrite Temp Sheet ---
@@ -705,14 +645,14 @@ function _finalizePrune() {
         SpreadsheetApp.flush();
         LOG.info("Final data written to temp sheet.");
 
-        // --- 4. Atomic Swap ---
+        // --- 4. Atomic Swap (Prune Edition) ---
         const finalSheet = ss.getSheetByName(finalSheetName);
         const oldSheet = ss.getSheetByName(oldSheetName);
 
         if (oldSheet) ss.deleteSheet(oldSheet);
         if (finalSheet) finalSheet.setName(oldSheetName);
         tempSheet.setName(finalSheetName);
-        tempSheet.showSheet();
+        finalSheet.showSheet(); // Use finalSheet handle which now points to the original sheet
         SpreadsheetApp.flush();
         LOG.info("Atomic sheet swap successful.");
 
