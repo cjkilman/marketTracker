@@ -1,4 +1,3 @@
-
 /**
  * Get or create a sheet, preserving headers.
  * For new sheets, limits the column count to the header length.
@@ -118,3 +117,5 @@ var Utility = (function(){
     _inWindow_: inWindow
   };
 })();
+
+// <-- The extra brace was here
