@@ -327,7 +327,7 @@ function _historyWorker() {
         const data = sourceSheet.getRange(readRow, 1, rowsToRead, header.length).getValues();
         
         // --- 3. Process Batch (Aggregate to Daily OHLC) ---
-        // Filter for data from the last ~2 days
+        // Filter for data from the last ~2 days to catch day boundaries
         const lookbackMs = Date.now() - (2 * 86400000); // 2 days
         const recent = [];
         for (let i = 0; i < data.length; i++) {
@@ -480,7 +480,7 @@ function updateHistoryTest() { return updateHistory(); }
 
 
 /* =================== Optional maintenance helpers (UNCHANGED) =================== */
-// (All other helper functions from the original file remain here)
+// (These functions are unchanged from your original file)
 
 function _wbAllocatedCells_() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -493,12 +493,15 @@ function _cellsNeededForAppend_(sh, addRows, needCols) {
 }
 
 function _tightenTrailingRows_(sh, rowBuffer) {
+  if (!sh) return; // Add guard
   rowBuffer = rowBuffer || 2000;
   const used = Math.max(1, sh.getLastRow());
   const alloc = sh.getMaxRows();
   const keep = Math.max(used + rowBuffer, Math.min(alloc, used + rowBuffer));
   const extra = alloc - keep;
-  if (extra > 0) sh.deleteRows(keep + 1, extra);
+  if (extra > 0) {
+     try { sh.deleteRows(keep + 1, extra); } catch(e) {}
+  }
 }
 
 function _deleteRowsAscBlocks_(sh, rowsAsc) {

@@ -171,18 +171,16 @@ function masterOrchestrator() {
   }
 
   // --- 2. Check "ESI" Job (marketFetcherEsi.js) ---
-  // (Note: This is your *other* Fuzzwork fetcher, the one for regions)
-  // We check the lease property that marketFetcherEsi.js already uses
+  // THIS JOB IS PARKED / DISABLED TO FIX THE OVERLAP
   const esiLease = parseInt(SCRIPT_PROP.getProperty('esiJobLeaseUntil') || '0', 10);
   if (esiLease > NOW_MS) {
-    // Lease is active, so the job is already running. Do nothing.
-    LOG.warn(`ESI job is already active (Lease expires in ${((esiLease - NOW_MS) / 60000).toFixed(1)} min). Skipping dispatch.`);
+    LOG.warn(`ESI job (marketFetcherEsi.js) is active but is PARKED. Skipping.`);
   } else {
-    // Lease is expired. "Bump" the job by starting it.
-    LOG.info("ESI job is not active. Dispatching 'bump' (starting updateEsiHistorySheet).");
-    const newEsiLease = NOW_MS + JOB_LEASE_DURATION_MS; // Give it a new 5 min lease
-    SCRIPT_PROP.setProperty('esiJobLeaseUntil', newEsiLease.toString());
-    updateEsiHistorySheet(); // Call the job
+    // LOG.info("ESI job is not active. Dispatching 'bump' (starting updateEsiHistorySheet).");
+    // const newEsiLease = NOW_MS + JOB_LEASE_DURATION_MS; // Give it a new 5 min lease
+    // SCRIPT_PROP.setProperty('esiJobLeaseUntil', newEsiLease.toString());
+    // updateEsiHistorySheet(); // Call the job
+    LOG.info("ESI job (marketFetcherEsi.js) is PARKED. Skipping dispatch.");
   }
 
   LOG.info("Master orchestrator finished lease checks.");
