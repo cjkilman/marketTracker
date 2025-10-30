@@ -1,12 +1,12 @@
 /***** marketFetcherESI.gs  —  MAIN PROJECT FILE ********************************
  * Contains BOTH sides:
- *   1) ENGINE: pulls ESI region history via GESI → caches & publishes slim table
- *   2) CLIENT: marketStatDataCache(...)  (cache-only; reads CacheService via your
- *      _getCachedFuz and _normalizeOrder from marketStatData)
+ * 1) ENGINE: pulls ESI region history via GESI → caches & publishes slim table
+ * 2) CLIENT: marketStatDataCache(...)  (cache-only; reads CacheService via your
+ * _getCachedFuz and _normalizeOrder from marketStatData)
  *
  * SLIM IS LAW:
- *   - Engine publishes named range: MarketResultESI_Region (type_id, region_id, vol30, ts, status)
- *   - Clients import that single range; all other math stays local (Fuz books + DoB).
+ * - Engine publishes named range: MarketResultESI_Region (type_id, region_id, vol30, ts, status)
+ * - Clients import that single range; all other math stays local (Fuz books + DoB).
  *******************************************************************************/
 
 /* ============================ CONFIG: ENGINE ============================ */
@@ -259,7 +259,7 @@ function fetchHistoryBatchGESI_(regionId, typeIds) {
     // feed the breaker so the worker can stand down if needed
     cbRecord_({
       groupFailures: failCt,
-      groupTotal: ids.length,              
+      groupTotal: ids.length,
       errorLimitRemain: remain,
       errorLimitReset: reset
     });
@@ -445,7 +445,7 @@ function kickoffMarketHistoryRefresh() {
   props.setProperty('mf_job_active', '1');
   props.setProperty('mf_job_started', new Date().toISOString());
 
-  publishMarketResultESIRegion(); // clients see stale→fresh tick
+  // publishMarketResultESIRegion(); // REMOVED: Publication is now an independent scheduled task.
 
   ScriptApp.newTrigger('marketFetchChunk').timeBased().everyMinutes(WORKER_EVERY_MIN).create();
 }
@@ -459,7 +459,7 @@ function marketFetchChunk() {
   var lock = LockService.getScriptLock();
   if (!lock.tryLock(5000)) {
     LoggerEx.warn('mf.lock.busy rid=' + rid);
-    return;
+    return; // Exits gracefully if already running
   }
 
   // Stand down early if breaker is open
@@ -550,7 +550,7 @@ function marketFetchChunk() {
     // Flush once
     if (rowsOut.length) {
       upsertRegionCache_(cache, rowsOut);
-      publishMarketResultESIRegion();
+      // publishMarketResultESIRegion(); // REMOVED: Publication is now an independent scheduled task.
       LoggerEx.log('mf.flush.chunk rid=' + rid + ' rows=' + rowsOut.length);
     } else {
       LoggerEx.log('mf.flush.empty rid=' + rid);
@@ -860,131 +860,62 @@ function pruneCacheToConfig_(mode = 'tombstone') {
  * Input:  Sheet "Interface Clients" → A:Client, B:region_id_heartbeat
  * Source: Sheet "Publish_ESI_Region" (A:E = type_id,region_id,volume30_region,last_updated,status)
  * Output: Sheet "Publish_ESI_Region_<client>" with headers:
- *         [type_id, volume30_region, last_updated, status]
+ * [type_id, volume30_region, last_updated, status]
  * Named range for client: MarketResultESI_Region_<client>
  */
-function ESI_publishClientInterfaces() {
-  const ss = SpreadsheetApp.getActive();
-  const srcSh = ss.getSheetByName('Publish_ESI_Region');
-  const cliSh = ss.getSheetByName('Interface Clients');
-  if (!srcSh || !cliSh) throw new Error('Missing required sheets');
+function publishMarketResultESIRegion() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const cache = ss.getSheetByName(SHEET_REGION_CACHE);
+  const pub = ss.getSheetByName(SHEET_PUBLISH);
+  if (!cache || !pub) throw new Error('Missing sheets');
 
-  const src = srcSh.getDataRange().getValues();
-  if (src.length < 2) return;
+  const keepPairs = getConfigPairSet_();
 
-  // ---- helpers ----
-  const normStatus = (s) => String(s || '').trim().toUpperCase().replace(/_/g, '-');
-  const toInt = (v) => {
-    const n = Number(String(v).replace(/[^\d\-]/g, ''));
-    return Number.isFinite(n) ? n : NaN;
-  };
-  const toDate = (v) => {
-    if (v instanceof Date) return v;
-    const s = String(v || '').trim();
-    if (!s) return null;
-    // Try YYYY-MM-DD first
-    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
-    if (m) return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
-    // Try serial / general number
-    const n = Number(s);
-    if (Number.isFinite(n)) return new Date(Math.round((n - 25569) * 86400000)); // Excel serial fallback
-    // Last resort: Date.parse
-    const t = Date.parse(s);
-    return isNaN(t) ? null : new Date(t);
-  };
+  const vals = cache.getDataRange().getValues();
+  const out = [HEADERS_PUBLISH];
 
-  // ---- group rows by region ----
-  // Build region → deduped rows keyed by type_id (prefer latest last_updated)
-  /** @type {Map<number, Map<number, any[]>>} */
-  const byRegion = new Map();
+  if (vals.length > 1) {
+    const h = vals[0];
+    const ix = {
+      t: h.indexOf('type_id'), r: h.indexOf('region_id'),
+      v: h.indexOf('volume30_region'), u: h.indexOf('last_updated'),
+      s: h.indexOf('status')
+    };
 
-  // src schema A..E: [type_id, region_id, vol30, last_updated, status]
-  for (let r = 1; r < src.length; r++) {
-    const row = src[r];
-    const typeId = toInt(row[0]);
-    const regionId = toInt(row[1]);
-    if (!Number.isFinite(typeId) || !Number.isFinite(regionId)) continue;
+    for (let i = 1; i < vals.length; i++) {
+      const row = vals[i];
+      const t = row[ix.t], r = row[ix.r];
+      if (t === "" || r === "") continue;
+ if (!keepPairs.has(`${Math.floor(t)}:${Math.floor(r)}`)) continue;
 
-    const vol30 = Number(row[2]) || 0;
-    const last = toDate(row[3]);       // Date or null
-    const status = normStatus(row[4]);
+      let status = String(row[ix.s] || "").toUpperCase();
+      if (status === "STALE") status = "STALE-ESI";
 
-    if (!byRegion.has(regionId)) byRegion.set(regionId, new Map());
-    const bag = byRegion.get(regionId);
+      const keepNumeric = (status === "OK" || status === "STALE-ESI");
+      const vol = keepNumeric ? row[ix.v] : "";
 
-    // dedupe by type_id: keep the row with the most recent last_updated
-    const prev = bag.get(typeId);
-    if (!prev) {
-      bag.set(typeId, [typeId, vol30, last || '', status]);
-    } else {
-      const prevDate = prev[2] instanceof Date ? prev[2] : toDate(prev[2]);
-      if ((last && !prevDate) || (last && prevDate && last > prevDate)) {
-        bag.set(typeId, [typeId, vol30, last, status]);
-      }
+      out.push([t, r, vol, row[ix.u], status]);
     }
   }
 
-  // ---- read clients ----
-  const lastCliRow = cliSh.getLastRow();
-  if (lastCliRow < 2) return;
-  const cliRows = cliSh.getRange(2, 1, lastCliRow - 1, 3).getValues();
-
-  const OUT_HEADERS = ['type_id', 'volume30_region', 'last_updated', 'status'];
-
-  for (const [clientRaw, ridRaw, filtRaw] of cliRows) {
-    const client = String(clientRaw || '').trim();
-    const regionId = toInt(ridRaw);
-    if (!client || !Number.isFinite(regionId)) continue;
-
-    // Build allowed set (default OK|STALE-ESI; "ALL" skips filtering)
-    const filt = String(filtRaw || 'OK|STALE-ESI').trim();
-    const allowAll = normStatus(filt) === 'ALL';
-    const allowed = new Set(
-      allowAll
-        ? []
-        : filt.split(/[|,]/).map((x) => normStatus(x)).filter(Boolean)
-    );
-
-    // Pull region rows and apply status filter
-    const bag = byRegion.get(regionId);
-    const rows = [];
-    if (bag && bag.size) {
-      for (const [, rec] of bag) {
-        if (!rec) continue;
-        const st = normStatus(rec[3]);
-        if (allowAll || allowed.has(st)) rows.push(rec);
-      }
+  // --- ADDED DOCUMENT LOCK FOR ATOMICITY ---
+  const docLock = LockService.getDocumentLock();
+  if (docLock.tryLock(10000)) { // Wait up to 10 seconds
+    try {
+      pub.clearContents();
+      pub.getRange(1, 1, out.length, HEADERS_PUBLISH.length).setValues(out);
+ // This heartbeat must be inside the lock to be valid
+        pub.getRange('H1').setNumberFormat('yyyy-mm-dd\"T\"hh:mm:ss\"Z\"').setValue(new Date());
+      SpreadsheetApp.getActive().setNamedRange(NR_MARKET_RESULT, pub.getRange('A:E'));
+    } finally {
+      docLock.releaseLock();
     }
-
-    // Optional: sort by volume desc, then type_id
-    rows.sort((a, b) => (b[1] - a[1]) || (a[0] - b[0]));
-
-    // Coerce last_updated to Date objects for formatting
-    for (let i = 0; i < rows.length; i++) {
-      const d = rows[i][2];
-      rows[i][2] = toDate(d) || '';
-    }
-
-    const outName = 'Publish_ESI_Region_' + client;
-    const outSh = getOrCreateSheet(ss, outName, OUT_HEADERS);
-
-    // Clear old data rows, keep header
-    const last = outSh.getLastRow();
-    if (last > 1) outSh.getRange(2, 1, last - 1, OUT_HEADERS.length).clearContent();
-
-    if (rows.length) {
-      outSh.getRange(2, 1, rows.length, OUT_HEADERS.length).setValues(rows);
-      // number/date formats
-      outSh.getRange(2, 1, rows.length, 1).setNumberFormat('0');              // type_id
-      outSh.getRange(2, 2, rows.length, 1).setNumberFormat('#,##0');          // volume30_region
-      outSh.getRange(2, 3, rows.length, 1).setNumberFormat('yyyy-mm-dd');     // last_updated
-    }
-
-    // Update named range (header + data)
-    const height = Math.max(1, rows.length + 1);
-    ss.setNamedRange('MarketResultESI_Region_' + client, outSh.getRange(1, 1, height, OUT_HEADERS.length));
+  } else {
+    // If lock fails, throw an error to be caught by the worker's ScriptLock
+    throw new Error("ESI Publish [publishMarketResultESIRegion] skipped: Document Lock busy.");
   }
 }
+
 
 /**
  * Install/replace a time trigger to republish client interfaces.
@@ -1122,8 +1053,8 @@ function ESI_breakerStatus() {
   var now = Date.now();
   var until = +(p.getProperty(CB_PROP_UNTIL) || 0);
   var msLeft = Math.max(0, until - now);
-  var fails  = +(p.getProperty(CB_PROP_FAILS) || 0);
-  var calls  = +(p.getProperty('esi_call_ct') || 0);
+  var fails = +(p.getProperty(CB_PROP_FAILS) || 0);
+  var calls = +(p.getProperty('esi_call_ct') || 0);
   var failRate = calls ? (fails / calls) : 0;
 
   var info = {
@@ -1137,4 +1068,3 @@ function ESI_breakerStatus() {
   (LoggerEx?.log || console.log)('esi.breaker.status', info);
   return info;
 }
-
