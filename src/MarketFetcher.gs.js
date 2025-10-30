@@ -1,387 +1,151 @@
-/** MarketFetcher.gs — Prices runner with Light/Heavy Prune + Lock
- * ASSUMES: Data is sourced from existing sheets ('Item List Back End' & 'Market Settings').
- * DEPENDENCIES:
- * - getOrCreateSheet (global)
- * - fuzAPI.requestItems() (in Fuz API.js)
- * - LoggerEx
- */
-
-/* ---------------------- Config helpers ---------------------- */
-
-function mtConfig() {
-  const c = (typeof getConfig === 'function') ? (getConfig() || {}) : {};
-  const num = (v, d) => (v == null || isNaN(Number(v))) ? d : Number(v);
-  const str = (v, d) => (v == null || v === '') ? d : String(v);
-  return {
-    sheets: {
-      prices:  str(c["MarketPricesSheet"], "Market Prices"),
-      history: str(c["HistorySheetName"],  "Market History"),
-    },
-    retentionDays: {
-      prices:  num(c["PriceRetentionDays"],   1),
-      history: num(c["HistoryRetentionDays"], 365),
-    },
-    maxRows: {
-      prices:  num(c["PricesMaxRows"],  100000),
-      history: num(c["HistoryMaxRows"], 200000),
-    },
-    chunkSize:     num(c["ChunkSize"],     75),
-    maxLogIDs:     num(c["MaxLogIDs"],    750),
-    bucketMinutes: num(c["BucketMinutes"], 20),
-    // optional:
-    daysForCandlestick: num(c["DaysForCandlestick"], 30),
-    openTime:           str(c["OpenTime"],  "11:00"),
-    closeTime:          str(c["CloseTime"], "18:00"),
-    rebuildAlways:      String(c["RebuildAlways"] || "FALSE").toUpperCase() === "TRUE",
-  };
-}
-function getBucketMinutes() { return mtConfig().bucketMinutes; }
-
-/* ---------------------- List Retrieval (Original Functions) ---------------------- */
-
-function sanitizeIDs(ids) {
-  return [...new Set(ids.map(v => Number(v)).filter(v => !isNaN(v) && v > 0))];
-}
+// Add this function (or ensure it exists) in MarketFetcher.gs.js or Orchestrator.gs.js
 
 /**
- * Reads Market Settings and returns an array of unique location objects.
+ * Wrapper function for the cache warmer.
+ * Attempts to run the cache warmer using executeWithTryLock.
+ * If skipped due to lock, it schedules a one-time retry trigger for itself.
+ * If completed fully, logs completion.
  */
-function getMarketSettings() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName("Market Settings");
-  if (!sheet) throw new Error("Market Settings sheet not found.");
-  const types = ["station", "system", "region"];
-  const combos = [];
-  types.forEach((type, i) => {
-    const col = 4 + i; // D,E,F
-    const raw = sheet.getRange(3, col, Math.max(0, sheet.getLastRow() - 2), 1).getValues().flat();
-    sanitizeIDs(raw).forEach(id => combos.push({ market_id: id, market_type: type }));
-  });
-  return combos;
-}
+function triggerCacheWarmerWithRetry() {
+  const SCRIPT_PROP = PropertiesService.getScriptProperties();
+  const LOG = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('CacheWarmer') : console);
 
-/**
- * Reads Item IDs and returns a sanitized array of unique type_ids.
- */
-function getTypeIDsFromItemList(limit) {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName("Item List Back End");
-  if (!sheet) throw new Error("Item List Back End sheet not found.");
-  let ids = sheet.getRange("A2:A" + sheet.getLastRow()).getValues().flat();
-  ids = sanitizeIDs(ids);
-  if (limit && ids.length > limit) ids = ids.slice(0, limit);
-  return ids;
-}
+  // --- Check if Price Snapshot Job is Finalizing (if applicable) ---
+  // If your Fuzz job had a finalizing step, check it here. Since we removed it, this might not be needed.
+  // const fuzzStep = SCRIPT_PROP.getProperty('fuzzJobStep');
+  // if (fuzzStep === STATE_FLAGS.FINALIZING) { // Assuming STATE_FLAGS is global or accessible
+  //   LOG.warn("Cache Warmer: Skipping execution, Fuzz Price job is finalizing.");
+  //   return;
+  // }
 
+  const funcToRun = fuzzworkCacheRefresh_TimeGated; // Assumes this function exists
+  const funcName = 'fuzzworkCacheRefresh_TimeGated';
+  const wrapperFuncName = 'triggerCacheWarmerWithRetry';
 
-/* ---------------------- Simplified Master List Function ---------------------- */
+  const retryDelayMs = 2 * 60 * 1000; // 2 minutes retry delay
 
-/**
- * NEW: Combines the output of Item List and Market Settings into a single
- * master list of requests (Masterlist pattern).
- */
-function getMasterMarketRequests() {
-    const typeIDs = getTypeIDsFromItemList();
-    const marketCombos = getMarketSettings();
+  LOG.info(`Wrapper ${wrapperFuncName} called. Attempting to run ${funcName}...`);
 
-    const masterRequests = [];
+  // Assumes executeWithTryLock is globally available (from Orchestrator.gs.js)
+  const result = executeWithTryLock(funcToRun, funcName); // result is true (full run), false (incomplete), or null (skipped)
 
-    // Perform the cross-product join
-    typeIDs.forEach(type_id => {
-        marketCombos.forEach(({ market_id, market_type }) => {
-            masterRequests.push({ 
-                type_id, 
-                market_id, 
-                market_type 
-            });
-        });
-    });
+  if (result === null) {
+    // --- Case 1: Skipped due to Script Lock ---
+    LOG.warn(`${funcName} was skipped due to Script Lock. Scheduling retry for ${wrapperFuncName}.`);
+    scheduleOneTimeTrigger(wrapperFuncName, retryDelayMs); // Assumes scheduleOneTimeTrigger is global
 
-    return masterRequests;
-}
+  } else if (result === true) {
+    // --- Case 2: Ran AND Completed Fully ---
+    LOG.info(`${funcName} completed a full run successfully.`);
+    // Cache warmer is done, no need to trigger price snapshot here, orchestrator handles timing.
+    // Clear the lease for the cache warmer
+    SCRIPT_PROP.deleteProperty('cacheWarmerLeaseUntil');
 
-/* ---------------------- Price Fetching Core ---------------------- */
+  } else if (result === false) {
+    // --- Case 3: Ran but did NOT complete fully (hit time limit) ---
+    LOG.info(`${funcName} ran but hit its time limit and rescheduled itself.`);
+    // Lease remains, inner function handles rescheduling.
 
-/**
- * Coerces v into a positive finite number, else null.
- */
-const toPosNumberOrNull = (v) => {
-  if (v == null) return null;
-  const n = typeof v === 'number' ? v : Number(String(v).replace(/[,\s]/g, ''));
-  return Number.isFinite(n) && n > 0 ? n : null;
-};
-
-/** Map Fuz result into math-friendly numbers (null for non-numeric/≤0). */
-function getMarketPrices(typeIds, marketId, marketType) {
-  let dataMap = {};
-  try {
-    // fuzAPI.requestItems handles the batch fetching for all typeIds in this location
-    const resultsArray = fuzAPI.requestItems(marketId, marketType, typeIds) || [];
-    
-    // Convert array to a map { type_id: {buy:..., sell:...} } for easier access by ID
-    resultsArray.forEach(item => {
-        dataMap[item.type_id] = item;
-    });
-  } catch (e) {
-    // If the call blows up, return all-null rows for requested ids.
-    return Object.fromEntries(
-      [...new Set(typeIds)].map(id => [id, {
-        minSell: null, maxBuy: null, medianSell: null, medianBuy: null
-      }])
-    );
+  } else {
+    // --- Case 4: Unexpected return value ---
+    LOG.warn(`${funcName} returned unexpected value: ${result}`);
+    // Clear lease on unexpected outcome
+     SCRIPT_PROP.deleteProperty('cacheWarmerLeaseUntil');
   }
-
-  const out = {};
-  for (const id of typeIds) {
-    const e = dataMap?.[id] ?? {};
-    const sell = e?.sell ?? {};
-    const buy  = e?.buy  ?? {};
-    out[id] = {
-      minSell:    toPosNumberOrNull(sell.min),
-      maxBuy:     toPosNumberOrNull(buy.max),
-      medianSell: toPosNumberOrNull(sell.median),
-      medianBuy:  toPosNumberOrNull(buy.median),
-    };
-  }
-  return out;
 }
 
+/**
+ * Cache refresh function (placeholder - ensure your actual implementation exists).
+ * Processes the Fuzzworks cache queue in batches within time limits.
+ */
+function fuzzworkCacheRefresh_TimeGated() {
+    const LOG = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('CacheWarmerCore') : console);
+    const SCRIPT_PROP = PropertiesService.getScriptProperties();
+    const START_TIME = Date.now();
+    const TIME_LIMIT_MS = 270000; // 4m 30s
+    const PROP_KEY_RESUME = 'cacheRefresh_lastIndex';
+    const PROP_KEY_COOLDOWN = 'cacheRefresh_lastFullCompletion'; // Tracks last full run
+    const SUB_BATCH_SIZE = 2500; // How many items to process per execution
+    const COOLDOWN_MINUTES = 10; // Minimum time between full runs
 
-/* ---------------------- Entry: record prices (baseline) ---------------------- */
+    LOG.info("Starting Fuzzworks cache refresh cycle (Time Gated)...");
+    let completedFullRun = false;
 
-function getCurrentMarketPrices() {
-  const cfg = mtConfig();
-  const SHEET_NAME = cfg.sheets.prices;
-  const RETENTION  = cfg.retentionDays.prices;
-  const MAX_ROWS   = cfg.maxRows.prices;
-
-  const lock = LockService.getScriptLock();
-  if (!lock.tryLock(2000)) { LoggerEx && LoggerEx.warn("Prices: skip — lock busy"); return; }
-
-  try {
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    const headers = ["date","market_id","market_type","type_id","min_sell","max_buy","median_sell","median_buy"];
-    // Assumes getOrCreateSheet exists
-    const sheet = getOrCreateSheet(ss, SHEET_NAME, headers);
-
-    // Light pre-prune (fast)
-    lightPrePrune_(sheet, MAX_ROWS);
-
-    // --- STEP 1: Get Master List (Cross-Product) ---
-    const allMarketRequests = getMasterMarketRequests();
-
-    if (!allMarketRequests.length) {
-      LoggerEx && LoggerEx.warn("Prices: Master Market Requests list is empty; aborting run.");
-      return;
-    }
-
-    // --- STEP 2: Group requests by location for Fuzzwork batch efficiency ---
-    const groupedRequests = {}; // { 'marketId_marketType': {market_id, market_type, typeIDs: []} }
-
-    allMarketRequests.forEach(req => {
-        const key = `${req.market_id}_${req.market_type}`;
-        if (!groupedRequests[key]) {
-            groupedRequests[key] = { 
-                market_id: req.market_id, 
-                market_type: req.market_type, 
-                typeIDs: [] 
-            };
+    try {
+        // --- Cooldown Check ---
+        const lastCompletionTime = parseInt(SCRIPT_PROP.getProperty(PROP_KEY_COOLDOWN) || '0', 10);
+        const cooldownMs = COOLDOWN_MINUTES * 60 * 1000;
+        if (START_TIME < lastCompletionTime + cooldownMs) {
+            LOG.info(`Cache refresh cooldown active (last run finished ${((START_TIME - lastCompletionTime)/60000).toFixed(1)} min ago). Skipping.`);
+            // IMPORTANT: Clear the lease if skipping due to cooldown, otherwise orchestrator thinks it's running
+            SCRIPT_PROP.deleteProperty('cacheWarmerLeaseUntil');
+            return true; // Return true as if completed, to prevent retry loops
         }
-        groupedRequests[key].typeIDs.push(req.type_id);
-    });
 
-    const now = new Date(); // timestamp stored in local tz
-    const rows = [];
-    
-    // --- STEP 3: Process each unique market location (one efficient API call per location) ---
-    Object.values(groupedRequests).forEach(({ market_id, market_type, typeIDs }) => {
-      // Fetch prices for all items in this location
-      const prices = getMarketPrices(typeIDs, market_id, market_type);
-      
-      // Write results to rows
-      typeIDs.forEach(type_id => {
-        const e = prices[type_id] || {};
-        rows.push([now, market_id, market_type, type_id, e.minSell ?? null, e.maxBuy ?? null, e.medianSell ?? null, e.medianBuy ?? null]);
-      });
-    });
+        // --- Get Requests ---
+        // !! IMPORTANT: Ensure 'getMasterBatchFromControlTable' is defined globally or imported !!
+        if (typeof getMasterBatchFromControlTable !== 'function') {
+            throw new Error("Dependency 'getMasterBatchFromControlTable' is missing.");
+        }
+        const allRequests = getMasterBatchFromControlTable();
+        if (!allRequests || allRequests.length === 0) {
+            LOG.info("Cache Refresh: Control Table empty. Resetting state.");
+            SCRIPT_PROP.deleteProperty(PROP_KEY_RESUME);
+            SCRIPT_PROP.deleteProperty(PROP_KEY_COOLDOWN); // Clear cooldown too
+             SCRIPT_PROP.deleteProperty('cacheWarmerLeaseUntil'); // Clear lease
+            return true;
+        }
 
-    if (rows.length) {
-      const start = sheet.getLastRow() + 1;
-      sheet.getRange(start, 1, rows.length, headers.length).setValues(rows);
-      LoggerEx && LoggerEx.log("Prices: wrote", rows.length, "rows @", start);
-    } else {
-      LoggerEx && LoggerEx.warn("Prices: no rows produced this run.");
+        // --- Determine Starting Point ---
+        const resumeIndexRaw = SCRIPT_PROP.getProperty(PROP_KEY_RESUME);
+        let startIndex = resumeIndexRaw ? parseInt(resumeIndexRaw, 10) : 0;
+        if (isNaN(startIndex) || startIndex < 0 || startIndex >= allRequests.length) startIndex = 0;
+        if (startIndex === 0) LOG.info(`Cache refresh starting/restarting from index 0.`);
+        else LOG.info(`Cache refresh resuming from index ${startIndex}.`);
+
+        let itemsProcessedThisRun = 0;
+
+        // --- Processing Loop ---
+        while (startIndex < allRequests.length) {
+            // Time Limit Check
+            if (Date.now() - START_TIME > TIME_LIMIT_MS) {
+                SCRIPT_PROP.setProperty(PROP_KEY_RESUME, startIndex.toString());
+                LOG.warn(`⚠️ Cache refresh time limit hit after ${itemsProcessedThisRun} items. Next run starts at index ${startIndex}. RESCHEDULING SELF.`);
+                scheduleOneTimeTrigger('triggerCacheWarmerWithRetry', 30 * 1000); // Reschedule the *wrapper*
+                return false; // Did not complete fully
+            }
+
+            // Process sub-batch
+            const endIndex = Math.min(startIndex + SUB_BATCH_SIZE, allRequests.length);
+            const currentSubBatch = allRequests.slice(startIndex, endIndex);
+            if (currentSubBatch.length > 0) {
+                 LOG.info(`Processing cache refresh batch: Indices ${startIndex} to ${endIndex - 1}`);
+                try {
+                    // Call the core fuzAPI function that handles cache checks and fetches
+                    fuzAPI.getDataForRequests(currentSubBatch); // Assumes fuzAPI is global
+                    itemsProcessedThisRun += currentSubBatch.length;
+                } catch (apiError) {
+                     LOG.error(`Error refreshing cache batch indices ${startIndex}-${endIndex - 1}: ${apiError.message}. Skipping batch.`);
+                     // Optionally add retry logic for the specific batch here
+                }
+            }
+            startIndex = endIndex;
+        } // End while
+
+        // --- Full Completion ---
+        SCRIPT_PROP.deleteProperty(PROP_KEY_RESUME);
+        SCRIPT_PROP.setProperty(PROP_KEY_COOLDOWN, START_TIME.toString()); // Use START_TIME as completion time
+        LOG.info(`Cache refresh: Successfully processed all ${allRequests.length} items. Cooldown set. Index reset.`);
+        completedFullRun = true;
+
+    } catch (e) {
+        LOG.error(`Unhandled error during cache refresh: ${e.message}\nStack: ${e.stack}`);
+        completedFullRun = false;
+        // Consider whether to reset PROP_KEY_RESUME on error or let it retry
+    } finally {
+        const duration = (Date.now() - START_TIME) / 1000;
+        LOG.info(`Cache refresh execution block finished in ${duration.toFixed(2)}s. Full run completed: ${completedFullRun}`);
+        // Lease is cleared by the wrapper (triggerCacheWarmerWithRetry) upon completion.
     }
-
-    // Tighten & simple retention (fast)
-    postTighten_(sheet);
-    if (RETENTION) pruneOldRows(sheet, RETENTION, /*dateCol=*/1);
-  } catch (e) {
-    LoggerEx && LoggerEx.error("getCurrentMarketPrices failed:", e);
-    throw e;
-  } finally {
-    lock.releaseLock();
-  }
-}
-
-/* ---------------------- Light Mode hygiene ---------------------- */
-
-function lightPrePrune_(sh, maxRows) {
-  const f = sh.getFilter && sh.getFilter(); if (f) f.remove();
-  _trimTrailing_(sh);
-  const last = sh.getLastRow();
-  if (maxRows && last > maxRows) {
-    const over = last - maxRows;
-    _deleteInBlocks_(sh, 2, over);
-    LoggerEx && LoggerEx.log('Prices: light prune removed oldest rows:', over);
-  }
-}
-function postTighten_(sh) { _trimTrailing_(sh); }
-function _trimTrailing_(sh) {
-  const used = sh.getLastRow();
-  const alloc = sh.getMaxRows();
-  const extra = alloc - used;
-  if (extra > 0) _deleteInBlocks_(sh, used + 1, extra);
-}
-// Deletes rows in blocks but never removes the last non-frozen row.
-function _deleteInBlocks_(sh, startRow, count) {
-  const BLOCK = 20000;
-
-  if (count <= 0) return;
-
-  const frozen = sh.getFrozenRows();
-  const bodyStart = frozen + 1;                  // first non-frozen row
-  const maxRows   = sh.getMaxRows();
-  const bodyRows  = Math.max(0, maxRows - frozen);
-
-  // normalize startRow to body
-  if (startRow < bodyStart) startRow = bodyStart;
-
-  // how many rows exist before our start within the body?
-  const keptTop = Math.max(0, startRow - bodyStart);
-
-  // We must leave at least 1 non-frozen row:
-  let safeCount = Math.min(count, Math.max(0, bodyRows - 1 - keptTop));
-  if (safeCount <= 0) {
-    if (startRow === bodyStart && count >= bodyRows) {
-      sh.getRange(bodyStart, 1, 1, sh.getMaxColumns()).clearContent();
-    }
-    return;
-  }
-  let row = startRow;
-  while (safeCount > 0) {
-    const n = Math.min(BLOCK, safeCount);
-    sh.deleteRows(row, n);
-    safeCount -= n;
-  }
-  if (startRow === bodyStart && count >= bodyRows) {
-    sh.getRange(bodyStart, 1, 1, sh.getMaxColumns()).clearContent();
-  }
-}
-
-
-/** Batch/contiguous prune for "older than N days" assuming chronological appends. */
-function pruneOldRows(sheet, retentionDays, dateCol /* 1-based */) {
-  if (!retentionDays) return;
-  const lastRow = sheet.getLastRow();
-  if (lastRow < 2) return;
-
-  const cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() - retentionDays);
-
-  const dates = sheet.getRange(2, dateCol, lastRow - 1, 1).getValues().flat();
-
-  let boundary = -1;
-  for (let i = 0; i < dates.length; i++) {
-    const d = dates[i];
-    if (!(d instanceof Date)) continue;
-    if (d < cutoff) boundary = i; else break;
-  }
-
-  if (boundary >= 0) {
-    const rowsToDelete = boundary + 1;
-    _deleteInBlocks_(sheet, /*startRow=*/2, /*count=*/rowsToDelete);
-    LoggerEx && LoggerEx.log('Prices: pruned old rows (<= cutoff):', rowsToDelete);
-  }
-}
-
-/* ---------------------- Heavy Prune (daily) ---------------------- */
-
-function dailyHeavyPrune_Prices() {
-  const CFG = mtConfig();
-  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.sheets.prices);
-  if (!sh) { LoggerEx && LoggerEx.warn('HeavyPrune: sheet not found'); return; }
-
-  const lock = LockService.getScriptLock();
-  if (!lock.tryLock(2000)) { LoggerEx && LoggerEx.warn('HeavyPrune skip: lock busy'); return; }
-  try {
-    const f = sh.getFilter && sh.getFilter(); if (f) f.remove();
-    heavyPruneSheet_(sh, CFG.retentionDays.prices, CFG.maxRows.prices, CFG.bucketMinutes);
-  } finally {
-    lock.releaseLock();
-  }
-}
-
-function dailyHeavyPrune_History() {
-  const CFG = mtConfig();
-  const sh = SpreadsheetApp.getActive().getSheetByName(CFG.sheets.history);
-  if (!sh) return;
-  heavyPruneSheet_(sh, CFG.retentionDays.history, CFG.maxRows.history, CFG.bucketMinutes);
-}
-
-/** Heavy prune: retention → dedupe (20m buckets) → cap → rewrite once → tighten */
-function heavyPruneSheet_(sh, retentionDays, maxRows, bucketMinutes) {
-  const lastRow = sh.getLastRow(), lastCol = sh.getLastColumn();
-  if (lastRow < 2) return;
-
-  const header = sh.getRange(1,1,1,lastCol).getValues()[0];
-  const lower  = header.map(h => String(h).trim().toLowerCase());
-  const find = (name) => lower.findIndex(h => h === name);
-
-  const DATE = find('date');
-  const TYPE = find('type_id');
-  const MID  = find('market_id');
-  const MTP  = find('market_type');
-  if (DATE < 0 || TYPE < 0 || MID < 0 || MTP < 0) {
-    LoggerEx && LoggerEx.warn('HeavyPrune: missing required columns (date/type_id/market_id/market_type)');
-    return;
-  }
-
-  const data = sh.getRange(2,1,lastRow-1,lastCol).getValues();
-
-  const cutoff = new Date(Date.now() - retentionDays * 86400000);
-  const windowed = [];
-  for (let i=0;i<data.length;i++) {
-    const r = data[i];
-    const d = r[DATE];
-    if (d instanceof Date && d >= cutoff) windowed.push(r);
-  }
-
-  const msPerBucket = (bucketMinutes || 20) * 60 * 1000;
-  const keep = new Map();
-  for (let i=0;i<windowed.length;i++) {
-    const r = windowed[i];
-    const d = r[DATE];
-    if (!(d instanceof Date)) continue;
-    const bucket = Math.floor(d.getTime() / msPerBucket);
-    const key = bucket + '|' + r[TYPE] + '|' + r[MID] + '|' + r[MTP];
-
-    const prev = keep.get(key);
-    if (!prev || (r[DATE] > prev[DATE])) keep.set(key, r);
-  }
-  let deduped = Array.from(keep.values());
-
-  if (deduped.length > maxRows) {
-    deduped.sort((a,b) => a[DATE] - b[DATE]);
-    deduped = deduped.slice(deduped.length - maxRows);
-  }
-
-  sh.clearContents();
-  sh.getRange(1,1,1,lastCol).setValues([header]);
-  if (deduped.length) sh.getRange(2,1,deduped.length,lastCol).setValues(deduped);
-
-  const used = sh.getLastRow(), alloc = sh.getMaxRows();
-  if (alloc > used) sh.deleteRows(used + 1, alloc - used);
-
-  LoggerEx && LoggerEx.log('HeavyPrune kept:', deduped.length, 'rows | window(days):', retentionDays, '| bucket(min):', bucketMinutes);
+    return completedFullRun;
 }
