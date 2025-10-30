@@ -145,7 +145,7 @@ function executeWithWaitLock(func, funcName) {
 
 
 /**
- * REVISED: Master orchestrator triggered periodically (e.G., every 15 minutes).
+ * REVISED: Master orchestrator (the "pipper") triggered every 15 minutes.
  * This function now implements the "bump" logic by checking job leases.
  * It will "bump" (start) any job whose lease has expired.
  */
@@ -171,6 +171,7 @@ function masterOrchestrator() {
   }
 
   // --- 2. Check "ESI" Job (marketFetcherEsi.js) ---
+  // (Note: This is your *other* Fuzzwork fetcher, the one for regions)
   // We check the lease property that marketFetcherEsi.js already uses
   const esiLease = parseInt(SCRIPT_PROP.getProperty('esiJobLeaseUntil') || '0', 10);
   if (esiLease > NOW_MS) {

@@ -9,7 +9,7 @@
 
 /* global LockService, PropertiesService, SpreadsheetApp, LoggerEx, STATE_FLAGS, 
    executeWithTryLock, scheduleOneTimeTrigger, getOrCreateSheet, _trimTrailing_,
-   FUZZ_TIME_LIMIT_MS, FUZZ_RESCHEDULE_MS, FUZZ_DOC_LOCK_TIMEOUT, PT */
+   FUZZ_TIME_LIMIT_MS, FUZZ_RESCHEDULE_MS, FUZZ_DOC_LOCK_TIMEOUT, PT, mtConfig */
 
 // --- [NEW HISTORY CONSTANTS] ---
 const HIST_JOB_PREFIX = 'historyJob'; // Prefix for state properties
@@ -478,11 +478,235 @@ function _finalizeHistory() {
 function updateMarketHistory(opts) { return updateHistory(); }
 function updateHistoryTest() { return updateHistory(); }
 
-/* =================== Other Helpers (Unchanged) =================== */
+
+/* =================== Optional maintenance helpers (UNCHANGED) =================== */
 // (All other helper functions from the original file remain here)
-// _hmCfg(), _tzNowNY_(), _minutesSinceMidnightNY_(), _parseHHMMtoMinutes_()
-// _wbAllocatedCells_(), _cellsNeededForAppend_(), _tightenTrailingRows_(), 
-// _deleteRowsAscBlocks_(), ensureAppendCapacity_History_(), _ensureSheet_()
-// formatHistoryBlock_(), _buildIndex_(), _writeContiguousHM_()
-// HM_stopTriggers(), HM_oneShot(), HM_diagDupes(), HM_dedupeKeepLast(),
-// diag_HistoryTodayDupes(), _canonMarketType(), _canonKey()
+
+function _wbAllocatedCells_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  return ss.getSheets().reduce((sum, sh) => sum + sh.getMaxRows() * sh.getMaxColumns(), 0);
+}
+
+function _cellsNeededForAppend_(sh, addRows, needCols) {
+  const cols = Math.max(needCols, sh.getMaxColumns());
+  return addRows * cols;
+}
+
+function _tightenTrailingRows_(sh, rowBuffer) {
+  rowBuffer = rowBuffer || 2000;
+  const used = Math.max(1, sh.getLastRow());
+  const alloc = sh.getMaxRows();
+  const keep = Math.max(used + rowBuffer, Math.min(alloc, used + rowBuffer));
+  const extra = alloc - keep;
+  if (extra > 0) sh.deleteRows(keep + 1, extra);
+}
+
+function _deleteRowsAscBlocks_(sh, rowsAsc) {
+  if (!rowsAsc || !rowsAsc.length) return;
+  for (let i = rowsAsc.length - 1; i >= 0; i--) {
+    sh.deleteRow(rowsAsc[i]);
+  }
+}
+
+function ensureAppendCapacity_History_(sh, addRows, needCols, retentionDays, dateColIdx1) {
+  if (addRows <= 0) return;
+  if (retentionDays > 0) {
+    const used = sh.getLastRow();
+    if (used > 1) {
+      const iDate0 = (dateColIdx1 || 4) - 1;
+      const lastCol = sh.getLastColumn();
+      const data = sh.getRange(2, 1, used - 1, lastCol).getValues();
+      const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000);
+      const del = [];
+      for (let i = 0; i < data.length; i++) {
+        const d = data[i][iDate0];
+        if (d instanceof Date && d < cutoff) del.push(i + 2);
+      }
+      if (del.length) _deleteRowsAscBlocks_(sh, del);
+    }
+  }
+  _tightenTrailingRows_(sh, 2000);
+  const CAP = (typeof WORKBOOK_CAP === 'number') ? WORKBOOK_CAP : 10000000;
+  const SAFETY = (typeof WORKBOOK_SAFETY === 'number') ? WORKBOOK_SAFETY : 200000;
+  const want = _cellsNeededForAppend_(sh, addRows, needCols);
+  const have = Math.max(0, CAP - SAFETY - _wbAllocatedCells_());
+  if (want <= have) return;
+  const cols = Math.max(needCols, sh.getMaxColumns());
+  const maxExtraRows = Math.floor(have / Math.max(1, cols));
+  const msg = [
+    '[History] Workbook cap guard: insufficient capacity.',
+    'Need ~' + want.toLocaleString() + ' cells, free ~' + have.toLocaleString() + '.',
+    'At current width (' + cols + ' cols), max additional rows: ~' + maxExtraRows.toLocaleString() + '.',
+    'Shorten history retention, trim other sheets, or run heavy prunes separately.'
+  ].join(' ');
+  (LoggerEx?.error || console.error)(msg);
+  throw new Error(msg);
+}
+
+function _ensureSheet_(ss, name, headers) {
+  if (typeof getOrCreateSheet === 'function') {
+    return getOrCreateSheet(ss, name, headers);
+  }
+  let sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+  if (headers && headers.length) {
+    const hdr = sh.getRange(1, 1, 1, headers.length).getValues()[0];
+    const needs = !hdr[0] || headers.some((h, i) => hdr[i] !== h);
+    if (needs) {
+      sh.clear();
+      sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+      sh.setFrozenRows(1);
+    }
+  }
+  return sh;
+}
+
+function formatHistoryBlock_(sh, startRow, nRows, idx1) {
+  if (!nRows) return;
+  const nfInt = '#,##0';
+  const nfDate = 'yyyy-mm-dd';
+  sh.getRange(startRow, idx1.date, nRows, 1).setNumberFormat(nfDate);
+  const numericCols = [
+    idx1.buy_open, idx1.buy_close, idx1.sell_open, idx1.sell_close,
+    idx1.buy_high, idx1.buy_low, idx1.sell_high, idx1.sell_low,
+    idx1.median_buy, idx1.median_sell
+  ];
+  numericCols.forEach(c => sh.getRange(startRow, c, nRows, 1).setNumberFormat(nfInt));
+}
+
+function _buildIndex_(vals) {
+  if (!vals || vals.length === 0) return { idx: new Map(), cols: 0 };
+  const H = vals[0]; const cols = H.length;
+  const iType = H.indexOf('type_id');
+  const iMid = H.indexOf('market_id');
+  const iMtp = H.indexOf('market_type');
+  const iDate = H.indexOf('date');
+  const toNYMidnight = (v) => {
+    if (v instanceof Date) return _toProjectDay_(v);
+    const s = String(v || '').trim();
+    if (!s) return null;
+    const n = Number(s);
+    if (Number.isFinite(n)) {
+      const d = new Date(Math.round((n - 25569) * 86400000));
+      return _toProjectDay_((d instanceof Date ? d : new Date(d)));
+    }
+    const t = Date.parse(s);
+    if (isNaN(t)) return null;
+    return _toProjectDay_(new Date(t));
+  };
+  const idx = new Map();
+  for (let r = 1; r < vals.length; r++) {
+    const row = vals[r];
+    const t = Number(row[iType]);
+    const m = Number(row[iMid]);
+    const mt = String(row[iMtp] || '').trim();
+    const d = toNYMidnight(row[iDate]);
+    if (!Number.isFinite(t) || !Number.isFinite(m) || !mt || !d) continue;
+    idx.set(`${t}|${m}|${mt}|${+d}`, r + 1);
+  }
+  return { idx, cols };
+}
+
+function _writeContiguousHM_(sh, updates, totalCols) {
+  if (!updates.length) return;
+  updates.sort((a, b) => a.rn - b.rn);
+  for (let i = 0; i < updates.length;) {
+    const start = updates[i].rn;
+    const block = [updates[i].row];
+    let j = i + 1;
+    while (j < updates.length && updates[j].rn === updates[j - 1].rn + 1) {
+      block.push(updates[j].row);
+      j++;
+    }
+    sh.getRange(start, 1, block.length, totalCols).setValues(block);
+    i = j;
+  }
+}
+
+function HM_stopTriggers() {
+  ScriptApp.getProjectTriggers()
+    .filter(t => ['HM_update', 'updateHistory', 'updateHistoryTest', '_historyWorker', '_finalizeHistory'].includes(t.getHandlerFunction()))
+    .forEach(t => ScriptApp.deleteTrigger(t));
+}
+
+function HM_oneShot() { updateHistory(); } // Just call the new starter
+
+function HM_diagDupes(limit) {
+  limit = Number(limit || 10);
+  const sh = SpreadsheetApp.getActive().getSheetByName('Market History');
+  if (!sh) { console.log('no Market History'); return; }
+  const vals = sh.getDataRange().getValues();
+  if (vals.length < 2) { console.log('empty'); return; }
+  const H = vals[0]; const iT=H.indexOf('type_id'), iM=H.indexOf('market_id'), iMt=H.indexOf('market_type'), iD=H.indexOf('date');
+  const toNY = (v)=> {
+    if (v instanceof Date) return _toProjectDay_(v);
+    const s=String(v||'').trim(); if(!s) return null;
+    const n=Number(s); if (Number.isFinite(n)) return _toProjectDay_(new Date(Math.round((n-25569)*86400000)));
+    const t=Date.parse(s); if (isNaN(t)) return null;
+    return _toProjectDay_(new Date(t));
+  };
+  const ct = {};
+  for (let r=1;r<vals.length;r++){
+    const d = toNY(vals[r][iD]); if(!d) continue;
+    const key = `${Math.floor(vals[r][iT])}|${Math.floor(vals[r][iM])}|${String(vals[r][iMt]).trim()}|${+d}`;
+    ct[key]=(ct[key]||0)+1;
+  }
+  const top = Object.entries(ct).filter(([,c])=>c>1).sort((a,b)=>b[1]-a[1]).slice(0,limit);
+  console.log('Top dup keys (key,count):', top);
+}
+
+function HM_dedupeKeepLast() {
+  const sh = SpreadsheetApp.getActive().getSheetByName('Market History');
+  if (!sh) return;
+  const vals = sh.getDataRange().getValues();
+  if (vals.length < 2) return;
+  const H = vals[0]; const iT=H.indexOf('type_id'), iM=H.indexOf('market_id'), iMt=H.indexOf('market_type'), iD=H.indexOf('date');
+  const toNY = (v)=> {
+    if (v instanceof Date) return _toProjectDay_(v);
+    const s=String(v||'').trim(); if(!s) return null;
+    const n=Number(s); if (Number.isFinite(n)) return _toProjectDay_(new Date(Math.round((n-25569)*86400000)));
+    const t=Date.parse(s); if (isNaN(t)) return null;
+    return _toProjectDay_(new Date(t));
+  };
+  const keepRow = new Map();
+  for (let r=1;r<vals.length;r++){
+    const d = toNY(vals[r][iD]); if (!d) continue;
+    const key = `${Math.floor(vals[r][iT])}|${Math.floor(vals[r][iM])}|${String(vals[r][iMt]).trim()}|${+d}`;
+    keepRow.set(key, r+1); // last occurrence wins
+  }
+  const deleteRows = [];
+  const kept = new Set(keepRow.values());
+  for (let r=2;r<=vals.length;r++){
+    if (!kept.has(r)) deleteRows.push(r);
+  }
+  deleteRows.sort((a,b)=>a-b);
+  for (let i=deleteRows.length-1;i>=0;i--) sh.deleteRow(deleteRows[i]);
+  console.log('HM_dedupeKeepLast removed:', deleteRows.length);
+}
+
+function diag_HistoryTodayDupes() {
+  const cfg = _hmCfg();
+  const sh = SpreadsheetApp.getActive().getSheetByName(cfg.sheets.history);
+  if (!sh) return Logger.log('History sheet not found');
+  const vals = sh.getDataRange().getValues();
+  const h = vals[0];
+  const I = { type: h.indexOf('type_id'), mid: h.indexOf('market_id'),
+              mtp: h.indexOf('market_type'), date: h.indexOf('date') };
+  const today = _toProjectDay_(PT.now());
+  const seen = new Map(), dupes = [];
+  for (let r = 1; r < vals.length; r++) {
+    const row = vals[r];
+    const d0 = row[I.date]; if (!(d0 instanceof Date)) continue;
+    const d = _toProjectDay_(d0); if (+d !== +today) continue;
+    const key = `${row[I.type]}|${row[I.mid]}|${String(row[I.mtp]).trim().toLowerCase()}|${+d}`;
+    if (seen.has(key)) dupes.push({ rowNumber: r+1, key });
+    else seen.set(key, r+1);
+  }
+  Logger.log({ today, dupes: dupes.length });
+  return dupes;
+}
+
+function _canonMarketType(v) { return String(v || '').trim().toLowerCase(); }
+function _canonKey(typeId, marketId, marketType, date) {
+  return `${Math.floor(typeId)}|${Math.floor(marketId)}|${_canonMarketType(marketType)}|${+_toProjectDay_(date)}`;
+}
