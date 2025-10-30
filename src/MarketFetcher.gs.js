@@ -6,7 +6,7 @@
  * a "Cold Start Sentinel" to preserve data integrity on all subsequent runs.
  */
 
-/* global LockService, PropertiesService, SpreadsheetApp, LoggerEx, fuzAPI, getMarketPrices, getMasterMarketRequests, getOrCreateSheet, scheduleOneTimeTrigger, STATE_FLAGS, JOB_LEASE_DURATION_MS, pruneOldRows, _trimTrailing_, getConfig */
+/* global LockService, PropertiesService, SpreadsheetApp, LoggerEx, fuzAPI, getMarketPrices, getMasterMarketRequests, getOrCreateSheet, scheduleOneTimeTrigger, JOB_LEASE_DURATION_MS, pruneOldRows, _trimTrailing_, getConfig */
 
 // --- Constants ---
 const FUZZ_JOB_PREFIX = 'fuzzJob'; // Prefix for state properties
@@ -73,7 +73,8 @@ function _updateFuzzMarketDataWorker() {
   const START_TIME = Date.now();
 
   // --- State Initialization & Validation ---
-  let currentState = SCRIPT_PROP.getProperty(FUZZ_PROP_STEP) || STATE_FLAGS.NEW_RUN;
+  // REFACTORED: Use strings directly, remove STATE_FLAGS dependency
+  let currentState = SCRIPT_PROP.getProperty(FUZZ_PROP_STEP) || "NEW_RUN";
   LOG_FUZZ.info(`Starting worker. Current State: ${currentState}`);
 
   // --- Lease Management ---
@@ -97,8 +98,9 @@ function _updateFuzzMarketDataWorker() {
 
   try {
     // --- State: NEW_RUN (Setup Phase - Conditional Initialization) ---
-    if (currentState === STATE_FLAGS.NEW_RUN) {
-      LOG_FUZZ.info(`State: ${STATE_FLAGS.NEW_RUN}. Preparing final sheet for append.`);
+    // REFACTORED: Use strings directly, remove STATE_FLAGS dependency
+    if (currentState === "NEW_RUN") {
+      LOG_FUZZ.info(`State: NEW_RUN. Preparing final sheet for append.`);
 
       // Use Document Lock for concurrency during setup
       const docLock = LockService.getDocumentLock();
@@ -124,7 +126,8 @@ function _updateFuzzMarketDataWorker() {
           // Start appending at the very next empty row
           SCRIPT_PROP.setProperty(FUZZ_PROP_ROW, finalSheet.getLastRow() + 1); 
           
-          currentState = STATE_FLAGS.PROCESSING;
+          // REFACTORED: Use strings directly
+          currentState = "PROCESSING";
           SCRIPT_PROP.setProperty(FUZZ_PROP_STEP, currentState);
           LOG_FUZZ.info(`Sheet '${FUZZ_SHEET_FINAL}' prepared. Next append row: ${finalSheet.getLastRow() + 1}. Transitioning to ${currentState}.`);
 
@@ -140,8 +143,9 @@ function _updateFuzzMarketDataWorker() {
 
 
     // --- State: PROCESSING ---
-    if (currentState === STATE_FLAGS.PROCESSING) {
-      LOG_FUZZ.info(`State: ${STATE_FLAGS.PROCESSING}. Fetching and writing batches.`);
+    // REFACTORED: Use strings directly
+    if (currentState === "PROCESSING") {
+      LOG_FUZZ.info(`State: PROCESSING. Fetching and writing batches.`);
 
       let requestStartIndex = parseInt(SCRIPT_PROP.getProperty(FUZZ_PROP_INDEX) || '0');
       let nextWriteRow = parseInt(SCRIPT_PROP.getProperty(FUZZ_PROP_ROW) || '2');
@@ -272,7 +276,8 @@ function _updateFuzzMarketDataWorker() {
       // --- Post-Loop Check (Completion) ---
       if (requestStartIndex >= allMarketRequests.length) {
         LOG_FUZZ.info("All batches processed. Job Complete.");
-        currentState = STATE_FLAGS.COMPLETE;
+        // REFACTORED: Use strings directly
+        currentState = "COMPLETE";
         // Reset job state immediately upon successful completion
         _resetFuzzMarketDataJobState(null);
       }
@@ -430,7 +435,8 @@ function dailyHeavyPrune_Prices() {
 
   // Check if it's already running
   const currentState = SCRIPT_PROP.getProperty(PRUNE_PROP_STEP);
-  if (currentState && currentState !== 'COMPLETE' && currentState !== STATE_FLAGS.NEW_RUN) {
+  // REFACTORED: Use strings directly, remove STATE_FLAGS dependency
+  if (currentState && currentState !== 'COMPLETE' && currentState !== "NEW_RUN") {
     LOG.warn(`Heavy Prune is already running (State: ${currentState}). Skipping new start.`);
     // Re-schedule the worker just in case the trigger was lost
     scheduleOneTimeTrigger('_heavyPruneWorker', 5000);
@@ -438,7 +444,8 @@ function dailyHeavyPrune_Prices() {
   }
 
   LOG.info("Starting new Heavy Prune cycle.");
-  SCRIPT_PROP.setProperty(PRUNE_PROP_STEP, STATE_FLAGS.NEW_RUN);
+  // REFACTORED: Use strings directly
+  SCRIPT_PROP.setProperty(PRUNE_PROP_STEP, "NEW_RUN");
 
   // Use executeWithTryLock
   const result = executeWithTryLock(_heavyPruneWorker, '_heavyPruneWorker');
@@ -461,13 +468,15 @@ function _heavyPruneWorker() {
   const sourceSheetName = FUZZ_SHEET_FINAL; // Market Prices is now the source
   const tempSheetName = PRUNE_SHEET_TEMP;
 
-  let currentState = SCRIPT_PROP.getProperty(PRUNE_PROP_STEP) || STATE_FLAGS.NEW_RUN;
+  // REFACTORED: Use strings directly
+  let currentState = SCRIPT_PROP.getProperty(PRUNE_PROP_STEP) || "NEW_RUN";
   LOG.info(`Starting worker. Current State: ${currentState}`);
 
   try {
     // --- State: NEW_RUN (Start) ---
-    if (currentState === STATE_FLAGS.NEW_RUN) {
-      LOG.info(`State: ${STATE_FLAGS.NEW_RUN}. Preparing prune temp sheet.`);
+    // REFACTORED: Use strings directly
+    if (currentState === "NEW_RUN") {
+      LOG.info(`State: NEW_RUN. Preparing prune temp sheet.`);
       const docLock = LockService.getDocumentLock();
       if (docLock.tryLock(FUZZ_DOC_LOCK_TIMEOUT)) {
         try {
@@ -479,7 +488,8 @@ function _heavyPruneWorker() {
           SpreadsheetApp.flush();
 
           SCRIPT_PROP.setProperty(PRUNE_PROP_READ_ROW, '2'); // Data starts row 2
-          currentState = STATE_FLAGS.PROCESSING;
+          // REFACTORED: Use strings directly
+          currentState = "PROCESSING";
           SCRIPT_PROP.setProperty(PRUNE_PROP_STEP, currentState);
           LOG.info(`Temp sheet '${tempSheetName}' prepared. Transitioning to ${currentState}.`);
         } finally {
@@ -493,8 +503,9 @@ function _heavyPruneWorker() {
     } // --- End NEW_RUN ---
 
     // --- State: PROCESSING (Processing While Loop) ---
-    if (currentState === STATE_FLAGS.PROCESSING) {
-      LOG_FUZZ.info(`State: ${STATE_FLAGS.PROCESSING}. Reading/deduping batches.`);
+    // REFACTORED: Use strings directly
+    if (currentState === "PROCESSING") {
+      LOG_FUZZ.info(`State: PROCESSING. Reading/deduping batches.`);
       
       const sourceSheet = ss.getSheetByName(sourceSheetName);
       const tempSheet = ss.getSheetByName(tempSheetName);
@@ -598,7 +609,8 @@ function _heavyPruneWorker() {
       // --- Post-Loop Check ---
       if (readRow > lastRow) {
         LOG_FUZZ.info("All source rows processed. Transitioning to FINALIZING.");
-        currentState = STATE_FLAGS.FINALIZING;
+        // REFACTORED: Use strings directly
+        currentState = "FINALIZING";
         SCRIPT_PROP.setProperty(PRUNE_PROP_STEP, currentState);
         scheduleOneTimeTrigger('_finalizePrune', 1000); // 1 sec delay
       }
@@ -620,7 +632,8 @@ function _finalizePrune() {
   const LOG = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('PruneFinalizer') : console);
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   
-  if (SCRIPT_PROP.getProperty(PRUNE_PROP_STEP) !== STATE_FLAGS.FINALIZING) {
+  // REFACTORED: Use strings directly
+  if (SCRIPT_PROP.getProperty(PRUNE_PROP_STEP) !== "FINALIZING") {
     LOG.warn(`Finalizer called in incorrect state (${SCRIPT_PROP.getProperty(PRUNE_PROP_STEP)}). Aborting.`);
     return;
   }
@@ -741,4 +754,22 @@ function _finalizePrune() {
     LOG.error(`Error in finalizer lock acquisition: ${e.message}`);
     scheduleOneTimeTrigger('_finalizePrune', 60000);
   }
+}
+
+/**
+ * NEW: Resets the state of the Heavy Prune job.
+ */
+function _resetHeavyPruneJobState(error) {
+  const LOG = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('HeavyPrune') : console);
+  LOG.warn(`RESETTING Heavy Prune Job State. Reason: ${error ? error.message : 'Manual'}`);
+  const SCRIPT_PROP = PropertiesService.getScriptProperties();
+  try {
+    SCRIPT_PROP.deleteProperty(PRUNE_PROP_STEP);
+    SCRIPT_PROP.deleteProperty(PRUNE_PROP_READ_ROW);
+    deleteTriggersByName('_heavyPruneWorker');
+    deleteTriggersByName('_finalizePrune');
+  } catch (propError) {
+    LOG.error(`Error deleting script properties: ${propError.message}`);
+  }
+  LOG.info("Heavy Prune job state reset complete.");
 }
