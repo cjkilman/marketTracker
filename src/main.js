@@ -18,6 +18,52 @@ function onOpen() {
     .addToUi();
 }
 
+/**
+ * REVISED: Creates all necessary triggers for the project.
+ * This now points to the new "Starter" functions for the daily jobs.
+ */
+function createTriggers() {
+  _deleteExistingTriggers(); // Deletes all triggers
+
+  // 1. The 15-Minute "Pipper"
+  ScriptApp.newTrigger('masterOrchestrator')
+    .timeBased()
+    .everyMinutes(15)
+    .create();
+
+  // 2. The 24-Hour State Check (Light Prune + Fuzz Reset)
+  // Runs daily at 11 PM
+  ScriptApp.newTrigger('dailyJobReset')
+    .timeBased()
+    .everyDays(1)
+    .atHour(23)
+    .create();
+
+  // 3. The Heavy Prune Starter
+  // Runs daily at 2 AM (giving the reset plenty of time)
+  ScriptApp.newTrigger('dailyHeavyPrune_Prices')
+    .timeBased()
+    .everyDays(1)
+    .atHour(2)
+    .create();
+
+  // 4. The History/Candlestick Starter
+  // Runs daily at 3 AM
+  ScriptApp.newTrigger('updateHistory')
+    .timeBased()
+    .everyDays(1)
+    .atHour(3)
+    .create();
+
+  // 5. Candlestick Builder
+  ScriptApp.newTrigger('buildAllCandlesticks')
+    .timeBased()
+    .everyDays(1)
+    .atHour(4)
+    .create();
+
+  SpreadsheetApp.getUi().alert('All triggers have been created successfully.');
+}
 
 
 function getStructureNames(structureIDs) {
