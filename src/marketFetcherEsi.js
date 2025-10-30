@@ -1,739 +1,1140 @@
-/** MarketFetcher.gs — STATEFUL Prices runner with Predictive Scheduling & Locks
- * Manages fetching Fuzzwork prices based on state properties.
- * Called by the masterOrchestrator.
+/***** marketFetcherESI.gs  —  MAIN PROJECT FILE ********************************
+ * Contains BOTH sides:
+ *   1) ENGINE: pulls ESI region history via GESI → caches & publishes slim table
+ *   2) CLIENT: marketStatDataCache(...)  (cache-only; reads CacheService via your
+ *      _getCachedFuz and _normalizeOrder from marketStatData)
  *
- * NOW INCLUDES:
- * - Stateful Heavy Prune worker (`_heavyPruneWorker`)
- * - Daily Job Reset (`dailyJobReset`)
- */
+ * SLIM IS LAW:
+ *   - Engine publishes named range: MarketResultESI_Region (type_id, region_id, vol30, ts, status)
+ *   - Clients import that single range; all other math stays local (Fuz books + DoB).
+ *******************************************************************************/
 
-/* global LockService, PropertiesService, SpreadsheetApp, LoggerEx, fuzAPI, getMasterMarketRequests, getOrCreateSheet, scheduleOneTimeTrigger, STATE_FLAGS, JOB_LEASE_DURATION_MS, mtConfig, executeWithTryLock, pruneOldRows, _trimTrailing_ */
+/* ============================ CONFIG: ENGINE ============================ */
+// Sources can be a Named Range OR "Sheet!A1" range
+const ITEMS_SOURCE = "'Item List Back End'!A2:A"; // type_id list
+const REGIONS_SOURCE = "'Market Settings'!F3:F";    // region_id list
 
-// --- Constants ---
-const FUZZ_JOB_PREFIX = 'fuzzJob'; // Prefix for state properties
-const FUZZ_PROP_STEP = FUZZ_JOB_PREFIX + 'Step';
-const FUZZ_PROP_INDEX = FUZZ_JOB_PREFIX + 'RequestIndex';
-const FUZZ_PROP_ROW = FUZZ_JOB_PREFIX + 'WriteRow';
-const FUZZ_PROP_LEASE = FUZZ_JOB_PREFIX + 'LeaseUntil';
-const FUZZ_SHEET_TEMP = 'Market_Prices_Temp'; // Temporary sheet for writes
-const FUZZ_SHEET_FINAL = 'Market Prices';     // Final destination sheet
-const FUZZ_SHEET_OLD = 'Market_Prices_Old';   // Intermediate for swap delete
-const FUZZ_SHEET_HEADERS = ["date", "market_id", "market_type", "type_id", "min_sell", "max_buy", "median_sell", "median_buy"];
+// Engine sheets & export name
+const SHEET_REGION_CACHE = 'Cache_Market_ESI_Region';
+const SHEET_PUBLISH = 'Publish_ESI_Region';
+const NR_MARKET_RESULT = 'MarketResultESI_Region';
 
-const FUZZ_BATCH_SIZE = 750; // How many requests to process per execution run
-const FUZZ_TIME_LIMIT_MS = 280000;      // Soft limit (4m 40s) before rescheduling
-const FUZZ_RESCHEDULE_MS = 5000;        // Delay for rescheduling (5s)
-const FUZZ_DOC_LOCK_TIMEOUT = 10000;    // Wait 10s for DocumentLock on write
+// Worker cadence & batching
+const WORKER_EVERY_MIN = 1;    // chunk worker interval (minutes)
+const BATCH_SIZE = 200;  // items per chunk per region (baseline)
+const CALL_PACE_MS = 100;  // sleep between GESI calls (ms)
 
-// --- [NEW PRUNE CONSTANTS] ---
-const PRUNE_JOB_PREFIX = 'heavyPruneJob'; // Prefix for state properties
-const PRUNE_PROP_STEP = PRUNE_JOB_PREFIX + 'Step';
-const PRUNE_PROP_READ_ROW = PRUNE_JOB_PREFIX + 'ReadRow';
-const PRUNE_SHEET_TEMP = 'Market_Prices_Prune_Temp'; // Temp sheet for pruning
-const PRUNE_BATCH_SIZE = 5000; // How many rows to read/process at a time
-// --- [END OF NEW CONSTANTS] ---
+// Daily kickoff time (EVE DT ~11:00 UTC)
+const DAILY_UTC_HOUR = 11;
+const DAILY_UTC_MIN = 20;
 
-const LOG_FUZZ = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('FuzzWorker') : console);
+// Engine headers
+const HEADERS_REGION = ['type_id', 'region_id', 'volume30_region', 'velocity_region', 'last_updated', 'status'];
+const HEADERS_PUBLISH = ['type_id', 'region_id', 'volume30_region', 'last_updated', 'status'];
 
-/**
- * Public wrapper function called by the orchestrator. Uses ScriptLock.
- */
-function updateFuzzMarketDataSheet() {
-  // Uses executeWithTryLock from Orchestrator.gs.js
-  const result = executeWithTryLock(_updateFuzzMarketDataWorker, 'updateFuzzMarketDataSheet');
-  if (result === null) {
-    LOG_FUZZ.warn("Execution skipped by ScriptLock. Will retry on next trigger.");
-  }
+/** ---------- Rate limit + backoff (lightweight) ---------- **/
+const PACER_PROP_GAP = 'esi_gap_ms';
+const PACER_PROP_LAST = 'esi_last_ms';
+const PACER_MIN_MS = 400;   // start ~2.5 rps
+const PACER_MAX_MS = 5000;  // cap 5s between calls
+
+/***** GESI batching + governor (≤300 req/min) ********************************/
+// Hard cap
+var ESI_TB_RATE_PER_MIN = 300; // tokens added per minute
+var ESI_TB_BURST = 300; // max token bucket
+var ESI_GROUP_SIZE = 50;  // requests per fetchAll group
+var ESI_MICRO_BREATH_MS = 100; // tiny pause between groups
+
+/* ===================== CIRCUIT BREAKER & PROBE ======================== */
+const CB_PROP_UNTIL = 'esi_breaker_until_ms';
+const CB_PROP_FAILS = 'esi_fail_ct';
+const CB_PROP_WINDOW = 'esi_fail_window_start_ms';
+const RAMP_PROP_RUNS = 'esi_ramp_runs_left'; // gentle ramp after recovery
+
+function cbOpen_(ms) {
+  const p = PropertiesService.getScriptProperties();
+  p.setProperty(CB_PROP_UNTIL, String(Date.now() + ms));
+  try { ESI_installProbe(3); } catch (_) { }
+}
+
+function cbClose_() {
+  const p = PropertiesService.getScriptProperties();
+  p.deleteProperty(CB_PROP_UNTIL);
+  p.deleteProperty(CB_PROP_FAILS);
+  p.deleteProperty(CB_PROP_WINDOW);
+  // set ramp for first few runs after recovery
+  p.setProperty(RAMP_PROP_RUNS, String(3));
+}
+
+function cbIsOpen_() {
+  const until = +(PropertiesService.getScriptProperties().getProperty(CB_PROP_UNTIL) || 0);
+  return until && Date.now() < until;
 }
 
 /**
- * Resets the state of the Fuzz market data job.
+ * Record a batch result into the breaker window.
+ * If error-limit is tight or we see many failures, open the breaker.
+ * opts: { groupFailures:number, errorLimitRemain?:number, errorLimitReset?:number }
  */
-function _resetFuzzMarketDataJobState(error) {
-  LOG_FUZZ.warn(`RESETTING Fuzz Market Data Job State. Reason: ${error ? error.message : 'Completion/Manual'}`);
-  const SCRIPT_PROP = PropertiesService.getScriptProperties();
-  try {
-    SCRIPT_PROP.deleteProperty(FUZZ_PROP_STEP);
-    SCRIPT_PROP.deleteProperty(FUZZ_PROP_INDEX);
-    SCRIPT_PROP.deleteProperty(FUZZ_PROP_ROW);
-    SCRIPT_PROP.deleteProperty(FUZZ_PROP_LEASE);
-    // Delete potential triggers
-    deleteTriggersByName('updateFuzzMarketDataSheet');
-    deleteTriggersByName('_finalizeFuzzDataUpdate'); // Ensure finalizer trigger is cleared
-  } catch (propError) {
-    LOG_FUZZ.error(`Error deleting script properties: ${propError.message}`);
+function cbRecord_(opts) {
+  // opts: { groupFailures:number, groupTotal?:number, errorLimitRemain?:number, errorLimitReset?:number }
+  var p = PropertiesService.getScriptProperties();
+  var now = Date.now();
+  var windowMs = 60000; // 1m window (no numeric separators for Apps Script safety)
+
+  var start = +(p.getProperty(CB_PROP_WINDOW) || 0);
+  var fails = +(p.getProperty(CB_PROP_FAILS) || 0);
+  var calls = +(p.getProperty('esi_call_ct') || 0);
+
+  // roll the window if stale
+  if (!start || (now - start) > windowMs) {
+    start = now; fails = 0; calls = 0;
   }
-  LOG_FUZZ.info("Fuzz market data job state reset complete.");
+
+  var groupFails = Math.max(0, Number(opts.groupFailures || 0));
+  var groupTotal = Math.max(groupFails, Number(opts.groupTotal || 0)); // pass ids.length if you have it
+
+  fails += groupFails;
+  calls += groupTotal;
+
+  p.setProperty(CB_PROP_WINDOW, String(start));
+  p.setProperty(CB_PROP_FAILS, String(fails));
+  p.setProperty('esi_call_ct', String(calls));
+
+  var remain = (opts.errorLimitRemain != null) ? Number(opts.errorLimitRemain) : null;
+  var resetSec = (opts.errorLimitReset != null) ? Number(opts.errorLimitReset) : null;
+
+  var failRate = calls > 0 ? (fails / calls) : 0;
+  var budgetTight = (remain != null) && (remain <= 3);          // ESI error-budget nearly exhausted
+  var rateBad = (calls >= 20) && (failRate >= 0.35);        // ≥35% fail rate in the last minute
+  var burstBad = groupFails >= Math.max(5, Math.floor(groupTotal * 0.5)); // burst in this group
+
+  if (budgetTight || rateBad || burstBad) {
+    // If ESI tells us the reset window, honor it (plus a small buffer); else 15 minutes.
+    var holdMs = (resetSec && resetSec > 0) ? (resetSec * 1000 + 5000) : (15 * 60000);
+    (LoggerEx?.warn || console.warn)('esi.breaker.open', {
+      fails, calls, failRate: +failRate.toFixed(2), remain, resetSec, holdMs
+    });
+    cbOpen_(holdMs);
+  }
 }
 
 
-/**
- * The core stateful worker function for fetching Fuzz data.
- */
-function _updateFuzzMarketDataWorker() {
-  const SCRIPT_PROP = PropertiesService.getScriptProperties();
-  const START_TIME = Date.now();
-
-  // --- State Initialization & Validation ---
-  let currentState = SCRIPT_PROP.getProperty(FUZZ_PROP_STEP) || STATE_FLAGS.NEW_RUN;
-  LOG_FUZZ.info(`Starting worker. Current State: ${currentState}`);
-
-  // --- Lease Management ---
-  const leaseUntil = parseInt(SCRIPT_PROP.getProperty(FUZZ_PROP_LEASE) || '0', 10);
-  if (START_TIME > leaseUntil) {
-    LOG_FUZZ.error(`Job lease expired or not set! Lease ended at ${new Date(leaseUntil)}. Resetting job state.`);
-    _resetFuzzMarketDataJobState(new Error("Job lease expired"));
-    return; // Halt execution
-  }
-  // Extend lease if nearing expiry within this run
-  if (leaseUntil - START_TIME < 60000) { // Less than 1 min left
-    const newLease = START_TIME + JOB_LEASE_DURATION_MS;
-    SCRIPT_PROP.setProperty(FUZZ_PROP_LEASE, newLease.toString());
-    LOG_FUZZ.info(`Extended job lease until ${new Date(newLease)}`);
-  }
-  // --- End Lease Management ---
-
-
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let tempSheet = null; // Initialize
-
+/** Canary probe: if a tiny call succeeds, close breaker and restart. */
+function ESI_probeAndMaybeCloseBreaker() {
+  if (!cbIsOpen_()) return;
   try {
-    // --- State: NEW_RUN (Setup Phase) ---
-    if (currentState === STATE_FLAGS.NEW_RUN) {
-      LOG_FUZZ.info(`State: ${STATE_FLAGS.NEW_RUN}. Preparing temporary sheet.`);
-
-      // Use Document Lock for sheet creation/clearing
-      const docLock = LockService.getDocumentLock();
-      if (docLock.tryLock(FUZZ_DOC_LOCK_TIMEOUT)) {
-        try {
-          // Delete old sheet if it exists
-          const oldSheet = ss.getSheetByName(FUZZ_SHEET_OLD);
-          if (oldSheet) ss.deleteSheet(oldSheet);
-
-          tempSheet = getOrCreateSheet(ss, FUZZ_SHEET_TEMP, FUZZ_SHEET_HEADERS);
-          if (tempSheet.getLastRow() > 1) {
-            tempSheet.getRange(2, 1, tempSheet.getLastRow() - 1, tempSheet.getMaxColumns()).clearContent();
-          }
-          tempSheet.hideSheet();
-          SpreadsheetApp.flush(); // Ensure sheet operations complete
-
-          // Initialize state for processing
-          SCRIPT_PROP.setProperty(FUZZ_PROP_INDEX, '0');
-          SCRIPT_PROP.setProperty(FUZZ_PROP_ROW, '2'); // Data starts row 2
-          currentState = STATE_FLAGS.PROCESSING;
-          SCRIPT_PROP.setProperty(FUZZ_PROP_STEP, currentState);
-          LOG_FUZZ.info(`Temp sheet '${FUZZ_SHEET_TEMP}' prepared. Transitioning to ${currentState}.`);
-
-        } finally {
-          docLock.releaseLock();
-        }
-      } else {
-        LOG_FUZZ.warn(`Document Lock busy during setup. Rescheduling.`);
-        scheduleOneTimeTrigger('updateFuzzMarketDataSheet', FUZZ_RESCHEDULE_MS);
-        return; // Reschedule and exit
-      }
-    } // --- End NEW_RUN ---
-
-
-    // --- State: PROCESSING ---
-    if (currentState === STATE_FLAGS.PROCESSING) {
-      LOG_FUZZ.info(`State: ${STATE_FLAGS.PROCESSING}. Fetching and writing batches.`);
-
-      let requestStartIndex = parseInt(SCRIPT_PROP.getProperty(FUZZ_PROP_INDEX) || '0');
-      let nextWriteRow = parseInt(SCRIPT_PROP.getProperty(FUZZ_PROP_ROW) || '2');
-      const allMarketRequests = getMasterMarketRequests(); // Get full list each time
-
-      if (!allMarketRequests || allMarketRequests.length === 0) {
-        LOG_FUZZ.warn("Master request list is empty. Resetting job.");
-        _resetFuzzMarketDataJobState(new Error("Master request list empty"));
-        return;
-      }
-
-      tempSheet = ss.getSheetByName(FUZZ_SHEET_TEMP); // Ensure we have the sheet object
-      if (!tempSheet) {
-        throw new Error(`Sheet '${FUZZ_SHEET_TEMP}' missing during PROCESSING phase.`);
-      }
-
-      let batchesProcessedThisRun = 0;
-
-      // --- Processing Loop ---
-      while (requestStartIndex < allMarketRequests.length) {
-        // --- Time Limit Check ---
-        if (Date.now() - START_TIME > FUZZ_TIME_LIMIT_MS) {
-          SCRIPT_PROP.setProperty(FUZZ_PROP_INDEX, requestStartIndex.toString());
-          SCRIPT_PROP.setProperty(FUZZ_PROP_ROW, nextWriteRow.toString());
-          scheduleOneTimeTrigger('updateFuzzMarketDataSheet', FUZZ_RESCHEDULE_MS);
-          LOG_FUZZ.warn(`Time limit hit after ${batchesProcessedThisRun} batches. Saved state. Rescheduled.`);
-          return; // Exit current execution
-        }
-
-        // --- Prepare Batch & Group ---
-        const requestEndIndex = Math.min(requestStartIndex + FUZZ_BATCH_SIZE, allMarketRequests.length);
-        const requestsForThisRun = allMarketRequests.slice(requestStartIndex, requestEndIndex);
-        const groupedRequests = {};
-        requestsForThisRun.forEach(req => {
-          const key = `${req.market_id}_${req.market_type}`;
-          if (!groupedRequests[key]) groupedRequests[key] = {
-            market_id: req.market_id,
-            market_type: req.market_type,
-            typeIDs: []
-          };
-          groupedRequests[key].typeIDs.push(req.type_id);
-        });
-
-        LOG_FUZZ.info(`Processing batch indices ${requestStartIndex}-${requestEndIndex - 1} (${requestsForThisRun.length} reqs, ${Object.keys(groupedRequests).length} markets).`);
-
-        // --- Fetch Data ---
-        const now = new Date();
-        const rowsToWrite = [];
-        let fetchErrorOccurred = false;
-
-        Object.values(groupedRequests).forEach(({
-          market_id,
-          market_type,
-          typeIDs
-        }) => {
-          try {
-            const prices = getMarketPrices(typeIDs, market_id, market_type); // Calls fuzAPI internally
-            typeIDs.forEach(type_id => {
-              const e = prices[type_id] || {};
-              rowsToWrite.push([now, market_id, market_type, type_id, e.minSell ?? null, e.maxBuy ?? null, e.medianSell ?? null, e.medianBuy ?? null]);
-            });
-          } catch (apiError) {
-            LOG_FUZZ.error(`API error for ${market_type}:${market_id} (items: ${typeIDs.length}): ${apiError.message}`);
-            fetchErrorOccurred = true;
-          }
-        });
-
-        // --- Write Batch (Document Lock) ---
-        if (rowsToWrite.length > 0) {
-          const docLock = LockService.getDocumentLock();
-          if (docLock.tryLock(FUZZ_DOC_LOCK_TIMEOUT)) {
-            try {
-              const range = tempSheet.getRange(nextWriteRow, 1, rowsToWrite.length, FUZZ_SHEET_HEADERS.length);
-              range.setValues(rowsToWrite);
-              nextWriteRow += rowsToWrite.length;
-              batchesProcessedThisRun++;
-              LOG_FUZZ.info(`Batch write success. ${rowsToWrite.length} rows written. Next row: ${nextWriteRow}`);
-            } catch (writeError) {
-              LOG_FUZZ.error(`Error during batch write: ${writeError.message}. Rescheduling.`);
-              SCRIPT_PROP.setProperty(FUZZ_PROP_INDEX, requestStartIndex.toString()); // Save current index
-              SCRIPT_PROP.setProperty(FUZZ_PROP_ROW, nextWriteRow.toString()); // Save potentially advanced row
-              scheduleOneTimeTrigger('updateFuzzMarketDataSheet', FUZZ_RESCHEDULE_MS);
-              throw writeError; // Re-throw to ensure finally block runs and exits
-            } finally {
-              docLock.releaseLock();
-            }
-          } else {
-            LOG_FUZZ.warn(`Document Lock busy for write. Saving state and rescheduling.`);
-            SCRIPT_PROP.setProperty(FUZZ_PROP_INDEX, requestStartIndex.toString());
-            SCRIPT_PROP.setProperty(FUZZ_PROP_ROW, nextWriteRow.toString());
-            scheduleOneTimeTrigger('updateFuzzMarketDataSheet', FUZZ_RESCHEDULE_MS);
-            return; // Exit
-          }
-        } else if (!fetchErrorOccurred) {
-          LOG_FUZZ.info(`No data returned/to write for batch indices ${requestStartIndex}-${requestEndIndex - 1}. Advancing.`);
-        }
-
-        // --- Advance Index Only After Successful Handling ---
-        requestStartIndex = requestEndIndex;
-        SCRIPT_PROP.setProperty(FUZZ_PROP_INDEX, requestStartIndex.toString());
-        SCRIPT_PROP.setProperty(FUZZ_PROP_ROW, nextWriteRow.toString()); // Save row progress too
-
-      } // --- End while loop ---
-
-      // --- Post-Loop Check ---
-      if (requestStartIndex >= allMarketRequests.length) {
-        LOG_FUZZ.info("All batches processed. Transitioning to FINALIZING.");
-        currentState = STATE_FLAGS.FINALIZING;
-        SCRIPT_PROP.setProperty(FUZZ_PROP_STEP, currentState);
-        // Immediately schedule the finalizer
-        scheduleOneTimeTrigger('_finalizeFuzzDataUpdate', 1000); // 1 sec delay
-      }
-
-    } // --- End PROCESSING ---
-
-  } catch (e) {
-    LOG_FUZZ.error(`Unhandled error in worker: ${e.message}\nStack: ${e.stack}`);
-    _resetFuzzMarketDataJobState(e);
-  } finally {
-    const duration = (Date.now() - START_TIME) / 1000;
-    LOG_FUZZ.info(`Worker execution finished in ${duration.toFixed(2)}s. Final State: ${currentState}`);
-  }
-}
-
-/**
- * Performs the atomic sheet swap using DocumentLock. Triggered after PROCESSING.
- */
-function _finalizeFuzzDataUpdate() {
-  const LOG = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('FuzzFinalizer') : console);
-  const SCRIPT_PROP = PropertiesService.getScriptProperties();
-
-  // Ensure state is correct
-  if (SCRIPT_PROP.getProperty(FUZZ_PROP_STEP) !== STATE_FLAGS.FINALIZING) {
-    LOG.warn(`Finalizer called in incorrect state (${SCRIPT_PROP.getProperty(FUZZ_PROP_STEP)}). Resetting job.`);
-    _resetFuzzMarketDataJobState(new Error("Finalizer called in incorrect state"));
-    return;
-  }
-
-  LOG.info("Starting finalization: Atomic sheet swap.");
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const docLock = LockService.getDocumentLock();
-
-  try {
-    if (docLock.tryLock(30000)) { // Wait up to 30s for the lock
-      try {
-        const tempSheet = ss.getSheetByName(FUZZ_SHEET_TEMP);
-        const finalSheet = ss.getSheetByName(FUZZ_SHEET_FINAL);
-        const oldSheet = ss.getSheetByName(FUZZ_SHEET_OLD);
-
-        if (!tempSheet || tempSheet.getLastRow() <= 1) {
-          throw new Error(`Temp sheet '${FUZZ_SHEET_TEMP}' is missing or empty! Cannot finalize.`);
-        }
-
-        // 1. Delete previous "Old" sheet (if exists)
-        if (oldSheet) ss.deleteSheet(oldSheet);
-
-        // 2. Rename current "Final" sheet to "Old" (if exists)
-        if (finalSheet) finalSheet.setName(FUZZ_SHEET_OLD);
-
-        // 3. Rename "Temp" sheet to "Final"
-        tempSheet.setName(FUZZ_SHEET_FINAL);
-        tempSheet.showSheet(); // Make it visible
-        SpreadsheetApp.flush(); // Ensure changes apply
-
-        LOG.info("Atomic sheet swap successful.");
-
-        // 4. Reset job state ONLY on successful swap
-        _resetFuzzMarketDataJobState(null); // Pass null for successful completion
-
-      } catch (swapError) {
-        LOG.error(`CRITICAL error during sheet swap: ${swapError.message}. State NOT reset. Manual intervention likely needed.`);
-        scheduleOneTimeTrigger('_finalizeFuzzDataUpdate', 60000); // Retry in 1 min
-        throw swapError; // Re-throw
-      } finally {
-        docLock.releaseLock();
-      }
-    } else {
-      LOG.warn("Document Lock busy during finalization. Rescheduling finalizer.");
-      scheduleOneTimeTrigger('_finalizeFuzzDataUpdate', FUZZ_RESCHEDULE_MS);
+    const regionId = 10000043; // Domain
+    const typeIds = [34];     // Tritanium
+    const res = fetchHistoryBatchGESI_(regionId, typeIds);
+    if (Array.isArray(res) && res[0] && res[0].status === 'OK') {
+      cbClose_();
+      (LoggerEx?.log || console.log)('esi.breaker.closed');
+      try { kickoffMarketHistoryRefresh(); } catch (_) { }
     }
-  } catch (e) {
-    LOG.error(`Error in finalizer lock acquisition: ${e.message}`);
-    scheduleOneTimeTrigger('_finalizeFuzzDataUpdate', 60000); // Retry in 1 min
-  }
+  } catch (_) { /* stay open */ }
 }
 
-/* ---------------------- Light Mode hygiene ---------------------- */
-
-function lightPrePrune_(sh, maxRows) {
-  const f = sh.getFilter && sh.getFilter();
-  if (f) f.remove();
-  _trimTrailing_(sh);
-  const last = sh.getLastRow();
-  if (maxRows && last > maxRows) {
-    const over = last - maxRows;
-    _deleteInBlocks_(sh, 2, over);
-    LoggerEx && LoggerEx.log('Prices: light prune removed oldest rows:', over);
-  }
+/** Install a periodic probe while breaker is open. */
+function ESI_installProbe(everyMinutes = 3) {
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'ESI_probeAndMaybeCloseBreaker')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('ESI_probeAndMaybeCloseBreaker').timeBased().everyMinutes(everyMinutes).create();
 }
 
-function postTighten_(sh) {
-  _trimTrailing_(sh);
+/* ============================ TOKEN BUCKET ============================= */
+function tbConsume_(need) {
+  var props = PropertiesService.getScriptProperties();
+  var now = Date.now();
+  var last = +props.getProperty('esi_tb_last_ms') || 0;
+  var tok = +props.getProperty('esi_tb_tokens') || 0;
+
+  if (!last) { last = now; tok = ESI_TB_BURST; } // start full to avoid first-stall
+
+  var ratePerMs = ESI_TB_RATE_PER_MIN / 60000;                  // tokens/ms
+  tok = Math.min(ESI_TB_BURST, tok + ratePerMs * (now - last)); // refill
+
+  if (tok >= need) {
+    tok -= need;
+    props.setProperty('esi_tb_tokens', String(tok));
+    props.setProperty('esi_tb_last_ms', String(now));
+    return 0;
+  }
+
+  var shortfall = need - tok;
+  var waitMs = Math.ceil(shortfall / ratePerMs);
+  props.setProperty('esi_tb_tokens', '0');
+  props.setProperty('esi_tb_last_ms', String(now));
+  (LoggerEx?.info || console.info)('esi.tb.wait', { ms: waitMs, need: need });
+  return waitMs;
 }
 
-function _trimTrailing_(sh) {
-  if (!sh) return; // Add guard clause
-  const used = sh.getLastRow();
-  const alloc = sh.getMaxRows();
-  const extra = alloc - used;
-  if (extra > 0) _deleteInBlocks_(sh, used + 1, extra);
+/* ======================== GESI CLIENT HELPERS ========================= */
+// ----- Blacksmoke/GESI client -----
+function getGESIHistoryClient_() {
+  // Requires GESI library + authorized character (Sheets Add-ons → GESI → Authorize)
+  return GESI.getClient().setFunction('markets_region_history');
 }
 
-function _deleteInBlocks_(sh, startRow, count) {
-  const BLOCK = 20000;
-  if (count <= 0 || !sh) return; // Add guard clause
-
-  const frozen = sh.getFrozenRows();
-  const bodyStart = frozen + 1;
-  const maxRows = sh.getMaxRows();
-  const bodyRows = Math.max(0, maxRows - frozen);
-
-  if (startRow < bodyStart) startRow = bodyStart;
-
-  const keptTop = Math.max(0, startRow - bodyStart);
-  let safeCount = Math.min(count, Math.max(0, bodyRows - 1 - keptTop));
-
-  if (safeCount <= 0) {
-    if (startRow === bodyStart && count >= bodyRows) {
-      sh.getRange(bodyStart, 1, 1, sh.getMaxColumns()).clearContent();
-    }
-    return;
-  }
-  let row = startRow;
-  while (safeCount > 0) {
-    const n = Math.min(BLOCK, safeCount);
-    sh.deleteRows(row, n);
-    safeCount -= n;
-  }
-  if (startRow === bodyStart && count >= bodyRows) {
-    sh.getRange(bodyStart, 1, 1, sh.getMaxColumns()).clearContent();
-  }
+function isBeforeNoonET_() {
+  return +Utilities.formatDate(new Date(), 'America/New_York', 'H') < 12;
 }
 
-
-/** Batch/contiguous prune for "older than N days" assuming chronological appends. */
-function pruneOldRows(sheet, retentionDays, dateCol /* 1-based */ ) {
-  if (!retentionDays || !sheet) return;
-  const lastRow = sheet.getLastRow();
-  if (lastRow < 2) return;
-
-  const cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() - retentionDays);
-
-  const dates = sheet.getRange(2, dateCol, lastRow - 1, 1).getValues().flat();
-
-  let boundary = -1;
-  for (let i = 0; i < dates.length; i++) {
-    const d = dates[i];
-    if (!(d instanceof Date)) continue;
-    if (d < cutoff) boundary = i;
-    else break;
-  }
-
-  if (boundary >= 0) {
-    const rowsToDelete = boundary + 1;
-    _deleteInBlocks_(sheet, /*startRow=*/ 2, /*count=*/ rowsToDelete);
-    LoggerEx && LoggerEx.log('Prices: pruned old rows (<= cutoff):', rowsToDelete);
-  }
+// Batch size honors ramp runs if present
+function getBatchSize_() {
+  const base = isBeforeNoonET_() ? 200 : 60;
+  const left = Number(PropertiesService.getScriptProperties().getProperty(RAMP_PROP_RUNS) || 0);
+  return left > 0 ? Math.min(60, base) : base;
 }
 
-/* ---------------------- [NEW] 24-Hour State Check ---------------------- */
+function buildHistoryRequests_(client, regionId, typeIds) {
+  return typeIds.map(function (tid) {
+    return client.buildRequest({
+      region_id: regionId,
+      type_id: tid,
+      show_column_headings: false,
+      version: 'latest'
+    });
+  });
+}
 
-/**
- * NEW: Performs the 24-hour state check.
- * 1. Runs a "Light Prune" (pruneOldRows) on the live data.
- * 2. Resets the main Fuzz worker job state.
- *
- * This function should be put on a daily trigger.
- */
-function dailyJobReset() {
-  const LOG = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('DailyReset') : console);
-  LOG.info("Starting 24-hour state check and job reset...");
+function summarizeHistory30_(rows) {
+  if (!rows || !rows.length) return { vol30: 0, vel: 0 };
+  var start = Math.max(0, rows.length - 30);
+  var v = 0;
+  for (var i = start; i < rows.length; i++) v += (+rows[i].volume || 0);
+  var n = rows.length - start;
+  return { vol30: v, vel: (n ? v / n : 0) };
+}
 
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const cfg = mtConfig(); //
-  const sheetName = cfg.sheets.prices;
-  const sheet = ss.getSheetByName(sheetName);
-
-  if (!sheet) {
-    LOG.error(`Sheet not found: ${sheetName}. Skipping light prune.`);
-  } else {
+function mapGESIRespToResult_(resp, typeId) {
+  var code = resp.getResponseCode();
+  if (code === 200) {
     try {
-      // 1. Run the "Light Prune"
-      const retentionDays = cfg.retentionDays.prices || 1;
-      LOG.info(`Running light prune (pruneOldRows) for ${retentionDays} day(s) on ${sheetName}...`);
-      pruneOldRows(sheet, retentionDays, 1); // 1 = date column
-      LOG.info("Light prune complete.");
+      var arr = JSON.parse(resp.getContentText()) || [];
+      var m = summarizeHistory30_(arr);
+      return { typeId: typeId, status: 'OK', vol30: m.vol30, vel: m.vel };
     } catch (e) {
-      LOG.error(`Light prune failed: ${e.message}`);
+      return { typeId: typeId, status: 'ERR_PARSE' };
     }
   }
+  if (code === 401 || code === 403) return { typeId: typeId, status: 'ERR_AUTH', code: code };
+  if (code === 420 || code === 429) return { typeId: typeId, status: 'ERR_RATE', code: code };
+  if (code >= 500) return { typeId: typeId, status: 'ERR_5XX', code: code };
+  if (code >= 400) return { typeId: typeId, status: 'ERR_4XX', code: code };
+  return { typeId: typeId, status: 'ERR_' + code, code: code };
+}
 
-  try {
-    // 2. Reset the Fuzz worker's "Start Index"
-    LOG.info("Resetting Fuzz Market Data Job State...");
-    _resetFuzzMarketDataJobState(new Error("Daily 24-hour reset"));
-    LOG.info("Fuzz job state reset complete.");
-  } catch (e) {
-    LOG.error(`Fuzz job reset failed: ${e.message}`);
+/* ================== BATCH FETCH (Breaker-aware) ======================= */
+function fetchHistoryBatchGESI_(regionId, typeIds) {
+  var client = getGESIHistoryClient_();
+  var out = [];
+
+  for (var i = 0; i < typeIds.length; i += ESI_GROUP_SIZE) {
+    var ids = typeIds.slice(i, i + ESI_GROUP_SIZE);
+
+    // governor
+    var wait = tbConsume_(ids.length);
+    if (wait > 0) Utilities.sleep(Math.min(wait, 30000));
+
+    var reqs = buildHistoryRequests_(client, regionId, ids);
+    var resps = UrlFetchApp.fetchAll(reqs);
+
+    // track error-limit and failures
+    let failCt = 0, remain = -1, reset = -1;
+    try {
+      const hdr = resps[0].getAllHeaders && resps[0].getAllHeaders();
+      remain = +(hdr && (hdr['x-esi-error-limit-remain'] || hdr['X-Esi-Error-Limit-Remain']) || -1);
+      reset = +(hdr && (hdr['x-esi-error-limit-reset'] || hdr['X-Esi-Error-Limit-Reset']) || -1);
+      if (remain >= 0) (LoggerEx?.info || console.info)('esi.errbudget', { remain, reset });
+    } catch (_) { }
+
+    for (var k = 0; k < resps.length; k++) {
+      const code = resps[k].getResponseCode();
+      if (code === 420 || code === 429 || code >= 500) failCt++;
+      out.push(mapGESIRespToResult_(resps[k], ids[k]));
+    }
+
+    // feed the breaker so the worker can stand down if needed
+    cbRecord_({
+      groupFailures: failCt,
+      groupTotal: ids.length,              
+      errorLimitRemain: remain,
+      errorLimitReset: reset
+    });
+
+    // gentle nap if budget is tight
+    if (remain > -1 && remain <= 5) {
+      const nap = Math.max(1000, (reset > 0 ? reset * 250 : 1500));
+      Utilities.sleep(nap);
+    }
+
+    Utilities.sleep(ESI_MICRO_BREATH_MS);
+  }
+  return out;
+}
+
+/* ============================ BACKOFF HELPERS ========================== */
+function isRateLimitedError_(e) {
+  const s = String(e && e.message || e || '');
+  return /bandwidth quota exceeded|error limit|too many|429|420/i.test(s);
+}
+
+function rateLimitPacer_() {
+  const p = PropertiesService.getScriptProperties();
+  const gap = Math.max(PACER_MIN_MS, Math.min(PACER_MAX_MS, Number(p.getProperty(PACER_PROP_GAP)) || PACER_MIN_MS));
+  const last = Number(p.getProperty(PACER_PROP_LAST)) || 0;
+  const now = Date.now();
+  const wait = Math.max(0, last + gap - now);
+  if (wait > 0) Utilities.sleep(wait);
+  p.setProperty(PACER_PROP_LAST, String(Date.now()));
+  return gap;
+}
+
+function bumpPacer_() {
+  const p = PropertiesService.getScriptProperties();
+  const cur = Math.max(PACER_MIN_MS, Number(p.getProperty(PACER_PROP_GAP)) || PACER_MIN_MS);
+  const next = Math.min(PACER_MAX_MS, Math.ceil(cur * 1.5));
+  p.setProperty(PACER_PROP_GAP, String(next));
+  return next;
+}
+
+function relaxPacer_() {
+  const p = PropertiesService.getScriptProperties();
+  const cur = Math.max(PACER_MIN_MS, Number(p.getProperty(PACER_PROP_GAP)) || PACER_MIN_MS);
+  const next = Math.max(PACER_MIN_MS, Math.floor(cur * 0.8));
+  p.setProperty(PACER_PROP_GAP, String(next));
+  return next;
+}
+
+function withRetries_(fn, tries = 3, baseDelay = 800) {
+  let attempt = 0;
+  while (true) {
+    try {
+      rateLimitPacer_();              // global pacing
+      return fn();                    // do the call
+    } catch (e) {
+      if (isRateLimitedError_(e) && attempt < tries - 1) {
+        const gap = bumpPacer_();
+        const jitter = Math.floor(Math.random() * 300);
+        const backoff = baseDelay * Math.pow(2, attempt) + jitter;
+        (LoggerEx?.warn || console.warn)(`Rate-limited: gap=${gap}ms, backoff=${backoff}ms, try=${attempt + 1}/${tries}`);
+        Utilities.sleep(backoff);
+        attempt++;
+        continue;
+      }
+      throw e; // non-rate error or out of tries
+    }
   }
 }
 
+/* ============================ ONE-OFF FETCH ============================ */
+function fetchVol30One_(typeId, regionId) {
+  try {
+    const hist = withRetries_(
+      () => GESI.getClient()
+        .setFunction('markets_region_history')
+        .executeRaw({ type_id: typeId, region_id: regionId }),
+      3, 800
+    ); // -> [{date:"YYYY-MM-DD", volume:..., ...}]
 
-/* ---------------------- [REWRITTEN] Heavy Prune (Stateful) ---------------------- */
+    if (!Array.isArray(hist) || hist.length === 0) {
+      return { status: 'NOT_FOUND', vol30: "", vel: "" };
+    }
 
-/**
- * REWRITTEN: This is now the "Starter" function for the stateful heavy prune.
- * It just acquires a lock, sets the state, and calls the worker.
- *
- * This is what you should schedule on your daily trigger (a few hours after dailyJobReset).
+    const vol30 = sumLastNDaysObj_(hist, 30); // sums 'volume' last 30d (UTC)
+
+    if (vol30 > 0) {
+      return { status: 'OK', vol30: vol30, vel: vol30 / 30 };
+    }
+    // zero over the last 30 days → treat as no data for math purposes
+    return { status: 'NO_DATA_30D', vol30: "", vel: "" };
+
+  } catch (e) {
+    if (isRateLimitedError_(e)) {
+      return { status: 'ERR_RATE' }; // do not write a row; retry next run
+    }
+    (LoggerEx?.error || console.error)('ESI error:', e?.message || e, e?.stack);
+    return { status: 'ERR_ESI', vol30: "", vel: "" };
+  }
+}
+
+/* ============================ CONFIG: CLIENT ============================ */
+/* marketStatDataCache uses your CacheService via _getCachedFuz and _normalizeOrder.
+ * It needs NO sheet/range config. In your Sheets formulas, add your own FUZ_TICK heartbeat.
  */
-function dailyHeavyPrune_Prices() {
-  const LOG = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('HeavyPrune') : console);
-  const SCRIPT_PROP = PropertiesService.getScriptProperties();
 
-  // Check if it's already running
-  const currentState = SCRIPT_PROP.getProperty(PRUNE_PROP_STEP);
-  if (currentState && currentState !== 'COMPLETE' && currentState !== STATE_FLAGS.NEW_RUN) {
-    LOG.warn(`Heavy Prune is already running (State: ${currentState}). Skipping new start.`);
-    // Re-schedule the worker just in case the trigger was lost
-    scheduleOneTimeTrigger('_heavyPruneWorker', 5000);
+function testESIHistory() {
+  const rid = 10000043; // Domain
+  const tid = 34;       // Tritanium
+  const client = GESI.getClient().setFunction('markets_region_history');
+  const resp = UrlFetchApp.fetch(client.buildRequest({
+    region_id: rid,
+    type_id: tid,
+    show_column_headings: false,
+    version: 'latest'
+  }));
+  const rows = JSON.parse(resp.getContentText());
+  console.log('history rows:', Array.isArray(rows) ? rows.length : rows);
+}
+
+/* =============================== SETUP ================================= */
+function setupEngine() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  ensureCacheMarketESIRegion_(ss);
+  ensurePublishSheet_(ss);
+  publishMarketResultESIRegion();
+  SpreadsheetApp.getUi().alert('Engine setup complete ✅');
+}
+
+function ensureCacheMarketESIRegion_(ss) {
+  let sh = ss.getSheetByName(SHEET_REGION_CACHE);
+  if (!sh) sh = ss.insertSheet(SHEET_REGION_CACHE);
+  const hdr = sh.getRange(1, 1, 1, HEADERS_REGION.length).getValues()[0];
+  const needs = !hdr[0] || HEADERS_REGION.some((h, i) => hdr[i] !== h);
+  if (needs) {
+    sh.clear();
+    sh.getRange(1, 1, 1, HEADERS_REGION.length).setValues([HEADERS_REGION]);
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+function ensurePublishSheet_(ss) {
+  let sh = ss.getSheetByName(SHEET_PUBLISH);
+  if (!sh) sh = ss.insertSheet(SHEET_PUBLISH);
+  const hdr = sh.getRange(1, 1, 1, HEADERS_PUBLISH.length).getValues()[0];
+  const needs = !hdr[0] || HEADERS_PUBLISH.some((h, i) => hdr[i] !== h);
+  if (needs) {
+    sh.clear();
+    sh.getRange(1, 1, 1, HEADERS_PUBLISH.length).setValues([HEADERS_PUBLISH]);
+    sh.setFrozenRows(1);
+  }
+  // heartbeat (outside named range)
+  sh.getRange('G1').setValue('published_at');
+  sh.getRange('H1').setNumberFormat('yyyy-mm-dd"T"hh:mm:ss"Z"');
+  SpreadsheetApp.getActive().setNamedRange(NR_MARKET_RESULT, sh.getRange('A:E'));
+}
+
+/* ============================ SCHEDULING =============================== */
+function installDailyKickoff() {
+  // clear old triggers for a clean slate
+  ScriptApp.getProjectTriggers().forEach(t => {
+    const h = t.getHandlerFunction();
+    if (h === 'kickoffMarketHistoryRefresh' || h === 'marketFetchChunk') {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+  ScriptApp.newTrigger('kickoffMarketHistoryRefresh')
+    .timeBased().everyDays(1).atHour(DAILY_UTC_HOUR).nearMinute(DAILY_UTC_MIN)
+    .inTimezone('Etc/UTC').create();
+  SpreadsheetApp.getUi().alert(`Daily kickoff installed @ ${DAILY_UTC_HOUR}:${DAILY_UTC_MIN} UTC ✅`);
+}
+
+/* ========================= KICKOFF → WORKER ============================ */
+function kickoffMarketHistoryRefresh() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const cache = ss.getSheetByName(SHEET_REGION_CACHE);
+  if (!cache) throw new Error('Missing ' + SHEET_REGION_CACHE);
+
+  markAllCacheStale_(cache);
+
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty('mf_cursor', JSON.stringify({ ri: 0, ii: 0 }));
+  props.setProperty('mf_job_active', '1');
+  props.setProperty('mf_job_started', new Date().toISOString());
+
+  publishMarketResultESIRegion(); // clients see stale→fresh tick
+
+  ScriptApp.newTrigger('marketFetchChunk').timeBased().everyMinutes(WORKER_EVERY_MIN).create();
+}
+
+/* ===================== WORKER: ESI → CACHE (GESI) ====================== */
+function marketFetchChunk() {
+  var t0 = Date.now();
+  var rid = Utilities.getUuid().slice(0, 8); // run id for grouping
+
+  // prevent overlap
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) {
+    LoggerEx.warn('mf.lock.busy rid=' + rid);
     return;
   }
 
-  LOG.info("Starting new Heavy Prune cycle.");
-  SCRIPT_PROP.setProperty(PRUNE_PROP_STEP, STATE_FLAGS.NEW_RUN);
-
-  // Use executeWithTryLock
-  const result = executeWithTryLock(_heavyPruneWorker, '_heavyPruneWorker');
-  if (result === null) {
-    LOG.warn("Heavy Prune start skipped by ScriptLock. Another process is running.");
+  // Stand down early if breaker is open
+  if (cbIsOpen_()) {
+    LoggerEx.warn('mf.breaker.open.standdown');
+    try { publishMarketResultESIRegion(); } catch (_) { }
+    return stopWorker_('breaker open');
   }
-}
-
-/**
- * NEW: The "Processing While Loop" worker for the heavy prune.
- * This function reads, processes, and writes in batches to avoid timeouts.
- */
-function _heavyPruneWorker() {
-  const LOG = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('PruneWorker') : console);
-  const SCRIPT_PROP = PropertiesService.getScriptProperties();
-  const START_TIME = Date.now();
-  
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const cfg = mtConfig();
-  const sourceSheetName = cfg.sheets.prices;
-  const tempSheetName = PRUNE_SHEET_TEMP;
-
-  let currentState = SCRIPT_PROP.getProperty(PRUNE_PROP_STEP) || STATE_FLAGS.NEW_RUN;
-  LOG.info(`Starting worker. Current State: ${currentState}`);
 
   try {
-    // --- State: NEW_RUN (Start) ---
-    if (currentState === STATE_FLAGS.NEW_RUN) {
-      LOG.info(`State: ${STATE_FLAGS.NEW_RUN}. Preparing prune temp sheet.`);
-      const docLock = LockService.getDocumentLock();
-      if (docLock.tryLock(FUZZ_DOC_LOCK_TIMEOUT)) {
-        try {
-          const tempSheet = getOrCreateSheet(ss, tempSheetName, FUZZ_SHEET_HEADERS);
-          if (tempSheet.getLastRow() > 1) {
-            tempSheet.getRange(2, 1, tempSheet.getLastRow() - 1, tempSheet.getMaxColumns()).clearContent();
-          }
-          tempSheet.hideSheet();
-          SpreadsheetApp.flush();
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var cache = ss.getSheetByName(SHEET_REGION_CACHE);
+    if (!cache) {
+      LoggerEx.warn('mf.early.no_cache rid=' + rid);
+      return stopWorker_('no cache');
+    }
 
-          SCRIPT_PROP.setProperty(PRUNE_PROP_READ_ROW, '2'); // Data starts row 2
-          currentState = STATE_FLAGS.PROCESSING;
-          SCRIPT_PROP.setProperty(PRUNE_PROP_STEP, currentState);
-          LOG.info(`Temp sheet '${tempSheetName}' prepared. Transitioning to ${currentState}.`);
-        } finally {
-          docLock.releaseLock();
-        }
+    var props = PropertiesService.getScriptProperties();
+    if (props.getProperty('mf_job_active') !== '1') {
+      LoggerEx.log('mf.early.no_active_job rid=' + rid);
+      return stopWorker_('no active job');
+    }
+
+    var regions = readListFlex_(REGIONS_SOURCE, {
+      numeric: true, integer: true, dropZeros: true, validator: isValidRegionId_
+    });
+    var items = readListFlex_(ITEMS_SOURCE, { numeric: true, integer: true });
+
+    if (!items.length || !regions.length) {
+      LoggerEx.warn('mf.early.no_items_or_regions rid=' + rid + ' items=' + items.length + ' regions=' + regions.length);
+      return stopWorker_('no items/regions');
+    }
+
+    var cur = JSON.parse(props.getProperty('mf_cursor') || '{"ri":0,"ii":0}');
+    var ri = Math.min(cur.ri || 0, regions.length - 1);
+    var ii = Math.min(cur.ii || 0, items.length - 1);
+
+    var regionId = regions[ri];
+    var BS = (typeof getBatchSize_ === 'function') ? getBatchSize_() : BATCH_SIZE;
+    var end = Math.min(ii + BS, items.length);
+    LoggerEx.info('mf.batch.params', { BS: BS, cadence_min: WORKER_EVERY_MIN });
+
+    var chunk = items.slice(ii, end);
+
+    LoggerEx.log(
+      'mf.run.start rid=' + rid + ' regions=' + regions.length + ' items=' + items.length +
+      ' cursorIn=' + JSON.stringify({ ri: ri, ii: ii }) +
+      ' region=' + regionId + ' window=' + JSON.stringify({ from: ii, to: end, size: chunk.length })
+    );
+
+    var processed = 0;
+    var hitRate = false;
+    var ok = 0, err = 0, errAuth = 0;
+
+    // --- GESI batch (auth handled by GESI, paced by token bucket) ---
+    var results = fetchHistoryBatchGESI_(regionId, chunk);
+
+    var rowsOut = [];
+
+    for (var i = 0; i < results.length; i++) {
+      var r = results[i];
+
+      if (r.status === 'ERR_RATE') {
+        hitRate = true;
+        LoggerEx.warn('mf.rate.hit rid=' + rid + ' region=' + regionId + ' processed=' + processed);
+        break; // leave remainder for next run
+      }
+
+      if (r.status === 'ERR_AUTH') {
+        errAuth++;
+        rowsOut.push([r.typeId, regionId, "", "", new Date(), 'ERR_AUTH']);
+        continue; // do NOT advance processed; we'll fail-fast after flush
+      }
+
+      if (r.status === 'OK') {
+        ok++;
+        rowsOut.push([r.typeId, regionId, r.vol30, r.vel, new Date(), 'OK']);
+        if (r.vol30 === 0) (LoggerEx?.info || console.info)('mf.vol30.zero', { regionId: regionId, typeId: r.typeId });
+        processed++;
       } else {
-        LOG.warn(`Document Lock busy during prune setup. Rescheduling.`);
-        scheduleOneTimeTrigger('_heavyPruneWorker', FUZZ_RESCHEDULE_MS);
-        return;
+        err++;
+        rowsOut.push([r.typeId, regionId, "", "", new Date(), r.status]);
+        LoggerEx.warn('mf.item.err rid=' + rid + ' region=' + regionId + ' type=' + r.typeId + ' status=' + r.status);
+        processed++; // non-auth errors still advance so we avoid stalls
       }
-    } // --- End NEW_RUN ---
+    }
 
-    // --- State: PROCESSING (Processing While Loop) ---
-    if (currentState === STATE_FLAGS.PROCESSING) {
-      LOG.info(`State: ${STATE_FLAGS.PROCESSING}. Reading/deduping batches.`);
-      
-      const sourceSheet = ss.getSheetByName(sourceSheetName);
-      const tempSheet = ss.getSheetByName(tempSheetName);
-      if (!sourceSheet || !tempSheet) {
-        throw new Error("Missing source or temp sheet during prune processing.");
-      }
+    // Flush once
+    if (rowsOut.length) {
+      upsertRegionCache_(cache, rowsOut);
+      publishMarketResultESIRegion();
+      LoggerEx.log('mf.flush.chunk rid=' + rid + ' rows=' + rowsOut.length);
+    } else {
+      LoggerEx.log('mf.flush.empty rid=' + rid);
+    }
 
-      let readRow = parseInt(SCRIPT_PROP.getProperty(PRUNE_PROP_READ_ROW) || '2');
-      const lastRow = sourceSheet.getLastRow();
-      
-      // --- Find Header Indices ---
-      const header = sourceSheet.getRange(1, 1, 1, sourceSheet.getLastColumn()).getValues()[0];
-      const lower = header.map(h => String(h).trim().toLowerCase());
-      const find = (name) => lower.findIndex(h => h === name);
-      const DATE = find('date'), TYPE = find('type_id'), MID = find('market_id'), MTP = find('market_type');
-      if (DATE < 0 || TYPE < 0 || MID < 0 || MTP < 0) {
-        throw new Error('Missing required columns (date/type_id/market_id/market_type) in source sheet.');
-      }
-      
-      // --- Processing Loop ---
-      while (readRow <= lastRow) {
-        // --- 1. Time Limit Check ---
-        if (Date.now() - START_TIME > FUZZ_TIME_LIMIT_MS) {
-          SCRIPT_PROP.setProperty(PRUNE_PROP_READ_ROW, readRow.toString());
-          scheduleOneTimeTrigger('_heavyPruneWorker', FUZZ_RESCHEDULE_MS);
-          LOG.warn(`Time limit hit. Saved state. Rescheduled. Next read row: ${readRow}`);
-          return;
-        }
+    // Auth fail-fast: stop job, preserve cursor. No recycling.
+    if (errAuth > 0) {
+      var props2 = PropertiesService.getScriptProperties();
+      props2.setProperty('mf_blocked_auth', '1'); // breadcrumb if you want to gate startup
+      props2.deleteProperty('mf_job_active');
+      LoggerEx.error('mf.auth.block rid=' + rid + ' region=' + regionId + ' errAuth=' + errAuth + ' hint="Sheets → Add-ons → GESI → Authorize Character"');
+      return stopWorker_('auth required');
+    }
 
-        // --- 2. Read Batch ---
-        const rowsToRead = Math.min(PRUNE_BATCH_SIZE, lastRow - readRow + 1);
-        if (rowsToRead <= 0) break; 
-        
-        LOG.info(`Reading ${rowsToRead} rows from ${sourceSheetName} (starting row ${readRow})...`);
-        const data = sourceSheet.getRange(readRow, 1, rowsToRead, header.length).getValues();
-        
-        // --- 3. Process Batch (Retention, Bucket, Dedupe) ---
-        const { bucketMinutes, retentionDays } = cfg;
-        const cutoff = new Date(Date.now() - retentionDays.prices * 86400000);
-        const msPerBucket = (bucketMinutes || 20) * 60 * 1000;
-        const keep = new Map(); // Keep latest record *within this batch*
+    // Advance cursor only by actual work
+    var cursorBefore = { ri: ri, ii: ii };
+    if (hitRate && processed === 0) {
+      if (typeof hardenPacer_ === 'function') hardenPacer_();
+      LoggerEx.warn('mf.cursor.stay_due_to_rate rid=' + rid + ' region=' + regionId + ' cursor=' + JSON.stringify(cursorBefore));
+      // keep ri/ii unchanged
+    } else {
+      ii += processed;
+      if (ii >= items.length) { ii = 0; ri++; }
+      if (!hitRate && typeof relaxPacer_ === 'function') relaxPacer_();
+    }
 
-        for (let i = 0; i < data.length; i++) {
-          const r = data[i];
-          const d = r[DATE];
-          if (!(d instanceof Date) || d < cutoff) continue; // Retention filter
+    var done = (ri >= regions.length);
+    var cursorAfter = done ? null : { ri: ri, ii: ii };
 
-          const bucket = Math.floor(d.getTime() / msPerBucket);
-          const key = bucket + '|' + r[TYPE] + '|' + r[MID] + '|' + r[MTP];
+    LoggerEx.log('mf.run.summary rid=' + rid + ' region=' + regionId +
+      ' ok=' + ok + ' err=' + err + ' hitRate=' + hitRate +
+      ' processed=' + processed + ' elapsedMs=' + (Date.now() - t0) +
+      ' cursorBefore=' + JSON.stringify(cursorBefore) +
+      ' cursorAfter=' + JSON.stringify(cursorAfter) + ' done=' + done);
 
-          const prev = keep.get(key);
-          if (!prev || (r[DATE] > prev[DATE])) {
-            keep.set(key, r); // Dedupe filter
-          }
-        }
-        
-        const rowsToWrite = Array.from(keep.values());
+    if (done) {
+      props.deleteProperty('mf_job_active');
+      props.deleteProperty('mf_cursor');
+      LoggerEx.log('mf.done rid=' + rid);
+      return stopWorker_('done');
+    }
 
-        // --- 4. Write Batch (Throttle Sheet Writes / Retrigger) ---
-        if (rowsToWrite.length > 0) {
-          const docLock = LockService.getDocumentLock();
-          if (docLock.tryLock(FUZZ_DOC_LOCK_TIMEOUT)) {
-            try {
-              tempSheet.getRange(tempSheet.getLastRow() + 1, 1, rowsToWrite.length, rowsToWrite[0].length).setValues(rowsToWrite);
-              LOG.info(`Appended ${rowsToWrite.length} deduped rows to ${tempSheetName}.`);
-            } finally {
-              docLock.releaseLock();
-            }
-          } else {
-            // RETRIGGER ON WRITE FAILURE
-            LOG.warn(`Document Lock busy for prune write. Rescheduling (will re-process batch).`);
-            scheduleOneTimeTrigger('_heavyPruneWorker', FUZZ_RESCHEDULE_MS);
-            return;
-          }
-        }
-        
-        // --- 5. Advance Index ---
-        readRow += rowsToRead;
-        SCRIPT_PROP.setProperty(PRUNE_PROP_READ_ROW, readRow.toString());
-      
-      } // --- End while loop ---
+    props.setProperty('mf_cursor', JSON.stringify({ ri: ri, ii: ii }));
 
-      // --- Post-Loop Check ---
-      if (readRow > lastRow) {
-        LOG.info("All source rows processed. Transitioning to FINALIZING.");
-        currentState = STATE_FLAGS.FINALIZING;
-        SCRIPT_PROP.setProperty(PRUNE_PROP_STEP, currentState);
-        scheduleOneTimeTrigger('_finalizePrune', 1000); // 1 sec delay
-      }
-    } // --- End PROCESSING ---
+    // Decrement ramp runs (if any) after each successful pass
+    try {
+      const left = Number(props.getProperty(RAMP_PROP_RUNS) || 0);
+      if (left > 0) props.setProperty(RAMP_PROP_RUNS, String(Math.max(0, left - 1)));
+    } catch (_) { }
 
   } catch (e) {
-    LOG.error(`Unhandled error in prune worker: ${e.message}\nStack: ${e.stack}`);
-    // Reset prune state on error
-    SCRIPT_PROP.deleteProperty(PRUNE_PROP_STEP);
-    SCRIPT_PROP.deleteProperty(PRUNE_PROP_READ_ROW);
+    LoggerEx.error('mf.run.exception rid=' + rid + ' msg=' + (e && e.message));
+    throw e;
+  } finally {
+    try { lock.releaseLock(); } catch (e2) { }
+    LoggerEx.log('mf.run.end rid=' + rid + ' ms=' + (Date.now() - t0));
+  }
+}
+
+function isValidRegionId_(n) {
+  n = Math.floor(Number(n));
+  return Number.isFinite(n) && n >= 10000000 && n < 20000000;
+}
+
+/* =============================== HELPERS ================================ */
+function publishMarketResultESIRegion() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const cache = ss.getSheetByName(SHEET_REGION_CACHE);
+  const pub = ss.getSheetByName(SHEET_PUBLISH);
+  if (!cache || !pub) throw new Error('Missing sheets');
+
+  const keepPairs = getConfigPairSet_();
+
+  const vals = cache.getDataRange().getValues();
+  const out = [HEADERS_PUBLISH];
+
+  if (vals.length > 1) {
+    const h = vals[0];
+    const ix = {
+      t: h.indexOf('type_id'), r: h.indexOf('region_id'),
+      v: h.indexOf('volume30_region'), u: h.indexOf('last_updated'),
+      s: h.indexOf('status')
+    };
+
+    for (let i = 1; i < vals.length; i++) {
+      const row = vals[i];
+      const t = row[ix.t], r = row[ix.r];
+      if (t === "" || r === "") continue;
+      if (!keepPairs.has(`${Math.floor(t)}:${Math.floor(r)}`)) continue;
+
+      let status = String(row[ix.s] || "").toUpperCase();
+      if (status === "STALE") status = "STALE-ESI";
+
+      const keepNumeric = (status === "OK" || status === "STALE-ESI");
+      const vol = keepNumeric ? row[ix.v] : "";
+
+      out.push([t, r, vol, row[ix.u], status]);
+    }
+  }
+
+  pub.clearContents();
+  pub.getRange(1, 1, out.length, HEADERS_PUBLISH.length).setValues(out);
+  pub.getRange('H1').setNumberFormat('yyyy-mm-dd\"T\"hh:mm:ss\"Z\"').setValue(new Date());
+  SpreadsheetApp.getActive().setNamedRange(NR_MARKET_RESULT, pub.getRange('A:E'));
+}
+
+function markAllCacheStale_(sheet) {
+  const data = sheet.getDataRange().getValues();
+  if (data.length < 2) return;
+
+  const h = data[0];
+  const iStatus = h.indexOf('status');
+  if (iStatus === -1) throw new Error('status col missing');
+
+  // Build status-only updates, conditional per row
+  const newStatuses = [];
+  for (let r = 1; r < data.length; r++) {
+    const cur = String(data[r][iStatus] || "").toUpperCase();
+    // Flip only good rows to STALE-ESI; leave others as-is
+    const next = (cur === "OK" || cur === "STALE-ESI") ? "STALE-ESI" : cur;
+    newStatuses.push([next]);
+  }
+
+  // Write just the status column; do NOT overwrite dates or numbers
+  sheet.getRange(2, iStatus + 1, newStatuses.length, 1).setValues(newStatuses);
+}
+
+function stopWorker_(reason) {
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'marketFetchChunk')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+  try { publishMarketResultESIRegion(); } catch (e) { }
+  if (reason) console.log('marketFetchChunk: stopped (' + reason + ')');
+}
+
+// Sum last N days (objects or arrays)
+function sumLastNDaysObj_(hist, days) {
+  const startMs = Date.now() - days * 864e5;
+  let sum = 0;
+  for (const r of Array.isArray(hist) ? hist : []) {
+    const t = Date.parse((r.date || '') + 'T00:00:00Z');
+    if (!isNaN(t) && t >= startMs) sum += Number(r.volume || 0);
+  }
+  return sum;
+}
+
+// Read list from Named Range OR "Sheet!A1" (numeric/string IDs; de-dupe; preserve order)
+function readListFlex_(spec, opts) {
+  opts = Object.assign({
+    numeric: true,       // coerce to number
+    integer: true,       // floor numbers (IDs)
+    dropZeros: true,     // ignore 0
+    dedupe: true,
+    validator: null      // fn(val)->boolean
+  }, opts || {});
+
+  const ss = SpreadsheetApp.getActive();
+  let range = (spec && typeof spec.getValues === 'function') ? spec : ss.getRangeByName(spec);
+  if (!range && typeof spec === 'string' && spec.includes('!')) {
+    const m = spec.match(/^'?([^'!]+)'?\!(.+)$/);
+    if (!m) throw new Error('Invalid list spec: ' + spec);
+    const sh = ss.getSheetByName(m[1]);
+    if (!sh) throw new Error('Sheet not found: ' + m[1]);
+    range = sh.getRange(m[2]);
+  }
+  if (!range) throw new Error('List source not found: ' + spec);
+
+  const seen = new Set(), out = [];
+  const vals = range.getValues().flat();
+
+  for (let v of vals) {
+    // normalize to trimmed string first to catch blanks & whitespace
+    let s = String(v).trim();
+    if (!s.length) continue;                     // ← ignore blanks
+
+    let val;
+    if (opts.numeric) {
+      let n = Number(s);                         // handles "1.0000043E7"
+      if (!Number.isFinite(n)) continue;
+      if (opts.integer) n = Math.floor(n);
+      if (opts.dropZeros && n === 0) continue;   // ← avoid the "0" poison
+      val = n;
+    } else {
+      val = s;
+    }
+
+    if (opts.validator && !opts.validator(val)) continue;
+    if (!opts.dedupe || !seen.has(val)) {
+      if (opts.dedupe) seen.add(val);
+      out.push(val);
+    }
+  }
+  return out;
+}
+
+// Upsert (type_id, region_id) rows into Cache_Market_ESI_Region
+function upsertRegionCache_(sheet, rows) {
+  if (!rows.length) return;
+  const data = sheet.getDataRange().getValues();
+  const h = data[0];
+  const iType = h.indexOf('type_id');
+  const iReg = h.indexOf('region_id');
+  const map = new Map();
+  for (let r = 1; r < data.length; r++) {
+    const t = data[r][iType], g = data[r][iReg];
+    if (t === '' || g === '') continue;
+    map.set(`${t}:${g}`, r + 1);
+  }
+  const updates = [], appends = [];
+  for (const row of rows) {
+    const [typeId, regionId] = row;
+    const rn = map.get(`${typeId}:${regionId}`);
+    if (rn) updates.push({ rn, row }); else appends.push(row);
+  }
+  updates.forEach(u => sheet.getRange(u.rn, 1, 1, HEADERS_REGION.length).setValues([u.row]));
+  if (appends.length) {
+    const start = sheet.getLastRow() + 1;
+    sheet.getRange(start, 1, appends.length, HEADERS_REGION.length).setValues(appends);
+  }
+}
+
+/* Utility used by ESI_publishClientInterfaces (safe no-op if you already have one) */
+function getOrCreateSheet(ss, name, headers) {
+  let sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+  if (headers && headers.length) {
+    const hdr = sh.getRange(1, 1, 1, headers.length).getValues()[0];
+    const needs = !hdr[0] || headers.some((h, i) => hdr[i] !== h);
+    if (needs) {
+      sh.clear();
+      sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+      sh.setFrozenRows(1);
+    }
+  }
+  return sh;
+}
+
+/* =============================== DEBUG ================================= */
+function debugListSources() {
+  const items = readListFlex_(ITEMS_SOURCE, { numeric: true });
+  const regions = readListFlex_(REGIONS_SOURCE, { numeric: true });
+  console.log({
+    items_count: items.length, regions_count: regions.length,
+    sample_items: items.slice(0, 5), sample_regions: regions.slice(0, 5)
+  });
+}
+
+function _pairKey_(t, r) { return `${Math.floor(t)}:${Math.floor(r)}`; }
+
+function getConfigPairSet_() {
+  const items = readListFlex_(ITEMS_SOURCE, { numeric: true, integer: true });
+  const regions = readListFlex_(REGIONS_SOURCE, { numeric: true, integer: true, dropZeros: true, validator: isValidRegionId_ });
+  const set = new Set();
+  for (const t of items) for (const r of regions) set.add(_pairKey_(t, r));
+  return set;
+}
+
+function pruneCacheToConfig_(mode = 'tombstone') {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(SHEET_REGION_CACHE);
+  if (!sh) throw new Error('Missing ' + SHEET_REGION_CACHE);
+
+  const vals = sh.getDataRange().getValues();
+  if (vals.length <= 1) return;
+
+  const h = vals[0];
+  const iT = h.indexOf('type_id');
+  const iR = h.indexOf('region_id');
+  const iV = h.indexOf('volume30_region');
+  const iVel = h.indexOf('velocity_region');
+  const iU = h.indexOf('last_updated');
+  const iS = h.indexOf('status');
+
+  const keepPairs = getConfigPairSet_();
+
+  if (mode === 'hard') {
+    // Rebuild the sheet with only configured rows
+    const out = [h];
+    for (let i = 1; i < vals.length; i++) {
+      const row = vals[i];
+      if (keepPairs.has(_pairKey_(row[iT], row[iR]))) out.push(row);
+    }
+    sh.clear();
+    sh.getRange(1, 1, out.length, out[0].length).setValues(out);
+    sh.setFrozenRows(1);
+    return;
+  }
+
+  // tombstone: mark non-config rows as REMOVED and blank their numbers
+  const updates = [];
+  for (let i = 1; i < vals.length; i++) {
+    const row = vals[i];
+    const keep = keepPairs.has(_pairKey_(row[iT], row[iR]));
+    if (!keep) {
+      row[iV] = "";               // blank numerics
+      if (iVel > -1) row[iVel] = "";
+      if (iU > -1) row[iU] = new Date();
+      row[iS] = "REMOVED";
+      updates.push({ rn: i + 1, row });
+    }
+  }
+  updates.forEach(u => sh.getRange(u.rn, 1, 1, h.length).setValues([u.row]));
+}
+
+/**
+ * Build a values-only table per client from Publish_ESI_Region.
+ * Input:  Sheet "Interface Clients" → A:Client, B:region_id_heartbeat
+ * Source: Sheet "Publish_ESI_Region" (A:E = type_id,region_id,volume30_region,last_updated,status)
+ * Output: Sheet "Publish_ESI_Region_<client>" with headers:
+ *         [type_id, volume30_region, last_updated, status]
+ * Named range for client: MarketResultESI_Region_<client>
+ */
+function ESI_publishClientInterfaces() {
+  const ss = SpreadsheetApp.getActive();
+  const srcSh = ss.getSheetByName('Publish_ESI_Region');
+  const cliSh = ss.getSheetByName('Interface Clients');
+  if (!srcSh || !cliSh) throw new Error('Missing required sheets');
+
+  const src = srcSh.getDataRange().getValues();
+  if (src.length < 2) return;
+
+  // ---- helpers ----
+  const normStatus = (s) => String(s || '').trim().toUpperCase().replace(/_/g, '-');
+  const toInt = (v) => {
+    const n = Number(String(v).replace(/[^\d\-]/g, ''));
+    return Number.isFinite(n) ? n : NaN;
+  };
+  const toDate = (v) => {
+    if (v instanceof Date) return v;
+    const s = String(v || '').trim();
+    if (!s) return null;
+    // Try YYYY-MM-DD first
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+    if (m) return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
+    // Try serial / general number
+    const n = Number(s);
+    if (Number.isFinite(n)) return new Date(Math.round((n - 25569) * 86400000)); // Excel serial fallback
+    // Last resort: Date.parse
+    const t = Date.parse(s);
+    return isNaN(t) ? null : new Date(t);
+  };
+
+  // ---- group rows by region ----
+  // Build region → deduped rows keyed by type_id (prefer latest last_updated)
+  /** @type {Map<number, Map<number, any[]>>} */
+  const byRegion = new Map();
+
+  // src schema A..E: [type_id, region_id, vol30, last_updated, status]
+  for (let r = 1; r < src.length; r++) {
+    const row = src[r];
+    const typeId = toInt(row[0]);
+    const regionId = toInt(row[1]);
+    if (!Number.isFinite(typeId) || !Number.isFinite(regionId)) continue;
+
+    const vol30 = Number(row[2]) || 0;
+    const last = toDate(row[3]);       // Date or null
+    const status = normStatus(row[4]);
+
+    if (!byRegion.has(regionId)) byRegion.set(regionId, new Map());
+    const bag = byRegion.get(regionId);
+
+    // dedupe by type_id: keep the row with the most recent last_updated
+    const prev = bag.get(typeId);
+    if (!prev) {
+      bag.set(typeId, [typeId, vol30, last || '', status]);
+    } else {
+      const prevDate = prev[2] instanceof Date ? prev[2] : toDate(prev[2]);
+      if ((last && !prevDate) || (last && prevDate && last > prevDate)) {
+        bag.set(typeId, [typeId, vol30, last, status]);
+      }
+    }
+  }
+
+  // ---- read clients ----
+  const lastCliRow = cliSh.getLastRow();
+  if (lastCliRow < 2) return;
+  const cliRows = cliSh.getRange(2, 1, lastCliRow - 1, 3).getValues();
+
+  const OUT_HEADERS = ['type_id', 'volume30_region', 'last_updated', 'status'];
+
+  for (const [clientRaw, ridRaw, filtRaw] of cliRows) {
+    const client = String(clientRaw || '').trim();
+    const regionId = toInt(ridRaw);
+    if (!client || !Number.isFinite(regionId)) continue;
+
+    // Build allowed set (default OK|STALE-ESI; "ALL" skips filtering)
+    const filt = String(filtRaw || 'OK|STALE-ESI').trim();
+    const allowAll = normStatus(filt) === 'ALL';
+    const allowed = new Set(
+      allowAll
+        ? []
+        : filt.split(/[|,]/).map((x) => normStatus(x)).filter(Boolean)
+    );
+
+    // Pull region rows and apply status filter
+    const bag = byRegion.get(regionId);
+    const rows = [];
+    if (bag && bag.size) {
+      for (const [, rec] of bag) {
+        if (!rec) continue;
+        const st = normStatus(rec[3]);
+        if (allowAll || allowed.has(st)) rows.push(rec);
+      }
+    }
+
+    // Optional: sort by volume desc, then type_id
+    rows.sort((a, b) => (b[1] - a[1]) || (a[0] - b[0]));
+
+    // Coerce last_updated to Date objects for formatting
+    for (let i = 0; i < rows.length; i++) {
+      const d = rows[i][2];
+      rows[i][2] = toDate(d) || '';
+    }
+
+    const outName = 'Publish_ESI_Region_' + client;
+    const outSh = getOrCreateSheet(ss, outName, OUT_HEADERS);
+
+    // Clear old data rows, keep header
+    const last = outSh.getLastRow();
+    if (last > 1) outSh.getRange(2, 1, last - 1, OUT_HEADERS.length).clearContent();
+
+    if (rows.length) {
+      outSh.getRange(2, 1, rows.length, OUT_HEADERS.length).setValues(rows);
+      // number/date formats
+      outSh.getRange(2, 1, rows.length, 1).setNumberFormat('0');              // type_id
+      outSh.getRange(2, 2, rows.length, 1).setNumberFormat('#,##0');          // volume30_region
+      outSh.getRange(2, 3, rows.length, 1).setNumberFormat('yyyy-mm-dd');     // last_updated
+    }
+
+    // Update named range (header + data)
+    const height = Math.max(1, rows.length + 1);
+    ss.setNamedRange('MarketResultESI_Region_' + client, outSh.getRange(1, 1, height, OUT_HEADERS.length));
   }
 }
 
 /**
- * NEW: The "Finalize" function for the heavy prune.
- * This runs the *second* deduplication (across all batches) and performs the atomic swap.
+ * Install/replace a time trigger to republish client interfaces.
+ * @param {number} everyMinutes  One of: 1, 5, 10, 15, 30 (default 5)
  */
-function _finalizePrune() {
-  const LOG = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('PruneFinalizer') : console);
-  const SCRIPT_PROP = PropertiesService.getScriptProperties();
-  
-  if (SCRIPT_PROP.getProperty(PRUNE_PROP_STEP) !== STATE_FLAGS.FINALIZING) {
-    LOG.warn(`Finalizer called in incorrect state (${SCRIPT_PROP.getProperty(PRUNE_PROP_STEP)}). Aborting.`);
-    return;
-  }
-
-  LOG.info("Starting finalization: Secondary deduplication and atomic swap.");
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const cfg = mtConfig();
-  const tempSheetName = PRUNE_SHEET_TEMP;
-  const finalSheetName = cfg.sheets.prices;
-  const oldSheetName = FUZZ_SHEET_OLD; // Use the same "Old" sheet as the Fuzz worker
-
-  const docLock = LockService.getDocumentLock();
-  try {
-    if (docLock.tryLock(30000)) { // Wait up to 30s
-      try {
-        const tempSheet = ss.getSheetByName(tempSheetName);
-        if (!tempSheet || tempSheet.getLastRow() <= 1) {
-          throw new Error(`Prune temp sheet '${tempSheetName}' is missing or empty! Cannot finalize.`);
-        }
-
-        // --- 1. Secondary Deduplication (in memory) ---
-        LOG.info("Reading temp sheet for final deduplication...");
-        const data = tempSheet.getRange(2, 1, tempSheet.getLastRow() - 1, tempSheet.getLastColumn()).getValues();
-        
-        const { bucketMinutes, maxRows } = cfg;
-        const msPerBucket = (bucketMinutes || 20) * 60 * 1000;
-        const keep = new Map();
-        
-        const header = tempSheet.getRange(1, 1, 1, tempSheet.getLastColumn()).getValues()[0];
-        const lower = header.map(h => String(h).trim().toLowerCase());
-        const find = (name) => lower.findIndex(h => h === name);
-        const DATE = find('date'), TYPE = find('type_id'), MID = find('market_id'), MTP = find('market_type');
-
-        for (let i = 0; i < data.length; i++) {
-          const r = data[i];
-          const d = r[DATE];
-          if (!(d instanceof Date)) continue; 
-
-          const bucket = Math.floor(d.getTime() / msPerBucket);
-          const key = bucket + '|' + r[TYPE] + '|' + r[MID] + '|' + r[MTP];
-
-          const prev = keep.get(key);
-          if (!prev || (r[DATE] > prev[DATE])) {
-            keep.set(key, r);
-          }
-        }
-        
-        let deduped = Array.from(keep.values());
-        LOG.info(`Final deduplication complete. Kept ${deduped.length} rows.`);
-
-        // --- 2. Cap Rows ---
-        if (deduped.length > maxRows.prices) {
-          deduped.sort((a,b) => a[DATE] - b[DATE]); // Sort by date ascending
-          deduped = deduped.slice(deduped.length - maxRows.prices); // Keep the newest rows
-          LOG.info(`Capped rows to ${deduped.length} (max: ${maxRows.prices}).`);
-        }
-        
-        // --- 3. Rewrite Temp Sheet ---
-        tempSheet.clearContents(); // Clear everything
-        tempSheet.getRange(1, 1, 1, header.length).setValues([header]); // Set header
-        if (deduped.length > 0) {
-          tempSheet.getRange(2, 1, deduped.length, header.length).setValues(deduped);
-        }
-        _trimTrailing_(tempSheet);
-        SpreadsheetApp.flush();
-        LOG.info("Final data written to temp sheet.");
-
-        // --- 4. Atomic Swap ---
-        const finalSheet = ss.getSheetByName(finalSheetName);
-        const oldSheet = ss.getSheetByName(oldSheetName);
-
-        if (oldSheet) ss.deleteSheet(oldSheet);
-        if (finalSheet) finalSheet.setName(oldSheetName);
-        tempSheet.setName(finalSheetName);
-        tempSheet.showSheet();
-        SpreadsheetApp.flush();
-        LOG.info("Atomic sheet swap successful.");
-
-        // --- 5. Reset Prune Job State ---
-        SCRIPT_PROP.deleteProperty(PRUNE_PROP_STEP);
-        SCRIPT_PROP.deleteProperty(PRUNE_PROP_READ_ROW);
-        LOG.info("Heavy Prune job state reset complete.");
-
-      } catch (swapError) {
-        LOG.error(`CRITICAL error during prune swap: ${swapError.message}. State NOT reset.`);
-        scheduleOneTimeTrigger('_finalizePrune', 60000); // Retry in 1 min
-        throw swapError;
-      } finally {
-        docLock.releaseLock();
-      }
-    } else {
-      LOG.warn("Document Lock busy during finalization. Rescheduling finalizer.");
-      scheduleOneTimeTrigger('_finalizePrune', FUZZ_RESCHEDULE_MS);
-    }
-  } catch (e) {
-    LOG.error(`Error in finalizer lock acquisition: ${e.message}`);
-    scheduleOneTimeTrigger('_finalizePrune', 60000);
-  }
+function ESI_installClientInterfaceRefresh(everyMinutes) {
+  const allowed = [1, 5, 10, 15, 30];
+  const n = Number(everyMinutes || 5);
+  if (!allowed.includes(n)) throw new Error('everyMinutes must be 1, 5, 10, 15, or 30.');
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'ESI_publishClientInterfaces')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('ESI_publishClientInterfaces').timeBased().everyMinutes(n).create();
 }
+
+/** Remove the refresh trigger */
+function ESI_stopClientInterfaceRefresh() {
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'ESI_publishClientInterfaces')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+}
+
+/* ========== OUTAGE RETRY (errors only, non-stranding, repo-native) ========== */
+/**
+ * ESI outage recovery — retry only rows with ERR_* (and IN_PROGRESS older than 5m).
+ * Uses existing fetchHistoryBatchGESI_ (GESI + TB governor). Never negative cache.
+ * Safe to run ad-hoc or via a short-lived time trigger. Does NOT pre-mark IN_PROGRESS.
+ */
+function ESI_RetryErrorsOnce(limit = 250, chunk = 20) {
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Cache_Market_ESI_Region');
+  if (!sh) return;
+  const rng = sh.getDataRange().getValues();
+  if (rng.length < 2) return;
+  const h = rng[0], H = _hdr(h);
+
+  const isRetryable = s => /^ERR_(?:RATE|5|NET|FETCH|PARSE|4XX|ESI)$/i.test(String(s || ''));
+  const now = new Date();
+  const inProgCutoff = Date.now() - 5 * 60 * 1000; // retry IN_PROGRESS older than 5m
+
+  const q = [];
+  for (let r = 1; r < rng.length && q.length < limit; r++) {
+    const row = rng[r]; row.__rowNumber = r + 1;
+    const st = String(row[H.status] || '').toUpperCase();
+    const ts = (row[H.last_updated] instanceof Date) ? row[H.last_updated].getTime() : 0;
+    if (isRetryable(st) || (st === 'IN_PROGRESS' && (!ts || ts < inProgCutoff))) q.push(row);
+  }
+  if (!q.length) return;
+
+  const COLS = sh.getLastColumn();
+  const byRegion = _groupBy(q, r => String(r[H.region_id]));
+  const write = (rows) => rows.forEach(u => sh.getRange(u.rowNumber, 1, 1, COLS).setValues([u.values]));
+
+  for (const reg of Object.keys(byRegion)) {
+    const rows = byRegion[reg];
+    for (let i = 0; i < rows.length; i += chunk) {
+      const part = rows.slice(i, i + chunk);
+      const typeIds = part.map(r => Number(r[H.type_id]));
+      let res;
+
+      try { res = fetchHistoryBatchGESI_(+reg, typeIds); }
+      catch (e) {
+        (LoggerEx?.warn || console.warn)('[ESI][retry] batch threw; region=' + reg + ' msg=' + (e && e.message));
+        write(part.map(row => ({ rowNumber: row.__rowNumber, values: _rowWriteValues(row, H, { last_updated: now, status: 'ERR_5XX' }, true) })));
+        continue;
+      }
+
+      const updates = [];
+      part.forEach((row, idx) => {
+        const rec = Array.isArray(res) ? res[idx] : null;
+        if (rec && rec.status === 'OK') {
+          updates.push({
+            rowNumber: row.__rowNumber, values: _rowWriteValues(row, H, {
+              volume30_region: rec.vol30, velocity_region: rec.vel, last_updated: now, status: 'OK'
+            }, false)
+          });
+        } else {
+          const status = (rec && rec.status) ? rec.status : 'ERR_FETCH';
+          updates.push({ rowNumber: row.__rowNumber, values: _rowWriteValues(row, H, { last_updated: now, status }, true) });
+        }
+      });
+      write(updates);
+    }
+  }
+  try { publishMarketResultESIRegion(); } catch (_) { }
+}
+
+/* tiny local utils matching your existing style */
+function _cfg(cfg, key, def) {
+  if (cfg && cfg[key] != null && cfg[key] !== "") return cfg[key];
+  try { const v = PropertiesService.getScriptProperties().getProperty(key); if (v != null && v !== "") return v; } catch (_) { }
+  return def;
+}
+function _hdr(row) { const m = {}; row.forEach((h, i) => m[String(h).trim()] = i); return m; }
+function _groupBy(arr, keyFn) { const m = {}; arr.forEach(x => { const k = String(keyFn(x)); (m[k] || (m[k] = [])).push(x); }); return m; }
+function _rowWriteValues(row, H, patch, preserveComputed) {
+  const v = row.slice();
+  if (!preserveComputed) {
+    if (patch.volume30_region != null) v[H.volume30_region] = patch.volume30_region;
+    if (patch.velocity_region != null) v[H.velocity_region] = patch.velocity_region;
+  }
+  if (patch.last_updated != null) v[H.last_updated] = patch.last_updated;
+  if (patch.status != null) v[H.status] = patch.status;
+  return v;
+}
+function _compute30d(historyRows) {
+  if (!Array.isArray(historyRows) || !historyRows.length) return { vol30: 0, vel: 0 };
+  const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  let vol = 0;
+  for (let i = 0; i < historyRows.length; i++) {
+    const row = historyRows[i];
+    const d = new Date(row.date || row.day || row.Date || row.Day);
+    if (!isNaN(d) && d >= cutoff) vol += Number(row.volume || row.Volume || 0);
+  }
+  return { vol30: vol, vel: vol / 30 };
+}
+
+/* ============================ OPTIONAL TEST HOOKS ====================== */
+/** Manually open breaker for testing (minutes). */
+function ESI_breakerOpenFor(minutes) {
+  var m = Math.max(1, Number(minutes) || 1);
+  cbOpen_(m * 60000); // avoid 60_000
+}
+
+/** Close breaker and clear counters. */
+function ESI_breakerClose() { cbClose_(); }
+
+/** Is the breaker currently open? */
+function ESI_breakerIsOpen() {
+  return cbIsOpen_();
+}
+
+/** Inspect breaker status (remaining ms/mins + rolling fail window). */
+function ESI_breakerStatus() {
+  var p = PropertiesService.getScriptProperties();
+  var now = Date.now();
+  var until = +(p.getProperty(CB_PROP_UNTIL) || 0);
+  var msLeft = Math.max(0, until - now);
+  var fails  = +(p.getProperty(CB_PROP_FAILS) || 0);
+  var calls  = +(p.getProperty('esi_call_ct') || 0);
+  var failRate = calls ? (fails / calls) : 0;
+
+  var info = {
+    open: msLeft > 0,
+    ms_left: msLeft,
+    minutes_left: +(msLeft / 60000).toFixed(2),
+    window_fails: fails,
+    window_calls: calls,
+    window_fail_rate: +failRate.toFixed(3)
+  };
+  (LoggerEx?.log || console.log)('esi.breaker.status', info);
+  return info;
+}
+
