@@ -459,7 +459,7 @@ function dailyHeavyPrune_Prices() {
  * Note: This function remains swap-based for safety/atomicity during the deduplication process.
  */
 function _heavyPruneWorker() {
-  const LOG = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('PruneWorker') : console);
+  const LOG = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('PruneWorker') : console); // <-- Uses LOG
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const START_TIME = Date.now();
   
@@ -470,13 +470,13 @@ function _heavyPruneWorker() {
 
   // REFACTORED: Use strings directly
   let currentState = SCRIPT_PROP.getProperty(PRUNE_PROP_STEP) || "NEW_RUN";
-  LOG.info(`Starting worker. Current State: ${currentState}`);
+  LOG.info(`Starting worker. Current State: ${currentState}`); // <-- Uses LOG
 
   try {
     // --- State: NEW_RUN (Start) ---
     // REFACTORED: Use strings directly
     if (currentState === "NEW_RUN") {
-      LOG.info(`State: NEW_RUN. Preparing prune temp sheet.`);
+      LOG.info(`State: NEW_RUN. Preparing prune temp sheet.`); // <-- Uses LOG
       const docLock = LockService.getDocumentLock();
       if (docLock.tryLock(FUZZ_DOC_LOCK_TIMEOUT)) {
         try {
@@ -491,12 +491,12 @@ function _heavyPruneWorker() {
           // REFACTORED: Use strings directly
           currentState = "PROCESSING";
           SCRIPT_PROP.setProperty(PRUNE_PROP_STEP, currentState);
-          LOG.info(`Temp sheet '${tempSheetName}' prepared. Transitioning to ${currentState}.`);
+          LOG.info(`Temp sheet '${tempSheetName}' prepared. Transitioning to ${currentState}.`); // <-- Uses LOG
         } finally {
           docLock.releaseLock();
         }
       } else {
-        LOG_FUZZ.warn(`Document Lock busy during prune setup. Rescheduling.`);
+        LOG.warn(`Document Lock busy during prune setup. Rescheduling.`); // <-- Uses LOG
         scheduleOneTimeTrigger('_heavyPruneWorker', FUZZ_RESCHEDULE_MS);
         return;
       }
@@ -505,7 +505,7 @@ function _heavyPruneWorker() {
     // --- State: PROCESSING (Processing While Loop) ---
     // REFACTORED: Use strings directly
     if (currentState === "PROCESSING") {
-      LOG_FUZZ.info(`State: PROCESSING. Reading/deduping batches.`);
+      LOG.info(`State: PROCESSING. Reading/deduping batches.`); // <-- Uses LOG
       
       const sourceSheet = ss.getSheetByName(sourceSheetName);
       const tempSheet = ss.getSheetByName(tempSheetName);
@@ -536,7 +536,7 @@ function _heavyPruneWorker() {
         if (Date.now() - START_TIME > FUZZ_TIME_LIMIT_MS) {
           SCRIPT_PROP.setProperty(PRUNE_PROP_READ_ROW, readRow.toString());
           scheduleOneTimeTrigger('_heavyPruneWorker', FUZZ_RESCHEDULE_MS);
-          LOG_FUZZ.warn(`Time limit hit. Saved state. Rescheduled. Next read row: ${readRow}`);
+          LOG.warn(`Time limit hit. Saved state. Rescheduled. Next read row: ${readRow}`); // <-- Uses LOG
           return;
         }
 
@@ -544,7 +544,7 @@ function _heavyPruneWorker() {
         const rowsToRead = Math.min(PRUNE_BATCH_SIZE, lastRow - readRow + 1);
         if (rowsToRead <= 0) break; 
         
-        LOG_FUZZ.info(`Reading ${rowsToRead} rows from ${sourceSheetName} (starting row ${readRow})...`);
+        LOG.info(`Reading ${rowsToRead} rows from ${sourceSheetName} (starting row ${readRow})...`); // <-- Uses LOG
         const data = sourceSheet.getRange(readRow, 1, rowsToRead, header.length).getValues();
         
         // --- 3. Process Batch (Retention, Bucket, Dedupe) ---
@@ -588,13 +588,13 @@ function _heavyPruneWorker() {
           if (docLock.tryLock(FUZZ_DOC_LOCK_TIMEOUT)) {
             try {
               tempSheet.getRange(tempSheet.getLastRow() + 1, 1, rowsToWrite.length, rowsToWrite[0].length).setValues(rowsToWrite);
-              LOG_FUZZ.info(`Appended ${rowsToWrite.length} deduped rows to ${tempSheetName}.`);
+              LOG.info(`Appended ${rowsToWrite.length} deduped rows to ${tempSheetName}.`); // <-- Uses LOG
             } finally {
               docLock.releaseLock();
             }
           } else {
             // RETRIGGER ON WRITE FAILURE
-            LOG_FUZZ.warn(`Document Lock busy for prune write. Rescheduling (will re-process batch).`);
+            LOG.warn(`Document Lock busy for prune write. Rescheduling (will re-process batch).`); // <-- Uses LOG
             scheduleOneTimeTrigger('_heavyPruneWorker', FUZZ_RESCHEDULE_MS);
             return;
           }
@@ -608,16 +608,16 @@ function _heavyPruneWorker() {
 
       // --- Post-Loop Check ---
       if (readRow > lastRow) {
-        LOG_FUZZ.info("All source rows processed. Transitioning to FINALIZING.");
+        LOG.info("All source rows processed. Transitioning to FINALIZING."); // <-- Uses LOG
         // REFACTORED: Use strings directly
         currentState = "FINALIZING";
-        SCRIPT_PROP.setProperty(PRUNE_PROP_STEP, currentState);
+        SCRIPT_PROP.setProperty(HIST_PROP_STEP, currentState);
         scheduleOneTimeTrigger('_finalizePrune', 1000); // 1 sec delay
       }
     } // --- End PROCESSING ---
 
   } catch (e) {
-    LOG_FUZZ.error(`Unhandled error in prune worker: ${e.message}\nStack: ${e.stack}`);
+    LOG.error(`Unhandled error in prune worker: ${e.message}\nStack: ${e.stack}`); // <-- Uses LOG
     // Reset prune state on error
     SCRIPT_PROP.deleteProperty(PRUNE_PROP_STEP);
     SCRIPT_PROP.deleteProperty(PRUNE_PROP_READ_ROW);
