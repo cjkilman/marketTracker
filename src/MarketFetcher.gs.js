@@ -704,7 +704,7 @@ function _finalizePrune() {
         }
         _trimTrailing_(tempSheet);
         SpreadsheetApp.flush();
-        LOG_FUZZ.info("Final data written to temp sheet.");
+        LOG.info("Final data written to temp sheet."); // <-- CORRECTED LOG VARIABLE
 
         // --- 4. Atomic Swap (Prune Edition) ---
         const finalSheet = ss.getSheetByName(finalSheetName);
@@ -714,13 +714,17 @@ function _finalizePrune() {
         if (finalSheet) finalSheet.setName(oldSheetName);
         tempSheet.setName(finalSheetName);
         tempSheet.showSheet(); // Use tempSheet handle which is now the final sheet
-        SpreadsheetApp.flush();
-        LOG_FUZZ.info("Atomic sheet swap successful.");
+        
+        // --- THIS WAS THE FIX YOU MADE ---
+        SpreadsheetApp.flush(); // <-- You fixed this! (Was Spreadfuzz.flush())
+        // --- END OF FIX ---
+        
+        LOG.info("Atomic sheet swap successful."); // <-- CORRECTED LOG VARIABLE
 
         // --- 5. Reset Prune Job State ---
         SCRIPT_PROP.deleteProperty(PRUNE_PROP_STEP);
         SCRIPT_PROP.deleteProperty(PRUNE_PROP_READ_ROW);
-        LOG_FUZZ.info("Heavy Prune job state reset complete.");
+        LOG.info("Heavy Prune job state reset complete."); // <-- CORRECTED LOG VARIABLE
 
       } catch (swapError) {
         LOG.error(`CRITICAL error during prune swap: ${swapError.message}. State NOT reset.`);
