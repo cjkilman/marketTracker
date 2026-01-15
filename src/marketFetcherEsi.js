@@ -44,7 +44,7 @@ const PACER_MAX_MS = 5000;  // cap 5s between calls
 // Hard cap
 var ESI_TB_RATE_PER_MIN = 300;   // tokens added per minute
 var ESI_TB_BURST = 300;   // max token bucket
-var ESI_GROUP_SIZE = 25;    // requests per fetchAll group
+var ESI_GROUP_SIZE = 50;    // requests per fetchAll group
 var ESI_MICRO_BREATH_MS = 100;   // tiny pause between groups
 
 function tbConsume_(need) {
@@ -129,53 +129,81 @@ function mapGESIRespToResult_(resp, typeId) {
 function fetchHistoryBatchGESI_(regionId, typeIds) {
   var client = getGESIHistoryClient_();
   var out = [];
+  
+  // Start with the configured max size (e.g., 50)
+  // If we hit errors, we will lower this variable dynamically for this run.
+  var currentBatchSize = ESI_GROUP_SIZE; 
+  var i = 0;
 
-  for (var i = 0; i < typeIds.length; i += ESI_GROUP_SIZE) {
-    var ids = typeIds.slice(i, i + ESI_GROUP_SIZE);
+  while (i < typeIds.length) {
+    // 1. Slice the next batch based on current dynamic size
+    var end = Math.min(i + currentBatchSize, typeIds.length);
+    var ids = typeIds.slice(i, end);
 
-    // governor
+    // 2. Pay the rate-limit cost (Token Bucket)
     var wait = tbConsume_(ids.length);
     if (wait > 0) Utilities.sleep(Math.min(wait, 30000));
 
     var reqs = buildHistoryRequests_(client, regionId, ids);
     
-    // --- [START FIX] Retry logic for Bandwidth Quota ---
-    var resps;
-    var maxTries = 3;
-    for (var attempt = 1; attempt <= maxTries; attempt++) {
-      try {
-        resps = UrlFetchApp.fetchAll(reqs);
-        break; // Success, exit retry loop
-      } catch (e) {
-        // Only retry if it is a bandwidth/quota error and we have attempts left
-        var isBandwidth = String(e.message).includes('Bandwidth') || String(e.message).includes('quota');
-        if (attempt === maxTries || !isBandwidth) {
-          throw e; // Fatal error or out of retries
-        }
-        
-        // Backoff: 2s, 4s, etc. + random jitter
-        var sleepMs = 2000 * attempt + Math.floor(Math.random() * 500);
-        (LoggerEx?.warn || console.warn)('esi.bandwidth.retry', { attempt: attempt, sleep: sleepMs, region: regionId });
-        Utilities.sleep(sleepMs);
-      }
-    }
-    // --- [END FIX] ---
-
-    // log error-budget once per group when available
     try {
-      if (resps && resps.length > 0) {
-        var hdr = resps[0].getAllHeaders && resps[0].getAllHeaders();
-        var remain = +(hdr && (hdr['x-esi-error-limit-remain'] || hdr['X-Esi-Error-Limit-Remain']) || -1);
-        var reset = +(hdr && (hdr['x-esi-error-limit-reset'] || hdr['X-Esi-Error-Limit-Reset']) || -1);
-        if (remain >= 0) (LoggerEx?.info || console.info)('esi.errbudget', { remain: remain, reset: reset });
-      }
-    } catch (_) { }
+      // 3. Attempt the fetch
+      var resps = UrlFetchApp.fetchAll(reqs);
 
-    for (var k = 0; k < resps.length; k++) {
-      out.push(mapGESIRespToResult_(resps[k], ids[k]));
+      // --- Success Path ---
+      
+      // Log error budget (optional, using first response)
+      try {
+        if (resps.length > 0) {
+          var hdr = resps[0].getAllHeaders && resps[0].getAllHeaders();
+          var remain = +(hdr && (hdr['x-esi-error-limit-remain'] || hdr['X-Esi-Error-Limit-Remain']) || -1);
+          if (remain >= 0) (LoggerEx?.info || console.info)('esi.errbudget', { remain: remain });
+        }
+      } catch (_) { }
+
+      // Process results
+      for (var k = 0; k < resps.length; k++) {
+        out.push(mapGESIRespToResult_(resps[k], ids[k]));
+      }
+
+      // Advance the cursor by the ACTUAL number of items processed
+      i += ids.length; 
+      
+      // Optional: If we are running successfully at a low batch size, 
+      // you could slowly increment currentBatchSize here, but usually 
+      // it's safer to stay low once a run has proven unstable.
+      
+      Utilities.sleep(ESI_MICRO_BREATH_MS);
+
+    } catch (e) {
+      // --- Error Path ---
+      var msg = String(e.message || "");
+      var isBandwidth = msg.includes("Bandwidth") || msg.includes("quota") || msg.includes("limit");
+
+      // If it's a bandwidth error and we can still reduce the size:
+      if (isBandwidth && currentBatchSize > 1) {
+        var oldSize = currentBatchSize;
+        // Dynamic Adjustment: Cut batch size in half
+        currentBatchSize = Math.max(1, Math.floor(currentBatchSize / 2));
+        
+        (LoggerEx?.warn || console.warn)('esi.bandwidth.adapt', {
+           msg: "Bandwidth limit hit. Reducing batch size and retrying.",
+           oldSize: oldSize,
+           newSize: currentBatchSize,
+           index: i
+        });
+        
+        // Wait a moment for the quota bucket to drain
+        Utilities.sleep(3000);
+        
+        // LOOP REPEATS: We do NOT increment 'i', so we retry the same items with the smaller batch.
+      } else {
+        // Fatal error: Not bandwidth related, OR we are already at batch size 1
+        throw e;
+      }
     }
-    Utilities.sleep(ESI_MICRO_BREATH_MS);
   }
+  
   return out;
 }
 
