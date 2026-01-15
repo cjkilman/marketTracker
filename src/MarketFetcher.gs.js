@@ -68,12 +68,15 @@ function _resetFuzzMarketDataJobState(error) {
 /**
  * The core stateful worker function for fetching Fuzz data (APPEND-ONLY).
  */
+/**
+ * The core stateful worker function for fetching Fuzz data (APPEND-ONLY).
+ * MODIFIED: Added Capacity Guard to prevent 10M cell limit crashes.
+ */
 function _updateFuzzMarketDataWorker() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const START_TIME = Date.now();
 
   // --- State Initialization & Validation ---
-  // REFACTORED: Use strings directly, remove STATE_FLAGS dependency
   let currentState = SCRIPT_PROP.getProperty(FUZZ_PROP_STEP) || "NEW_RUN";
   LOG_FUZZ.info(`Starting worker. Current State: ${currentState}`);
 
@@ -92,17 +95,14 @@ function _updateFuzzMarketDataWorker() {
   }
   // --- End Lease Management ---
 
-
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let finalSheet = null; // Changed from tempSheet
+  let finalSheet = null; 
 
   try {
-    // --- State: NEW_RUN (Setup Phase - Conditional Initialization) ---
-    // REFACTORED: Use strings directly, remove STATE_FLAGS dependency
+    // --- State: NEW_RUN (Setup Phase) ---
     if (currentState === "NEW_RUN") {
       LOG_FUZZ.info(`State: NEW_RUN. Preparing final sheet for append.`);
 
-      // Use Document Lock for concurrency during setup
       const docLock = LockService.getDocumentLock();
       if (docLock.tryLock(FUZZ_DOC_LOCK_TIMEOUT)) {
         try {
@@ -110,23 +110,18 @@ function _updateFuzzMarketDataWorker() {
           finalSheet = ss.getSheetByName(FUZZ_SHEET_FINAL);
 
           if (isColdStart || !finalSheet) {
-            // First time run or sheet was manually deleted: use getOrCreateSheet to guarantee headers
             finalSheet = getOrCreateSheet(ss, FUZZ_SHEET_FINAL, FUZZ_SHEET_HEADERS);
             SCRIPT_PROP.setProperty(FUZZ_PROP_INIT, 'TRUE');
             LOG_FUZZ.info("COLD START: Sheet created/headers guaranteed.");
           } else {
-            // Subsequent run: use existing sheet handle
             LOG_FUZZ.info("WARM START: Using existing sheet for append.");
           }
           
           SpreadsheetApp.flush(); 
 
-          // Initialize state for processing
           SCRIPT_PROP.setProperty(FUZZ_PROP_INDEX, '0');
-          // Start appending at the very next empty row
           SCRIPT_PROP.setProperty(FUZZ_PROP_ROW, finalSheet.getLastRow() + 1); 
           
-          // REFACTORED: Use strings directly
           currentState = "PROCESSING";
           SCRIPT_PROP.setProperty(FUZZ_PROP_STEP, currentState);
           LOG_FUZZ.info(`Sheet '${FUZZ_SHEET_FINAL}' prepared. Next append row: ${finalSheet.getLastRow() + 1}. Transitioning to ${currentState}.`);
@@ -137,19 +132,17 @@ function _updateFuzzMarketDataWorker() {
       } else {
         LOG_FUZZ.warn(`Document Lock busy during setup. Rescheduling.`);
         scheduleOneTimeTrigger('updateFuzzMarketDataSheet', FUZZ_RESCHEDULE_MS);
-        return; // Reschedule and exit
+        return; 
       }
-    } // --- End NEW_RUN ---
-
+    } 
 
     // --- State: PROCESSING ---
-    // REFACTORED: Use strings directly
     if (currentState === "PROCESSING") {
       LOG_FUZZ.info(`State: PROCESSING. Fetching and writing batches.`);
 
       let requestStartIndex = parseInt(SCRIPT_PROP.getProperty(FUZZ_PROP_INDEX) || '0');
       let nextWriteRow = parseInt(SCRIPT_PROP.getProperty(FUZZ_PROP_ROW) || '2');
-      const allMarketRequests = getMasterMarketRequests(); // Get full list each time
+      const allMarketRequests = getMasterMarketRequests(); 
 
       if (!allMarketRequests || allMarketRequests.length === 0) {
         LOG_FUZZ.warn("Master request list is empty. Resetting job.");
@@ -157,7 +150,7 @@ function _updateFuzzMarketDataWorker() {
         return;
       }
 
-      finalSheet = ss.getSheetByName(FUZZ_SHEET_FINAL); // Ensure we have the sheet object
+      finalSheet = ss.getSheetByName(FUZZ_SHEET_FINAL);
       if (!finalSheet) {
         throw new Error(`Sheet '${FUZZ_SHEET_FINAL}' missing during PROCESSING phase.`);
       }
@@ -172,7 +165,7 @@ function _updateFuzzMarketDataWorker() {
           SCRIPT_PROP.setProperty(FUZZ_PROP_ROW, nextWriteRow.toString());
           scheduleOneTimeTrigger('updateFuzzMarketDataSheet', FUZZ_RESCHEDULE_MS);
           LOG_FUZZ.warn(`Time limit hit after ${batchesProcessedThisRun} batches. Saved state. Rescheduled.`);
-          return; // Exit current execution
+          return; 
         }
 
         // --- Prepare Batch & Group ---
@@ -196,38 +189,26 @@ function _updateFuzzMarketDataWorker() {
         const rowsToWrite = [];
         let fetchErrorOccurred = false;
 
-        Object.values(groupedRequests).forEach(({
-          market_id,
-          market_type,
-          typeIDs
-        }) => {
+        Object.values(groupedRequests).forEach(({ market_id, market_type, typeIDs }) => {
           try {
-            // This function now returns the full fuzObject map
             const prices = getMarketPrices(typeIDs, market_id, market_type); 
             
             typeIDs.forEach(type_id => {
-              // 'e' is now the full fuzObject, or an empty object
               const fuzObject = prices[type_id] || {};
-              
-              // --- REFACTORED: Access nested structure ---
               const sell = fuzObject.sell || {};
               const buy = fuzObject.buy || {};
               
-              // --- REFACTORED: 0-ORDER-COUNT CHECK (using nested structure) ---
-              // Check if both buy and sell order counts are 0 or undefined/null
               const totalOrderCount = (buy.orderCount || 0) + (sell.orderCount || 0);
               
               if (totalOrderCount > 0) {
-                // Only push if there are orders
                 rowsToWrite.push([
                   now, market_id, market_type, type_id, 
-                  sell.min ?? null,   // Was e.minSell
-                  buy.max ?? null,    // Was e.maxBuy
-                  sell.median ?? null,// Was e.medianSell
-                  buy.median ?? null  // Was e.medianBuy
+                  sell.min ?? null, 
+                  buy.max ?? null, 
+                  sell.median ?? null,
+                  buy.median ?? null
                 ]);
               }
-              // --- END REFACTORED CHECK ---
             });
           } catch (apiError) {
             LOG_FUZZ.error(`API error for ${market_type}:${market_id} (items: ${typeIDs.length}): ${apiError.message}`);
@@ -240,7 +221,53 @@ function _updateFuzzMarketDataWorker() {
           const docLock = LockService.getDocumentLock();
           if (docLock.tryLock(FUZZ_DOC_LOCK_TIMEOUT)) {
             try {
-              // Write directly to the final sheet, starting at the calculated nextWriteRow
+              // =================================================================
+              // [NEW] CAPACITY GUARD: Prevents 10M cell limit crash
+              // =================================================================
+              const SAFETY_BUFFER = 50000;
+              const MAX_CELLS = 10000000;
+              
+              // 1. Calculate Capacity
+              const allSheets = ss.getSheets();
+              let totalCells = allSheets.reduce((sum, s) => sum + (s.getMaxRows() * s.getMaxColumns()), 0);
+              const cellsNeeded = rowsToWrite.length * FUZZ_SHEET_HEADERS.length;
+              
+              // 2. Emergency Trim if needed
+              if (totalCells + cellsNeeded > MAX_CELLS - SAFETY_BUFFER) {
+                LOG_FUZZ.warn(`CRITICAL CAPACITY (${totalCells} cells). Attempting EMERGENCY TRIM of empty rows.`);
+                
+                allSheets.forEach(s => {
+                  try {
+                    const lastRow = s.getLastRow(); // Last row with actual content
+                    const maxRow = s.getMaxRows();
+                    const lastCol = s.getLastColumn();
+                    const maxCol = s.getMaxColumns();
+
+                    // Trim Rows (leave 10 buffer)
+                    if (maxRow > lastRow + 10) {
+                      s.deleteRows(lastRow + 10, maxRow - lastRow - 10);
+                    }
+                    // Trim Columns (leave 1 buffer, only if safe)
+                    if (maxCol > lastCol + 1 && maxCol > 5) { // Don't trim tiny sheets too aggressively
+                      s.deleteColumns(lastCol + 2, maxCol - lastCol - 1);
+                    }
+                  } catch(e) { /* ignore errors on individual sheets */ }
+                });
+                SpreadsheetApp.flush();
+
+                // 3. Re-Check
+                totalCells = ss.getSheets().reduce((sum, s) => sum + (s.getMaxRows() * s.getMaxColumns()), 0);
+                if (totalCells + cellsNeeded > MAX_CELLS) {
+                   throw new Error(`Workbook capacity exceeded (10M cells). Emergency trim insufficient. Current: ${totalCells}`);
+                } else {
+                   LOG_FUZZ.info(`Emergency trim successful. New cell count: ${totalCells}`);
+                }
+              }
+              // =================================================================
+              // [END] CAPACITY GUARD
+              // =================================================================
+
+              // Write directly to the final sheet
               const range = finalSheet.getRange(nextWriteRow, 1, rowsToWrite.length, FUZZ_SHEET_HEADERS.length);
               range.setValues(rowsToWrite);
               nextWriteRow += rowsToWrite.length;
@@ -248,10 +275,10 @@ function _updateFuzzMarketDataWorker() {
               LOG_FUZZ.info(`Batch append success. ${rowsToWrite.length} rows written. Next row: ${nextWriteRow}`);
             } catch (writeError) {
               LOG_FUZZ.error(`Error during batch write: ${writeError.message}. Rescheduling.`);
-              SCRIPT_PROP.setProperty(FUZZ_PROP_INDEX, requestStartIndex.toString()); // Save current index
-              SCRIPT_PROP.setProperty(FUZZ_PROP_ROW, nextWriteRow.toString()); // Save potentially advanced row
+              SCRIPT_PROP.setProperty(FUZZ_PROP_INDEX, requestStartIndex.toString()); 
+              SCRIPT_PROP.setProperty(FUZZ_PROP_ROW, nextWriteRow.toString()); 
               scheduleOneTimeTrigger('updateFuzzMarketDataSheet', FUZZ_RESCHEDULE_MS);
-              throw writeError; // Re-throw to ensure finally block runs and exits
+              throw writeError; 
             } finally {
               docLock.releaseLock();
             }
@@ -260,7 +287,7 @@ function _updateFuzzMarketDataWorker() {
             SCRIPT_PROP.setProperty(FUZZ_PROP_INDEX, requestStartIndex.toString());
             SCRIPT_PROP.setProperty(FUZZ_PROP_ROW, nextWriteRow.toString());
             scheduleOneTimeTrigger('updateFuzzMarketDataSheet', FUZZ_RESCHEDULE_MS);
-            return; // Exit
+            return; 
           }
         } else if (!fetchErrorOccurred) {
           LOG_FUZZ.info(`No data returned/to write for batch indices ${requestStartIndex}-${requestEndIndex - 1}. Advancing.`);
@@ -269,16 +296,14 @@ function _updateFuzzMarketDataWorker() {
         // --- Advance Index Only After Successful Handling ---
         requestStartIndex = requestEndIndex;
         SCRIPT_PROP.setProperty(FUZZ_PROP_INDEX, requestStartIndex.toString());
-        SCRIPT_PROP.setProperty(FUZZ_PROP_ROW, nextWriteRow.toString()); // Save row progress too
+        SCRIPT_PROP.setProperty(FUZZ_PROP_ROW, nextWriteRow.toString()); 
 
       } // --- End while loop ---
 
       // --- Post-Loop Check (Completion) ---
       if (requestStartIndex >= allMarketRequests.length) {
         LOG_FUZZ.info("All batches processed. Job Complete.");
-        // REFACTORED: Use strings directly
         currentState = "COMPLETE";
-        // Reset job state immediately upon successful completion
         _resetFuzzMarketDataJobState(null);
       }
 
@@ -474,29 +499,44 @@ function _heavyPruneWorker() {
 
   try {
     // --- State: NEW_RUN (Start) ---
-    // REFACTORED: Use strings directly
+  // REFACTORED: Use strings directly
     if (currentState === "NEW_RUN") {
-      LOG.info(`State: NEW_RUN. Preparing prune temp sheet.`); // <-- Uses LOG
+      LOG.info(`State: NEW_RUN. Preparing prune temp sheet.`); 
       const docLock = LockService.getDocumentLock();
       if (docLock.tryLock(FUZZ_DOC_LOCK_TIMEOUT)) {
         try {
-          const tempSheet = getOrCreateSheet(ss, tempSheetName, FUZZ_SHEET_HEADERS);
-          if (tempSheet.getLastRow() > 1) {
-            tempSheet.getRange(2, 1, tempSheet.getLastRow() - 1, tempSheet.getMaxColumns()).clearContent();
+          // [FIX] Aggressively delete old sheets to free space BEFORE creating new ones
+          const oldSheetName = FUZZ_SHEET_FINAL + "_Prune_Old";
+          const oldSheet = ss.getSheetByName(oldSheetName);
+          if (oldSheet) {
+             LOG.info(`Deleting old backup sheet to free space: ${oldSheetName}`);
+             ss.deleteSheet(oldSheet);
           }
+          
+          const existingTemp = ss.getSheetByName(tempSheetName);
+          if (existingTemp) {
+             LOG.info(`Deleting stale temp sheet to free space: ${tempSheetName}`);
+             ss.deleteSheet(existingTemp);
+          }
+          SpreadsheetApp.flush(); // Ensure deletion is committed before insertion
+          // [END FIX]
+
+          const tempSheet = getOrCreateSheet(ss, tempSheetName, FUZZ_SHEET_HEADERS);
+          // (No need to clear content since we just deleted and recreated it)
+          
           tempSheet.hideSheet();
           SpreadsheetApp.flush();
 
           SCRIPT_PROP.setProperty(PRUNE_PROP_READ_ROW, '2'); // Data starts row 2
-          // REFACTORED: Use strings directly
+          
           currentState = "PROCESSING";
           SCRIPT_PROP.setProperty(PRUNE_PROP_STEP, currentState);
-          LOG.info(`Temp sheet '${tempSheetName}' prepared. Transitioning to ${currentState}.`); // <-- Uses LOG
+          LOG.info(`Temp sheet '${tempSheetName}' prepared. Transitioning to ${currentState}.`); 
         } finally {
           docLock.releaseLock();
         }
       } else {
-        LOG.warn(`Document Lock busy during prune setup. Rescheduling.`); // <-- Uses LOG
+        LOG.warn(`Document Lock busy during prune setup. Rescheduling.`); 
         scheduleOneTimeTrigger('_heavyPruneWorker', FUZZ_RESCHEDULE_MS);
         return;
       }
@@ -611,7 +651,7 @@ function _heavyPruneWorker() {
         LOG.info("All source rows processed. Transitioning to FINALIZING."); // <-- Uses LOG
         // REFACTORED: Use strings directly
         currentState = "FINALIZING";
-        SCRIPT_PROP.setProperty(HIST_PROP_STEP, currentState);
+        SCRIPT_PROP.setProperty(PRUNE_PROP_STEP, currentState);
         scheduleOneTimeTrigger('_finalizePrune', 1000); // 1 sec delay
       }
     } // --- End PROCESSING ---
@@ -772,4 +812,33 @@ function _resetHeavyPruneJobState(error) {
     LOG.error(`Error deleting script properties: ${propError.message}`);
   }
   LOG.info("Heavy Prune job state reset complete.");
+}
+
+/**
+ * ONE-TIME UTILITY: Run this manually to free up cell space.
+ * Deletes old backup/temp sheets that may be clogging the workbook.
+ */
+function emergencyCleanup() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheetsToDelete = [
+    'Market Prices_Prune_Old',  // Old backup from previous swaps
+    'Market_Prices_Prune_Temp'  // Stale temp sheet from failed runs
+  ];
+  
+  sheetsToDelete.forEach(name => {
+    const sheet = ss.getSheetByName(name);
+    if (sheet) {
+      console.log(`Deleting sheet to free space: ${name}`);
+      ss.deleteSheet(sheet);
+    } else {
+      console.log(`Sheet not found (clean): ${name}`);
+    }
+  });
+
+  // Also trim empty rows from the main sheet
+  const mainSheet = ss.getSheetByName('Market Prices');
+  if (mainSheet) {
+    console.log('Trimming trailing empty rows from Market Prices...');
+    _trimTrailing_(mainSheet); 
+  }
 }

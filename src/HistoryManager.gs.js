@@ -36,7 +36,8 @@ function _hmCfg() {
     const s = String(v == null ? '' : v).trim().toUpperCase();
     return s === 'TRUE' ? true : (s === 'FALSE' ? false : d);
   };
-  const retentionDays = num(c["HistoryRetentionDays"], num(c["HistoryDaysLimit"], 365));
+  const cutoff = new Date(Date.now() - historyRetentionDays * 86400000);
+let finalData = data.filter(r => r[3] instanceof Date && r[3] >= cutoff);
 
   return {
     sheets: {

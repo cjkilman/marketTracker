@@ -44,7 +44,7 @@ const PACER_MAX_MS = 5000;  // cap 5s between calls
 // Hard cap
 var ESI_TB_RATE_PER_MIN = 300;   // tokens added per minute
 var ESI_TB_BURST = 300;   // max token bucket
-var ESI_GROUP_SIZE = 50;    // requests per fetchAll group
+var ESI_GROUP_SIZE = 25;    // requests per fetchAll group
 var ESI_MICRO_BREATH_MS = 100;   // tiny pause between groups
 
 function tbConsume_(need) {
@@ -138,14 +138,37 @@ function fetchHistoryBatchGESI_(regionId, typeIds) {
     if (wait > 0) Utilities.sleep(Math.min(wait, 30000));
 
     var reqs = buildHistoryRequests_(client, regionId, ids);
-    var resps = UrlFetchApp.fetchAll(reqs);
+    
+    // --- [START FIX] Retry logic for Bandwidth Quota ---
+    var resps;
+    var maxTries = 3;
+    for (var attempt = 1; attempt <= maxTries; attempt++) {
+      try {
+        resps = UrlFetchApp.fetchAll(reqs);
+        break; // Success, exit retry loop
+      } catch (e) {
+        // Only retry if it is a bandwidth/quota error and we have attempts left
+        var isBandwidth = String(e.message).includes('Bandwidth') || String(e.message).includes('quota');
+        if (attempt === maxTries || !isBandwidth) {
+          throw e; // Fatal error or out of retries
+        }
+        
+        // Backoff: 2s, 4s, etc. + random jitter
+        var sleepMs = 2000 * attempt + Math.floor(Math.random() * 500);
+        (LoggerEx?.warn || console.warn)('esi.bandwidth.retry', { attempt: attempt, sleep: sleepMs, region: regionId });
+        Utilities.sleep(sleepMs);
+      }
+    }
+    // --- [END FIX] ---
 
     // log error-budget once per group when available
     try {
-      var hdr = resps[0].getAllHeaders && resps[0].getAllHeaders();
-      var remain = +(hdr && (hdr['x-esi-error-limit-remain'] || hdr['X-Esi-Error-Limit-Remain']) || -1);
-      var reset = +(hdr && (hdr['x-esi-error-limit-reset'] || hdr['X-Esi-Error-Limit-Reset']) || -1);
-      if (remain >= 0) (LoggerEx?.info || console.info)('esi.errbudget', { remain: remain, reset: reset });
+      if (resps && resps.length > 0) {
+        var hdr = resps[0].getAllHeaders && resps[0].getAllHeaders();
+        var remain = +(hdr && (hdr['x-esi-error-limit-remain'] || hdr['X-Esi-Error-Limit-Remain']) || -1);
+        var reset = +(hdr && (hdr['x-esi-error-limit-reset'] || hdr['X-Esi-Error-Limit-Reset']) || -1);
+        if (remain >= 0) (LoggerEx?.info || console.info)('esi.errbudget', { remain: remain, reset: reset });
+      }
     } catch (_) { }
 
     for (var k = 0; k < resps.length; k++) {
