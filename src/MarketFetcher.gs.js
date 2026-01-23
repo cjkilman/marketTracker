@@ -83,238 +83,116 @@ function _updateFuzzMarketDataWorker() {
   // --- Lease Management ---
   const leaseUntil = parseInt(SCRIPT_PROP.getProperty(FUZZ_PROP_LEASE) || '0', 10);
   if (START_TIME > leaseUntil) {
-    LOG_FUZZ.error(`Job lease expired or not set! Lease ended at ${new Date(leaseUntil)}. Resetting job state.`);
+    LOG_FUZZ.error(`Job lease expired. Resetting job state.`);
     _resetFuzzMarketDataJobState(new Error("Job lease expired"));
-    return; // Halt execution
+    return;
   }
-  // Extend lease if nearing expiry within this run
-  if (leaseUntil - START_TIME < 60000) { // Less than 1 min left
+  
+  // Extend lease if nearing expiry
+  if (leaseUntil - START_TIME < 60000) {
     const newLease = START_TIME + JOB_LEASE_DURATION_MS;
     SCRIPT_PROP.setProperty(FUZZ_PROP_LEASE, newLease.toString());
-    LOG_FUZZ.info(`Extended job lease until ${new Date(newLease)}`);
   }
-  // --- End Lease Management ---
-
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let finalSheet = null; 
 
   try {
-    // --- State: NEW_RUN (Setup Phase) ---
+    // --- State: NEW_RUN ---
     if (currentState === "NEW_RUN") {
-      LOG_FUZZ.info(`State: NEW_RUN. Preparing final sheet for append.`);
-
-      const docLock = LockService.getDocumentLock();
-      if (docLock.tryLock(FUZZ_DOC_LOCK_TIMEOUT)) {
-        try {
-          const isColdStart = !SCRIPT_PROP.getProperty(FUZZ_PROP_INIT);
-          finalSheet = ss.getSheetByName(FUZZ_SHEET_FINAL);
-
-          if (isColdStart || !finalSheet) {
-            finalSheet = getOrCreateSheet(ss, FUZZ_SHEET_FINAL, FUZZ_SHEET_HEADERS);
-            SCRIPT_PROP.setProperty(FUZZ_PROP_INIT, 'TRUE');
-            LOG_FUZZ.info("COLD START: Sheet created/headers guaranteed.");
-          } else {
-            LOG_FUZZ.info("WARM START: Using existing sheet for append.");
-          }
-          
-          SpreadsheetApp.flush(); 
-
-          SCRIPT_PROP.setProperty(FUZZ_PROP_INDEX, '0');
-          SCRIPT_PROP.setProperty(FUZZ_PROP_ROW, finalSheet.getLastRow() + 1); 
-          
-          currentState = "PROCESSING";
-          SCRIPT_PROP.setProperty(FUZZ_PROP_STEP, currentState);
-          LOG_FUZZ.info(`Sheet '${FUZZ_SHEET_FINAL}' prepared. Next append row: ${finalSheet.getLastRow() + 1}. Transitioning to ${currentState}.`);
-
-        } finally {
-          docLock.releaseLock();
-        }
-      } else {
-        LOG_FUZZ.warn(`Document Lock busy during setup. Rescheduling.`);
-        scheduleOneTimeTrigger('updateFuzzMarketDataSheet', FUZZ_RESCHEDULE_MS);
-        return; 
-      }
+      LOG_FUZZ.info(`State: NEW_RUN. Initializing indices for BigQuery stream.`);
+      SCRIPT_PROP.setProperty(FUZZ_PROP_INDEX, '0');
+      // Note: FUZZ_PROP_ROW is now just a count/log of items processed, not a sheet row.
+      SCRIPT_PROP.setProperty(FUZZ_PROP_ROW, '0'); 
+      currentState = "PROCESSING";
+      SCRIPT_PROP.setProperty(FUZZ_PROP_STEP, currentState);
     } 
 
     // --- State: PROCESSING ---
     if (currentState === "PROCESSING") {
-      LOG_FUZZ.info(`State: PROCESSING. Fetching and writing batches.`);
-
       let requestStartIndex = parseInt(SCRIPT_PROP.getProperty(FUZZ_PROP_INDEX) || '0');
-      let nextWriteRow = parseInt(SCRIPT_PROP.getProperty(FUZZ_PROP_ROW) || '2');
+      let totalProcessedCount = parseInt(SCRIPT_PROP.getProperty(FUZZ_PROP_ROW) || '0');
       const allMarketRequests = getMasterMarketRequests(); 
 
       if (!allMarketRequests || allMarketRequests.length === 0) {
-        LOG_FUZZ.warn("Master request list is empty. Resetting job.");
         _resetFuzzMarketDataJobState(new Error("Master request list empty"));
         return;
       }
 
-      finalSheet = ss.getSheetByName(FUZZ_SHEET_FINAL);
-      if (!finalSheet) {
-        throw new Error(`Sheet '${FUZZ_SHEET_FINAL}' missing during PROCESSING phase.`);
-      }
-
       let batchesProcessedThisRun = 0;
 
-      // --- Processing Loop ---
       while (requestStartIndex < allMarketRequests.length) {
         // --- Time Limit Check ---
         if (Date.now() - START_TIME > FUZZ_TIME_LIMIT_MS) {
           SCRIPT_PROP.setProperty(FUZZ_PROP_INDEX, requestStartIndex.toString());
-          SCRIPT_PROP.setProperty(FUZZ_PROP_ROW, nextWriteRow.toString());
+          SCRIPT_PROP.setProperty(FUZZ_PROP_ROW, totalProcessedCount.toString());
           scheduleOneTimeTrigger('updateFuzzMarketDataSheet', FUZZ_RESCHEDULE_MS);
-          LOG_FUZZ.warn(`Time limit hit after ${batchesProcessedThisRun} batches. Saved state. Rescheduled.`);
+          LOG_FUZZ.warn(`Time limit hit. Rescheduling at index ${requestStartIndex}`);
           return; 
         }
 
-        // --- Prepare Batch & Group ---
+        // --- Prepare Batch ---
         const requestEndIndex = Math.min(requestStartIndex + FUZZ_BATCH_SIZE, allMarketRequests.length);
         const requestsForThisRun = allMarketRequests.slice(requestStartIndex, requestEndIndex);
         const groupedRequests = {};
         requestsForThisRun.forEach(req => {
           const key = `${req.market_id}_${req.market_type}`;
-          if (!groupedRequests[key]) groupedRequests[key] = {
-            market_id: req.market_id,
-            market_type: req.market_type,
-            typeIDs: []
-          };
+          if (!groupedRequests[key]) groupedRequests[key] = { market_id: req.market_id, market_type: req.market_type, typeIDs: [] };
           groupedRequests[key].typeIDs.push(req.type_id);
         });
 
-        LOG_FUZZ.info(`Processing batch indices ${requestStartIndex}-${requestEndIndex - 1} (${requestsForThisRun.length} reqs, ${Object.keys(groupedRequests).length} markets).`);
-
-       // --- Fetch Data ---
+        // --- Fetch Data ---
         const now = new Date();
-        const rowsToWrite = [];
-        let fetchErrorOccurred = false;
-
+        const rowsToStream = [];
+        
         Object.values(groupedRequests).forEach(({ market_id, market_type, typeIDs }) => {
           try {
             const prices = getMarketPrices(typeIDs, market_id, market_type); 
-            
             typeIDs.forEach(type_id => {
               const fuzObject = prices[type_id] || {};
               const sell = fuzObject.sell || {};
               const buy = fuzObject.buy || {};
-              
-              const totalOrderCount = (buy.orderCount || 0) + (sell.orderCount || 0);
-              
-              if (totalOrderCount > 0) {
-                rowsToWrite.push([
+              if ((buy.orderCount || 0) + (sell.orderCount || 0) > 0) {
+                rowsToStream.push([
                   now, market_id, market_type, type_id, 
-                  sell.min ?? null, 
-                  buy.max ?? null, 
-                  sell.median ?? null,
-                  buy.median ?? null
+                  sell.min ?? null, buy.max ?? null, 
+                  sell.median ?? null, buy.median ?? null
                 ]);
               }
             });
           } catch (apiError) {
-            LOG_FUZZ.error(`API error for ${market_type}:${market_id} (items: ${typeIDs.length}): ${apiError.message}`);
-            fetchErrorOccurred = true;
+            LOG_FUZZ.error(`API error: ${apiError.message}`);
           }
         });
 
-        // --- Write Batch (Document Lock) ---
-        if (rowsToWrite.length > 0) {
-          const docLock = LockService.getDocumentLock();
-          if (docLock.tryLock(FUZZ_DOC_LOCK_TIMEOUT)) {
-            try {
-              // =================================================================
-              // [NEW] CAPACITY GUARD: Prevents 10M cell limit crash
-              // =================================================================
-              const SAFETY_BUFFER = 50000;
-              const MAX_CELLS = 10000000;
-              
-              // 1. Calculate Capacity
-              const allSheets = ss.getSheets();
-              let totalCells = allSheets.reduce((sum, s) => sum + (s.getMaxRows() * s.getMaxColumns()), 0);
-              const cellsNeeded = rowsToWrite.length * FUZZ_SHEET_HEADERS.length;
-              
-              // 2. Emergency Trim if needed
-              if (totalCells + cellsNeeded > MAX_CELLS - SAFETY_BUFFER) {
-                LOG_FUZZ.warn(`CRITICAL CAPACITY (${totalCells} cells). Attempting EMERGENCY TRIM of empty rows.`);
-                
-                allSheets.forEach(s => {
-                  try {
-                    const lastRow = s.getLastRow(); // Last row with actual content
-                    const maxRow = s.getMaxRows();
-                    const lastCol = s.getLastColumn();
-                    const maxCol = s.getMaxColumns();
-
-                    // Trim Rows (leave 10 buffer)
-                    if (maxRow > lastRow + 10) {
-                      s.deleteRows(lastRow + 10, maxRow - lastRow - 10);
-                    }
-                    // Trim Columns (leave 1 buffer, only if safe)
-                    if (maxCol > lastCol + 1 && maxCol > 5) { // Don't trim tiny sheets too aggressively
-                      s.deleteColumns(lastCol + 2, maxCol - lastCol - 1);
-                    }
-                  } catch(e) { /* ignore errors on individual sheets */ }
-                });
-                SpreadsheetApp.flush();
-
-                // 3. Re-Check
-                totalCells = ss.getSheets().reduce((sum, s) => sum + (s.getMaxRows() * s.getMaxColumns()), 0);
-                if (totalCells + cellsNeeded > MAX_CELLS) {
-                   throw new Error(`Workbook capacity exceeded (10M cells). Emergency trim insufficient. Current: ${totalCells}`);
-                } else {
-                   LOG_FUZZ.info(`Emergency trim successful. New cell count: ${totalCells}`);
-                }
-              }
-              // =================================================================
-              // [END] CAPACITY GUARD
-              // =================================================================
-
-              // Write directly to the final sheet
-              const range = finalSheet.getRange(nextWriteRow, 1, rowsToWrite.length, FUZZ_SHEET_HEADERS.length);
-              range.setValues(rowsToWrite);
-              nextWriteRow += rowsToWrite.length;
-              batchesProcessedThisRun++;
-              LOG_FUZZ.info(`Batch append success. ${rowsToWrite.length} rows written. Next row: ${nextWriteRow}`);
-            } catch (writeError) {
-              LOG_FUZZ.error(`Error during batch write: ${writeError.message}. Rescheduling.`);
-              SCRIPT_PROP.setProperty(FUZZ_PROP_INDEX, requestStartIndex.toString()); 
-              SCRIPT_PROP.setProperty(FUZZ_PROP_ROW, nextWriteRow.toString()); 
-              scheduleOneTimeTrigger('updateFuzzMarketDataSheet', FUZZ_RESCHEDULE_MS);
-              throw writeError; 
-            } finally {
-              docLock.releaseLock();
-            }
-          } else {
-            LOG_FUZZ.warn(`Document Lock busy for write. Saving state and rescheduling.`);
-            SCRIPT_PROP.setProperty(FUZZ_PROP_INDEX, requestStartIndex.toString());
-            SCRIPT_PROP.setProperty(FUZZ_PROP_ROW, nextWriteRow.toString());
+        // --- STREAM TO BIGQUERY ---
+        if (rowsToStream.length > 0) {
+          try {
+            // Calling the utility function we created earlier
+            streamToBigQuery(rowsToStream);
+            
+            totalProcessedCount += rowsToStream.length;
+            batchesProcessedThisRun++;
+          } catch (bqError) {
+            LOG_FUZZ.error(`BigQuery stream failed: ${bqError.message}. Retrying batch...`);
+            // We don't advance the index here so it retries on the next trigger
             scheduleOneTimeTrigger('updateFuzzMarketDataSheet', FUZZ_RESCHEDULE_MS);
-            return; 
+            return;
           }
-        } else if (!fetchErrorOccurred) {
-          LOG_FUZZ.info(`No data returned/to write for batch indices ${requestStartIndex}-${requestEndIndex - 1}. Advancing.`);
         }
 
-        // --- Advance Index Only After Successful Handling ---
+        // --- Advance State ---
         requestStartIndex = requestEndIndex;
         SCRIPT_PROP.setProperty(FUZZ_PROP_INDEX, requestStartIndex.toString());
-        SCRIPT_PROP.setProperty(FUZZ_PROP_ROW, nextWriteRow.toString()); 
+        SCRIPT_PROP.setProperty(FUZZ_PROP_ROW, totalProcessedCount.toString()); 
+      }
 
-      } // --- End while loop ---
-
-      // --- Post-Loop Check (Completion) ---
       if (requestStartIndex >= allMarketRequests.length) {
-        LOG_FUZZ.info("All batches processed. Job Complete.");
+        LOG_FUZZ.info("All data successfully pushed to BigQuery. Job Complete.");
         currentState = "COMPLETE";
         _resetFuzzMarketDataJobState(null);
       }
-
-    } // --- End PROCESSING ---
-
+    }
   } catch (e) {
-    LOG_FUZZ.error(`Unhandled error in worker: ${e.message}\nStack: ${e.stack}`);
+    LOG_FUZZ.error(`Unhandled error: ${e.message}`);
     _resetFuzzMarketDataJobState(e);
-  } finally {
-    const duration = (Date.now() - START_TIME) / 1000;
-    LOG_FUZZ.info(`Worker execution finished in ${duration.toFixed(2)}s. Final State: ${currentState}`);
   }
 }
 
@@ -339,11 +217,36 @@ function postTighten_(sh) {
 }
 
 function _trimTrailing_(sh) {
-  if (!sh) return; // Add guard clause
-  const used = sh.getLastRow();
-  const alloc = sh.getMaxRows();
-  const extra = alloc - used;
-  if (extra > 0) _deleteInBlocks_(sh, used + 1, extra);
+  if (!sh) return;
+  
+  const lastRow = sh.getLastRow();
+  const maxRows = sh.getMaxRows();
+  const lastCol = sh.getLastColumn();
+  const maxCols = sh.getMaxColumns();
+
+  // 1. Trim Rows (Existing logic)
+  const rowsToDelete = maxRows - (lastRow + 5);
+  if (rowsToDelete > 0) {
+    try {
+      _deleteInBlocks_(sh, lastRow + 6, rowsToDelete);
+      console.log(`[CLEANUP] Trimmed ${rowsToDelete} rows from ${sh.getName()}`);
+    } catch (e) {
+      console.error(`Error trimming rows: ${e.message}`);
+    }
+  }
+
+  // 2. Trim Columns (NEW - Crucial for cell limit)
+  // Sheets default to 26 columns (A-Z). EVE data only needs ~8-10.
+  // Trimming 15 columns from a 500k row sheet frees 7.5 million cells.
+  const colsToDelete = maxCols - (lastCol + 1);
+  if (colsToDelete > 0 && maxCols > 5) {
+    try {
+      sh.deleteColumns(lastCol + 2, colsToDelete);
+      console.log(`[CLEANUP] Trimmed ${colsToDelete} columns from ${sh.getName()}`);
+    } catch (e) {
+      console.error(`Error trimming columns: ${e.message}`);
+    }
+  }
 }
 
 function _deleteInBlocks_(sh, startRow, count) {
