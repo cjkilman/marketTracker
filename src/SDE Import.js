@@ -142,78 +142,35 @@ const sdeLib = () => {
   };
 
  /**
-   * ROBUST CSVToArray with Silent Published Filter
-   * Filters on the Input side to generate clean output files.
-   */
-  const CSVToArray = (strData, strDelimiter = ",", headers = null, publishedOnly = true) => {
-    if (!strData || strData.trim().length === 0) return [];
+ * ROBUST CSVToArray with Marketability Filter
+ */
+const CSVToArray = (strData, strDelimiter = ",", headers = null, publishedOnly = true) => {
+  // ... existing setup logic ...
+  
+  const publishIdx = rawHeaders.indexOf("published");
+  const marketGroupIdx = rawHeaders.indexOf("marketGroupID"); // ADD THIS
 
-    // Use Google's built-in parser
-    const allLines = Utilities.parseCsv(strData, strDelimiter.charCodeAt(0));
-    if (allLines.length === 0) return [];
-
-    const rawHeaders = allLines[0].map(h => h.trim());
+  for (let i = 1; i < allLines.length; i++) {
+    const cols = allLines[i];
     
-    // 1. Identify the 'published' column index
-    const publishIdx = rawHeaders.indexOf("published");
-
-    let arrData = [];
-    let headersIndex = [];
-    const skipHeaders = !headers || !headers.length || !headers[0];
-
-    // 2. Map requested output headers
-    if (!skipHeaders) {
-      const outputHeaders = [];
-      for (const requestedHeader of headers) {
-        const index = rawHeaders.indexOf(requestedHeader);
-        if (index !== -1) {
-          headersIndex.push(index);
-          outputHeaders.push(requestedHeader);
-        }
-      }
-      arrData.push(outputHeaders);
-    } else {
-      headersIndex = rawHeaders.map((_, i) => i);
-      arrData.push(rawHeaders);
+    // --- GATE 1: Published Status ---
+    if (publishedOnly === true && publishIdx !== -1) {
+      const pubValue = String(cols[publishIdx]).trim();
+      if (pubValue !== '1' && pubValue.toLowerCase() !== 'true') continue;
     }
 
-    const expectedLength = arrData[0].length;
-
-    // 3. Process Rows with Input-Side Filtering
-    for (let i = 1; i < allLines.length; i++) {
-      const cols = allLines[i];
-      if (cols.length < rawHeaders.length) continue;
-
-      /**
-       * SILENT FILTER LOGIC:
-       * If publishedOnly is true AND the column exists in the input file:
-       * Drop any row that isn't '1' or 'true'.
-       */
-      if (publishedOnly === true && publishIdx !== -1) {
-        const pubValue = String(cols[publishIdx]).trim();
-        if (pubValue !== '1' && pubValue.toLowerCase() !== 'true') {
-          continue; // Skip unpublished junk
-        }
-      }
-
-      let row = [];
-      for (const indexToKeep of headersIndex) {
-        let val = (cols[indexToKeep] || "").trim();
-        
-        // Basic Type Conversion
-        if (!isNaN(val) && val !== '') {
-          val = val.includes('.') ? parseFloat(val) : parseInt(val, 10);
-        }
-        row.push(val);
-      }
-
-      if (row.length === expectedLength) {
-        arrData.push(row);
+    // --- GATE 2: Marketability (The "Anti-Junk" Filter) ---
+    if (marketGroupIdx !== -1) {
+      const mgValue = String(cols[marketGroupIdx]).trim();
+      // Drop items that are null, empty, or '0' (meaning not on the market)
+      if (mgValue === "" || mgValue.toLowerCase() === "null" || mgValue === "0") {
+        continue; 
       }
     }
 
-    return arrData;
-  };
+    // ... proceed to add row ...
+  }
+}
 
   // ==================================================================
   // --- END OF REPLACEMENT ---

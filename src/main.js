@@ -21,8 +21,12 @@ function onOpen() {
 
 function GET_SDE_CONFIG() {
   return [
-    { name: "SDE_invTypes", file: "invTypes.csv", cols: ["typeID", "groupID", "typeName", "volume", "marketGroupID", "published"] },
-    { name: "SDE_mapDenormalize", file: "mapDenormalize.csv", cols: ["itemID", "typeID", "groupID", "solarSystemID", "itemName"] }
+    { 
+      name: "SDE_invTypes", 
+      file: "invTypes.csv", 
+      cols: ["typeID", "groupID", "typeName", "volume", "marketGroupID", "published"] ,
+      published: true
+    }
   ];
 }
 

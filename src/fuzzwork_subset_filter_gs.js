@@ -182,7 +182,61 @@ function normalizeConfig_(raw){
 }
 
 // ----------------------------- Sheet helpers ----------------------------------
+/**
+ * REFACTORED: Dynamic Request Discovery.
+ * Pulls all published Type IDs from SDE_invTypes and maps them 
+ * to the active markets in 'Market Settings'.
+ */
+function getMasterMarketRequests() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  // 1. PULL PUBLISHED TYPES FROM SDE
+  const sdeSheet = ss.getSheetByName("SDE_invTypes");
+  if (!sdeSheet) {
+    console.error("Discovery Failed: SDE_invTypes sheet not found.");
+    return [];
+  }
+  
+  const sdeData = sdeSheet.getDataRange().getValues();
+  const sdeHeader = sdeData[0].map(h => String(h).toLowerCase());
+  const typeIdx = sdeHeader.indexOf("typeid");
+  const pubIdx = sdeHeader.indexOf("published");
 
+  // Filter for published items only
+  const publishedTypeIDs = sdeData.slice(1)
+    .filter(row => row[pubIdx] == 1 || row[pubIdx] === true)
+    .map(row => row[typeIdx]);
+
+  // 2. PULL MARKETS FROM SETTINGS
+  const settingsSheet = ss.getSheetByName("Market Settings");
+  if (!settingsSheet) {
+    console.error("Discovery Failed: Market Settings sheet not found.");
+    return [];
+  }
+  
+  const settingsData = settingsSheet.getDataRange().getValues();
+  // Assume Market Settings has columns like: #, Hub Name, Station, System, Region
+  // We want to pull System (Col 5) or Region (Col 6) depending on your config
+  const activeMarkets = settingsData.slice(1).map(row => ({
+    system_id: row[4], // Adjust index based on your actual sheet columns
+    region_id: row[5]
+  })).filter(m => m.system_id || m.region_id);
+
+  // 3. COMBINE: Cartesian Product (Types x Markets)
+  const masterList = [];
+  activeMarkets.forEach(market => {
+    publishedTypeIDs.forEach(typeID => {
+      masterList.push({
+        market_id: market.system_id || market.region_id,
+        market_type: market.system_id ? 'system' : 'region',
+        type_id: typeID
+      });
+    });
+  });
+
+  console.log(`[DISCOVERY] Generated ${masterList.length} market requests from SDE data.`);
+  return masterList;
+}
 
 function writeTableChunked_(sheetName, table, chunkRows) {
   const sh = getOrCreateSheet_(sheetName);
