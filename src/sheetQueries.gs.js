@@ -1,39 +1,77 @@
-function refreshFilteredPrices() {
+/**
+ * MASTER DISPATCHER: Rotates through all listed market-pull sheets.
+ * Hook this to your 30-minute trigger.
+ */
+function masterMarketRefresh() {
+  const SCRIPT_PROP = PropertiesService.getScriptProperties();
+  const NOW_MS = Date.now();
+
+  // 1. ORCHESTRATOR LEASE CHECK (Check once for the whole fleet)
+  const leaseUntil = parseInt(SCRIPT_PROP.getProperty('fuzzJobLeaseUntil') || '0', 10);
+  if (NOW_MS < leaseUntil) {
+    console.warn(`[ORCHESTRATOR] Engine Busy until ${new Date(leaseUntil).toLocaleTimeString()}. Skipping refresh cycle.`);
+    return;
+  }
+
+  // 2. THE FLEET: List every sheet that uses the C4/D4/A7 layout
+  const marketSheets = [
+    'filtered prices', 
+    'Mineral Supply Prices', 
+    'T1 Supply Prices',
+  ];
+
+// 3. ROTATE AND REFRESH
+  marketSheets.forEach(sheetName => {
+    try {
+      refreshFilteredPrices(sheetName);
+      SpreadsheetApp.flush(); // Force the write to finish
+      Utilities.sleep(500);   // Tiny gap to keep the UI snappy
+    } catch (e) {
+      console.error(`[CRITICAL] Failed to refresh sheet "${sheetName}": ${e.message}`);
+    }
+  });
+}
+
+/**
+ * WORKER: Hardened BigQuery Puller for a specific sheet.
+ * Now acts as a modular unit for the Dispatcher.
+ */
+function refreshFilteredPrices(targetSheetName) {
+  const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const projectId = 'tenacious-tiger-345318';
-  const targetSheetName = 'filtered prices';
+  
+  // Default to main sheet if called manually without an argument
+  if (!targetSheetName) targetSheetName = 'filtered prices';
+  
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(targetSheetName);
-  
-  // 1. Get criteria from the sheet
+
+  if (!sheet) {
+    console.warn(`[SKIP] Sheet "${targetSheetName}" not found in workbook.`);
+    return;
+  }
+
+  // --- 1. INPUT GATING (Handle ImportRange Failures) ---
   const marketId = sheet.getRange("C4").getValue();
   const marketType = sheet.getRange("D4").getValue();
 
-  // --- NEW GATE: Validate ImportRange Inputs ---
-  console.log(`[GATE CHECK] Market ID: "${marketId}" | Market Type: "${marketType}"`);
+  // Validate inputs: Abort if #N/A or Loading
+  const isIdValid = marketId && !isNaN(marketId) && marketId !== "#N/A" && marketId !== "";
+  const isTypeValid = marketType && marketType !== "#N/A" && marketType !== "" && marketType.toLowerCase() !== "loading...";
 
-  // Check for empty, loading, or error states from ImportRange
-  if (!marketId || isNaN(marketId) || marketId === "" || marketId === "#N/A") {
-    console.warn("🛑 ABORT: Market ID is invalid or still loading from IMPORTRANGE.");
-    return;
-  }
-  
-  if (!marketType || marketType === "" || marketType === "#N/A" || marketType.toLowerCase() === "loading...") {
-    console.warn("🛑 ABORT: Market Type is invalid or still loading from IMPORTRANGE.");
-    return;
+  if (!isIdValid || !isTypeValid) {
+    console.warn(`[${targetSheetName}] GATE BLOCKED: Settings missing or invalid. Retrying next cycle.`);
+    sheet.getRange("E4").setValue(`⚠️ Delayed: Settings Loading... (${new Date().toLocaleTimeString()})`);
+    return; 
   }
 
-  console.log("✅ Inputs validated. Proceeding to BigQuery.");
-
-  // 2. Build the SQL (Using the Safety 1=1 logic we discussed)
+  // --- 2. THE BIGQUERY PULL ---
   const sql = `
-    SELECT 
-      date, type_id, max_buy, min_sell 
+    SELECT date, type_id, max_buy, min_sell 
     FROM (
-      SELECT *, 
-             ROW_NUMBER() OVER(PARTITION BY type_id ORDER BY date DESC) as rn
+      SELECT *, ROW_NUMBER() OVER(PARTITION BY type_id ORDER BY date DESC) as rn
       FROM \`${projectId}.market_data.market_prices\`
-      WHERE 1=1
-      AND market_id = ${marketId}
+      WHERE market_id = ${marketId}
       AND LOWER(market_type) = LOWER('${marketType}')
       AND date >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
     )
@@ -46,26 +84,29 @@ function refreshFilteredPrices() {
     const rows = queryResults.rows;
 
     if (!rows || rows.length === 0) {
-      console.warn(`[BQ] No results found for Market ${marketId} (${marketType}) in the last 30 days.`);
+      console.warn(`[${targetSheetName}] No data found in BQ for Market ${marketId}.`);
+      sheet.getRange("E4").setValue("⚠️ No Data Found in BQ");
       return;
     }
 
-    // 3. Format results for the sheet
     const data = rows.map(row => [
       new Date(row.f[0].v), 
-      row.f[1].v,           
-      row.f[2].v,           
-      row.f[3].v            
+      row.f[1].v, 
+      row.f[2].v, 
+      row.f[3].v
     ]);
 
-    // 4. Clear and Write (Starting Row 7)
-    // We write the header once, then the data below it.
+    // --- 3. THE WRITE (Starting Row 7) ---
     sheet.getRange("A7:D").clearContent();
     sheet.getRange(7, 1, 1, 4).setValues([["Date", "Type ID", "Max Buy", "Min Sell"]]);
     sheet.getRange(8, 1, data.length, 4).setValues(data);
     
-    console.log(`[SUCCESS] Updated ${data.length} items from BigQuery.`);
+    // Individual heartbeat for this sheet
+    sheet.getRange("E4").setValue(`✅ Synced: ${new Date().toLocaleTimeString()}`);
+    console.log(`[${targetSheetName}] Success: ${data.length} items.`);
+    
   } catch (err) {
-    console.error(`[BQ ERROR] SQL failed: ${err.message}`);
+    console.error(`[${targetSheetName}] BQ Error: ${err.message}`);
+    sheet.getRange("E4").setValue("❌ BQ Query Error");
   }
 }
