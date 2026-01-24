@@ -1,15 +1,24 @@
 {
   "timeZone": "America/New_York",
   "dependencies": {
-    "libraries": [{
-      "userSymbol": "GESI",
-      "libraryId": "1KjnRVVFr2KiHH55sqBfHcZ-yXweJ7iv89V99ubaLy4A7B_YH8rB5u0s3",
-      "version": "53"
-    }]
+    "libraries": [
+      {
+        "userSymbol": "GESI",
+        "libraryId": "1KjnRVVFr2KiHH55sqBfHcZ-yXweJ7iv89V99ubaLy4A7B_YH8rB5u0s3",
+        "version": "53"
+      }
+    ],
+    "enabledAdvancedServices": [
+      {
+        "userSymbol": "BigQuery",
+        "version": "v2",
+        "serviceId": "bigquery"
+      }
+    ]
   },
   "exceptionLogging": "STACKDRIVER",
   "runtimeVersion": "V8",
-    "oauthScopes": [
+  "oauthScopes": [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/script.external_request",
     "https://www.googleapis.com/auth/script.scriptapp",

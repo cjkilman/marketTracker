@@ -1,14 +1,15 @@
 /**
- * Streams market data rows directly to BigQuery instead of the Sheet.
+ * Streams market data to BigQuery using free "Load Jobs".
+ * This method is completely free and bypasses the Sandbox streaming restriction.
  */
 function streamToBigQuery(rows) {
-  const projectId = 'tenacious-tiger-345318'; // <--- CHANGE THIS
+  const projectId = 'tenacious-tiger-345318'; 
   const datasetId = 'market_data';
   const tableId = 'market_prices';
 
-  // Map sheet-style rows to BigQuery JSON rows
-  const jsonRows = rows.map(row => ({
-    json: {
+  // 1. Transform rows into Newline-Delimited JSON (Free Tier requirement)
+  const jsonRows = rows.map(row => {
+    return JSON.stringify({
       date: row[0] instanceof Date ? row[0].toISOString() : new Date(row[0]).toISOString(),
       market_id: parseInt(row[1]),
       market_type: String(row[2]),
@@ -17,22 +18,32 @@ function streamToBigQuery(rows) {
       max_buy: parseFloat(row[5]) || null,
       median_sell: parseFloat(row[6]) || null,
       median_buy: parseFloat(row[7]) || null
-    }
-  }));
+    });
+  }).join('\n');
 
-  const insertRequest = {
-    rows: jsonRows
+  // Convert to a blob for the upload job
+  const blob = Utilities.newBlob(jsonRows, 'application/octet-stream');
+
+  // 2. Configure the Load Job
+  const jobConfig = {
+    configuration: {
+      load: {
+        destinationTable: {
+          projectId: projectId,
+          datasetId: datasetId,
+          tableId: tableId
+        },
+        sourceFormat: 'NEWLINE_DELIMITED_JSON',
+        writeDisposition: 'WRITE_APPEND' // Appends to existing history
+      }
+    }
   };
 
   try {
-    const response = BigQuery.Tabledata.insertAll(insertRequest, projectId, datasetId, tableId);
-    
-    if (response.insertErrors) {
-      console.error("[BIGQUERY] Insert Errors: ", JSON.stringify(response.insertErrors));
-    } else {
-      console.log(`[BIGQUERY] Successfully pushed ${rows.length} rows to BigQuery.`);
-    }
+    // 3. Execute as a Job (Free) instead of a Stream (Paid)
+    const runJob = BigQuery.Jobs.insert(jobConfig, projectId, blob);
+    console.log(`[BIGQUERY] Load Job started: ${runJob.jobReference.jobId}. Rows: ${rows.length}`);
   } catch (err) {
-    console.error("[BIGQUERY] Pipeline Error: " + err.message);
+    console.error("[BIGQUERY] Free-Tier Pipe Error: " + err.message);
   }
 }
