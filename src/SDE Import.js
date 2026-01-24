@@ -159,14 +159,15 @@ const CSVToArray = (strData, strDelimiter = ",", headers = null, publishedOnly =
       if (pubValue !== '1' && pubValue.toLowerCase() !== 'true') continue;
     }
 
-    // --- GATE 2: Marketability (The "Anti-Junk" Filter) ---
-    if (marketGroupIdx !== -1) {
-      const mgValue = String(cols[marketGroupIdx]).trim();
-      // Drop items that are null, empty, or '0' (meaning not on the market)
-      if (mgValue === "" || mgValue.toLowerCase() === "null" || mgValue === "0") {
-        continue; 
-      }
-    }
+// Add this logic inside the CSVToArray row processing loop
+const marketGroupIdx = rawHeaders.indexOf("marketGroupID"); //
+if (marketGroupIdx !== -1) { //
+  const mgValue = String(cols[marketGroupIdx]).trim().toLowerCase(); //
+  // Drop items where marketGroupID is empty, 0, or "null"
+  if (mgValue === "" || mgValue === "null" || mgValue === "0") { //
+    continue; // Skip the item
+  }
+}
 
     // ... proceed to add row ...
   }
