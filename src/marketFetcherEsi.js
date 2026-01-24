@@ -11,7 +11,7 @@
 
 /* ============================ CONFIG: ENGINE ============================ */
 // Sources can be a Named Range OR "Sheet!A1" range
-const ITEMS_SOURCE = "'Item List Back End'!A2:A";   // type_id list
+const ITEMS_SOURCE = "'Item List Back End'!A2:B";   // type_id list
 const REGIONS_SOURCE = "'Market Settings'!F3:F";      // region_id list
 
 // Engine sheets & export name
@@ -722,45 +722,66 @@ function sumLastNDaysObj_(hist, days) {
   return sum;
 }
 
-// Read list from Named Range OR "Sheet!A1" (numeric IDs; de-dupe; preserve order)
-// Read list from Named Range OR "Sheet!A1" (numeric/string IDs; de-dupe; preserve order)
+/**
+ * REVISED: List reader that catches and reports #N/A errors
+ */
 function readListFlex_(spec, opts) {
   opts = Object.assign({
-    numeric: true,       // coerce to number
-    integer: true,       // floor numbers (IDs)
-    dropZeros: true,     // ignore 0
+    numeric: true,
+    integer: true,
+    dropZeros: true,
     dedupe: true,
-    validator: null      // fn(val)->boolean
+    validator: null
   }, opts || {});
 
   const ss = SpreadsheetApp.getActive();
-  let range = (spec && typeof spec.getValues === 'function') ? spec : ss.getRangeByName(spec);
-  if (!range && typeof spec === 'string' && spec.includes('!')) {
+  
+  // 1. Establish the source
+  let rangeObj = (spec && typeof spec.getValues === 'function') ? spec : ss.getRangeByName(spec);
+  
+  if (!rangeObj && typeof spec === 'string' && spec.includes('!')) {
     const m = spec.match(/^'?([^'!]+)'?\!(.+)$/);
-    if (!m) throw new Error('Invalid list spec: ' + spec);
-    const sh = ss.getSheetByName(m[1]);
-    if (!sh) throw new Error('Sheet not found: ' + m[1]);
-    range = sh.getRange(m[2]);
+    if (m) {
+      const sh = ss.getSheetByName(m[1]);
+      if (sh) rangeObj = sh.getRange(m[2]);
+    }
   }
-  if (!range) throw new Error('List source not found: ' + spec);
+
+  // 2. Safety check
+  if (!rangeObj) {
+    console.error(`[LIST_ERROR] Could not find source: ${spec}`);
+    return [];
+  }
 
   const seen = new Set(), out = [];
-  const vals = range.getValues().flat();
+  const vals = rangeObj.getValues(); // This is the 2D array [ID, Name]
 
-  for (let v of vals) {
-    // normalize to trimmed string first to catch blanks & whitespace
-    let s = String(v).trim();
-    if (!s.length) continue;                     // ← ignore blanks
+  for (let i = 0; i < vals.length; i++) {
+    let typeIdRaw = String(vals[i][0]).trim(); 
+    // Column B (Index 1) holds the Name for our diagnostic log
+    let itemName = vals[i][1] ? String(vals[i][1]).trim() : "Unknown Item";
+
+    // --- THE DIAGNOSTIC GATE ---
+    if (typeIdRaw === "#N/A" || typeIdRaw === "#VALUE!" || typeIdRaw === "#REF!") {
+      // Now using itemName so you can see "Dual 'Afocal' Heavy Laser I"
+      console.error(`[SDE_DISCREPANCY] Broken ID for Item: "${itemName}" in ${spec}.`);
+      continue; 
+    }
+
+    if (!typeIdRaw.length) continue; 
 
     let val;
     if (opts.numeric) {
-      let n = Number(s);                         // handles "1.0000043E7"
-      if (!Number.isFinite(n)) continue;
+      let n = Number(typeIdRaw);
+      if (!Number.isFinite(n)) {
+        console.warn(`[LIST_WARN] Non-numeric ID for "${itemName}": Found "${typeIdRaw}".`);
+        continue;
+      }
       if (opts.integer) n = Math.floor(n);
-      if (opts.dropZeros && n === 0) continue;   // ← avoid the "0" poison
+      if (opts.dropZeros && n === 0) continue;
       val = n;
     } else {
-      val = s;
+      val = typeIdRaw;
     }
 
     if (opts.validator && !opts.validator(val)) continue;
