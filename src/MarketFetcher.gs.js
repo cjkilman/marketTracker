@@ -46,7 +46,7 @@ function updateFuzzMarketDataSheet() {
 
 /**
  * Resets the state of the Fuzz market data job.
- * Note: FUZZ_PROP_INIT is NOT cleared to preserve the sheet structure.
+ * MODIFIED: No longer deletes FUZZ_PROP_LEASE to enforce the 30-min window.
  */
 function _resetFuzzMarketDataJobState(error) {
   LOG_FUZZ.warn(`RESETTING Fuzz Market Data Job State. Reason: ${error ? error.message : 'Completion/Manual'}`);
@@ -55,13 +55,16 @@ function _resetFuzzMarketDataJobState(error) {
     SCRIPT_PROP.deleteProperty(FUZZ_PROP_STEP);
     SCRIPT_PROP.deleteProperty(FUZZ_PROP_INDEX);
     SCRIPT_PROP.deleteProperty(FUZZ_PROP_ROW);
-    SCRIPT_PROP.deleteProperty(FUZZ_PROP_LEASE);
+    
+    // REMOVE OR COMMENT OUT THIS LINE:
+    // SCRIPT_PROP.deleteProperty(FUZZ_PROP_LEASE); 
+    
     // Delete potential triggers
     deleteTriggersByName('updateFuzzMarketDataSheet');
   } catch (propError) {
     LOG_FUZZ.error(`Error deleting script properties: ${propError.message}`);
   }
-  LOG_FUZZ.info("Fuzz market data job state reset complete.");
+  LOG_FUZZ.info("Fuzz job state reset. Lease remains active until expiration.");
 }
 
 

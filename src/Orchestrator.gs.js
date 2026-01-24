@@ -13,7 +13,7 @@ const STATE_FLAGS = {
   FINALIZING: 'FINALIZING',
   COMPLETE: 'COMPLETE'
 };
-const JOB_LEASE_DURATION_MS = 300000; // 5 minutes
+const JOB_LEASE_DURATION_MS = 1800000; // 5 minutes
 
 // Global lock depth counters
 var EXECUTION_LOCK_DEPTH_TRY = 0;
@@ -145,63 +145,44 @@ function executeWithWaitLock(func, funcName) {
 
 
 /**
- * REVISED: Master orchestrator (the "pipper") triggered every 15 minutes.
- * This function now implements the "bump" logic by checking job leases.
- * It will "bump" (start) any job whose lease has expired.
+ * REVISED: Master orchestrator
+ * Now manages Fuzz, ESI, SDE, and Market Refresh.
  */
 function masterOrchestrator() {
   const LOG = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('Orchestrator') : console);
-  LOG.info("Master orchestrator running. Checking job leases...");
-
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const NOW_MS = Date.now();
 
-  const ESI_STAGNATION_TIMEOUT_MS = 30 * 60 * 1000; // Define a 30-minute threshold for no progress
-
-  // --- 1. Check Fuzz Snapshot Job (MarketFetcher.gs.js) ---
-  const fuzzLease = parseInt(SCRIPT_PROP.getProperty('fuzzJobLeaseUntil') || '0', 10);
-  if (fuzzLease > NOW_MS) {
-    LOG.warn(`Fuzz job is already active (Lease expires in ${((fuzzLease - NOW_MS) / 60000).toFixed(1)} min). Skipping dispatch.`);
-  } else {
-    LOG.info("Fuzz job is not active. Dispatching 'bump' (starting updateFuzzMarketDataSheet).");
-    const newFuzzLease = NOW_MS + JOB_LEASE_DURATION_MS; // Give it a new 5 min lease
-    SCRIPT_PROP.setProperty('fuzzJobLeaseUntil', newFuzzLease.toString());
-    updateFuzzMarketDataSheet(); // Call the job
+  // --- 1. SDE JOB MONITORING (High Priority) ---
+  const sdeRunning = SCRIPT_PROP.getProperty('SDE_JOB_RUNNING') === 'true';
+  if (sdeRunning) {
+    LOG.warn("SDE Import Job detected as ACTIVE. Checking trigger health...");
+    
+    // Auto-resume logic: If the trigger died, recreate it
+    const hasTrigger = ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === 'sde_job_PROCESS');
+    if (!hasTrigger) {
+      LOG.error("SDE Process trigger missing while job active. Re-jumpstarting SDE Engine.");
+      ScriptApp.newTrigger('sde_job_PROCESS').timeBased().after(1000).create();
+    }
+    
+    LOG.info("Deferring Market operations until SDE is finished.");
+    return; // Exit here to prevent collisions with SDE writes
   }
 
-  // --- 2. Check "ESI" Job (marketFetcherEsi.js) - HANG DETECTION LOGIC ---
-  const esiActive = SCRIPT_PROP.getProperty('mf_job_active');
-  const currentCursor = SCRIPT_PROP.getProperty('mf_cursor');
-  const lastCheckedCursor = SCRIPT_PROP.getProperty('mf_hang_check_cursor');
-  const lastCheckTime = parseInt(SCRIPT_PROP.getProperty('mf_hang_check_time_ms') || '0', 10);
+  // --- 2. Check Fuzz Snapshot Job (MarketFetcher.gs.js) ---
+  const fuzzLease = parseInt(SCRIPT_PROP.getProperty('fuzzJobLeaseUntil') || '0', 10);
+  if (fuzzLease > NOW_MS) {
+    LOG.warn(`Fuzz job is active. Lease expires in ${((fuzzLease - NOW_MS) / 60000).toFixed(1)} min.`);
+  } else {
+    LOG.info("Fuzz job idle. Dispatching bump.");
+    SCRIPT_PROP.setProperty('fuzzJobLeaseUntil', (NOW_MS + 1800000).toString()); // 30m Lease
+    updateFuzzMarketDataSheet();
+  }
 
-  if (esiActive === '1') {
-    const isFirstCheck = lastCheckedCursor === null;
-    
-    // Stagnation is detected if the cursor hasn't moved AND the check time exceeds 30 minutes
-    const isStagnated = (currentCursor === lastCheckedCursor && NOW_MS - lastCheckTime > ESI_STAGNATION_TIMEOUT_MS);
-    
-    if (isFirstCheck) {
-        LOG.info("ESI Job is active. Starting progress monitoring.");
-    } else if (isStagnated) {
-        LOG.error(`ESI Job HANG DETECTED! Cursor (${currentCursor}) has not advanced for over 30 minutes. Forcing state reset.`);
-        
-        // Execute the necessary cleanup and reset
-        if (typeof _resetEsiHistoryJobState === 'function') {
-            _resetEsiHistoryJobState(new Error("Progress Stagnation Detected by Orchestrator"));
-        } else {
-            LOG.error("Cannot reset ESI state: _resetEsiHistoryJobState function is missing.");
-        }
-    } 
-    
-    // Always update the check properties for the NEXT 15-minute cycle
-    if (currentCursor !== null) {
-        SCRIPT_PROP.setProperty('mf_hang_check_cursor', currentCursor);
-        SCRIPT_PROP.setProperty('mf_hang_check_time_ms', String(NOW_MS));
+  // --- 3. Link to Master Market Refresh ---
+  if (fuzzLease <= NOW_MS && !sdeRunning) {
+    if (typeof masterMarketRefresh === 'function') {
+      masterMarketRefresh(); 
     }
-
-    LOG.warn(`ESI job is active and progressing. Skipping dispatch.`);
-}
-
-  LOG.info("Master orchestrator finished lease checks.");
+  }
 }

@@ -1,3 +1,6 @@
+// Global Property Service
+const SCRIPT_PROPS = PropertiesService.getScriptProperties();
+
 /**
  * Creates the "Admin Tools" menu when the spreadsheet is opened.
  */
@@ -8,16 +11,35 @@ function onOpen() {
     .addItem('Delete All Triggers', '_deleteExistingTriggers')
     .addSeparator()
     .addItem('Run 15-Min Orchestrator', 'masterOrchestrator')
-    .addItem('Run Daily Reset (Light Prune)', 'dailyJobReset')
-    .addItem('Run Daily Heavy Prune', 'dailyHeavyPrune_Prices')
-    .addItem('Run Daily History (OHLC) Build', 'updateHistory')
+    .addItem('Run SDE Update (Full)', 'sde_job_START') // New SDE Start
     .addSeparator()
     .addItem('Manual: Reset Fuzz Job State', '_resetFuzzMarketDataJobState_MENU')
     .addItem('Manual: Reset ESI Job State', '_resetEsiHistoryJobState_MENU')
-    // --- ADD THIS LINE ---
-    .addItem('Manual: Reset Heavy Prune State', '_resetHeavyPruneJobState_MENU')
-    // --- END ADD ---
+    .addItem('Manual: Reset SDE Job State', '_resetSdeJobState_MENU') // New SDE Reset
     .addToUi();
+}
+
+function GET_SDE_CONFIG() {
+  return [
+    { name: "SDE_invTypes", file: "invTypes.csv", cols: ["typeID", "groupID", "typeName", "volume", "marketGroupID", "published"] },
+    { name: "SDE_mapDenormalize", file: "mapDenormalize.csv", cols: ["itemID", "typeID", "groupID", "solarSystemID", "itemName"] }
+  ];
+}
+
+function GET_UTILITY_CONFIG() {
+  return { sheetName: "Utility", range: "B3:C3" }; // Adjust to your actual "Off" switch location
+}
+
+/**
+ * NEW: Manual Reset for SDE Job
+ */
+function _resetSdeJobState_MENU() {
+  if (typeof sde_job_FINALIZE === 'function') {
+    sde_job_FINALIZE(); 
+    SpreadsheetApp.getUi().alert('SDE Job State has been force-reset.');
+  } else {
+    SpreadsheetApp.getUi().alert('Error: SDE controller not found.');
+  }
 }
 
 /**
