@@ -69,11 +69,37 @@ function _resetFuzzMarketDataJobState(error) {
 
 
 /**
+ * Internal check to see if the refresh "Engine" is active.
+ * Returns true if the ESI toggle (D3) in the Utility sheet is set to 1.
+ */
+function isEngineRunning_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const util = ss.getSheetByName("Utility");
+  if (!util) return false;
+  
+  // Checks cell D3 (TICK.ESI)
+  return util.getRange("D3").getValue() === 1;
+}
+
+/**
  * REVISED: Worker with Undefined Safety Gate
  */
 function _updateFuzzMarketDataWorker(idBatch, marketConfig, isNewRun) {
   const LOG = LoggerEx.withTag('FuzzWorker');
   
+// --- ADDED MAINTENANCE GATES ---
+  if (isSdeJobRunning()) {
+    LOG.warn("ABORT: SDE Update in progress. Parking Fuzz Worker.");
+    SCRIPT_PROPS.setProperty('fuzz_job_active', 'false');
+    return;
+  }
+
+  if (!isEngineRunning_()) {
+    LOG.warn("ABORT: Engine is parked. Skipping Fuzz fetch.");
+    return;
+  }
+
+
   // --- SAFETY GATE: Catch undefined/empty batches before they hit .length ---
   if (!idBatch || !Array.isArray(idBatch) || idBatch.length === 0) {
     console.warn(`[FuzzWorker] Worker invoked with empty or invalid idBatch. Ending cycle.`);
