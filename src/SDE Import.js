@@ -98,7 +98,40 @@ const sdeLib = () => {
     return sheet;
   };
 
+/**
+ * ROBUST CSVToArray with Double-Gate Filter
+ */
+const CSVToArray = (strData, strDelimiter = ",", headers = null, publishedOnly = true) => {
+  const allLines = Utilities.parseCsv(strData, strDelimiter.charCodeAt(0));
+  if (allLines.length === 0) return [];
 
+  const rawHeaders = allLines[0].map(h => h.trim());
+  const publishIdx = rawHeaders.indexOf("published");
+  const marketGroupIdx = rawHeaders.indexOf("marketGroupID"); // Identify market group column
+
+  let arrData = [];
+  // ... (header mapping logic) ...
+
+  for (let i = 1; i < allLines.length; i++) {
+    const cols = allLines[i];
+    
+    // --- GATE 1: Published Status ---
+    if (publishedOnly === true && publishIdx !== -1) {
+      const pubValue = String(cols[publishIdx]).trim();
+      if (pubValue !== '1' && pubValue.toLowerCase() !== 'true') continue;
+    }
+
+    // --- GATE 2: Marketability (Anti-Junk) ---
+    if (marketGroupIdx !== -1) {
+      const mgValue = String(cols[marketGroupIdx]).trim().toLowerCase();
+      // Drop items that are null, empty, or '0'
+      if (mgValue === "" || mgValue === "null" || mgValue === "0") continue;
+    }
+
+    // ... (Proceed to parse and add row) ...
+  }
+  return arrData;
+};
 
   /**
    * Downloads a specific CSV file from Fuzzwork and parses it using the robust internal parser.
@@ -141,37 +174,7 @@ const sdeLib = () => {
     }
   };
 
- /**
- * ROBUST CSVToArray with Marketability Filter
- */
-const CSVToArray = (strData, strDelimiter = ",", headers = null, publishedOnly = true) => {
-  // ... existing setup logic ...
-  
-  const publishIdx = rawHeaders.indexOf("published");
-  const marketGroupIdx = rawHeaders.indexOf("marketGroupID"); // ADD THIS
 
-  for (let i = 1; i < allLines.length; i++) {
-    const cols = allLines[i];
-    
-    // --- GATE 1: Published Status ---
-    if (publishedOnly === true && publishIdx !== -1) {
-      const pubValue = String(cols[publishIdx]).trim();
-      if (pubValue !== '1' && pubValue.toLowerCase() !== 'true') continue;
-    }
-
-// Add this logic inside the CSVToArray row processing loop
-const marketGroupIdx = rawHeaders.indexOf("marketGroupID"); //
-if (marketGroupIdx !== -1) { //
-  const mgValue = String(cols[marketGroupIdx]).trim().toLowerCase(); //
-  // Drop items where marketGroupID is empty, 0, or "null"
-  if (mgValue === "" || mgValue === "null" || mgValue === "0") { //
-    continue; // Skip the item
-  }
-}
-
-    // ... proceed to add row ...
-  }
-}
 
   // ==================================================================
   // --- END OF REPLACEMENT ---
