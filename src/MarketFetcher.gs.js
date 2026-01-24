@@ -69,137 +69,66 @@ function _resetFuzzMarketDataJobState(error) {
 
 
 /**
- * The core stateful worker function for fetching Fuzz data (APPEND-ONLY).
+ * Processes a single chunk of market data: 
+ * Discovery -> FuzAPI Fetch -> BigQuery Stream
  */
-/**
- * The core stateful worker function for fetching Fuzz data (APPEND-ONLY).
- * MODIFIED: Added Capacity Guard to prevent 10M cell limit crashes.
- */
-function _updateFuzzMarketDataWorker() {
-  const SCRIPT_PROP = PropertiesService.getScriptProperties();
-  const START_TIME = Date.now();
-
-  // --- State Initialization & Validation ---
-  let currentState = SCRIPT_PROP.getProperty(FUZZ_PROP_STEP) || "NEW_RUN";
-  LOG_FUZZ.info(`Starting worker. Current State: ${currentState}`);
-
-  // --- Lease Management ---
-  const leaseUntil = parseInt(SCRIPT_PROP.getProperty(FUZZ_PROP_LEASE) || '0', 10);
-  if (START_TIME > leaseUntil) {
-    LOG_FUZZ.error(`Job lease expired. Resetting job state.`);
-    _resetFuzzMarketDataJobState(new Error("Job lease expired"));
-    return;
-  }
+function _updateFuzzMarketDataWorker(idBatch, marketConfig, isNewRun) {
+  const LOG = LoggerEx.withTag('FuzzWorker');
   
-  // Extend lease if nearing expiry
-  if (leaseUntil - START_TIME < 60000) {
-    const newLease = START_TIME + JOB_LEASE_DURATION_MS;
-    SCRIPT_PROP.setProperty(FUZZ_PROP_LEASE, newLease.toString());
-  }
-
   try {
-    // --- State: NEW_RUN ---
-    if (currentState === "NEW_RUN") {
-      LOG_FUZZ.info(`State: NEW_RUN. Initializing indices for BigQuery stream.`);
-      SCRIPT_PROP.setProperty(FUZZ_PROP_INDEX, '0');
-      // Note: FUZZ_PROP_ROW is now just a count/log of items processed, not a sheet row.
-      SCRIPT_PROP.setProperty(FUZZ_PROP_ROW, '0'); 
-      currentState = "PROCESSING";
-      SCRIPT_PROP.setProperty(FUZZ_PROP_STEP, currentState);
-    } 
+    // 1. LOG THE FETCH START
+    console.log(`[FuzzWorker] Starting FuzAPI Pull for ${idBatch.length} items in ${marketConfig.market_type}: ${marketConfig.market_id}`);
 
-    // --- State: PROCESSING ---
-    if (currentState === "PROCESSING") {
-      let requestStartIndex = parseInt(SCRIPT_PROP.getProperty(FUZZ_PROP_INDEX) || '0');
-      let totalProcessedCount = parseInt(SCRIPT_PROP.getProperty(FUZZ_PROP_ROW) || '0');
-      const allMarketRequests = getMasterMarketRequests(); 
-
-      if (!allMarketRequests || allMarketRequests.length === 0) {
-        _resetFuzzMarketDataJobState(new Error("Master request list empty"));
-        return;
-      }
-
-      let batchesProcessedThisRun = 0;
-
-      while (requestStartIndex < allMarketRequests.length) {
-        // --- Time Limit Check ---
-        if (Date.now() - START_TIME > FUZZ_TIME_LIMIT_MS) {
-          SCRIPT_PROP.setProperty(FUZZ_PROP_INDEX, requestStartIndex.toString());
-          SCRIPT_PROP.setProperty(FUZZ_PROP_ROW, totalProcessedCount.toString());
-          scheduleOneTimeTrigger('updateFuzzMarketDataSheet', FUZZ_RESCHEDULE_MS);
-          LOG_FUZZ.warn(`Time limit hit. Rescheduling at index ${requestStartIndex}`);
-          return; 
-        }
-
-        // --- Prepare Batch ---
-        const requestEndIndex = Math.min(requestStartIndex + FUZZ_BATCH_SIZE, allMarketRequests.length);
-        const requestsForThisRun = allMarketRequests.slice(requestStartIndex, requestEndIndex);
-        const groupedRequests = {};
-        requestsForThisRun.forEach(req => {
-          const key = `${req.market_id}_${req.market_type}`;
-          if (!groupedRequests[key]) groupedRequests[key] = { market_id: req.market_id, market_type: req.market_type, typeIDs: [] };
-          groupedRequests[key].typeIDs.push(req.type_id);
-        });
-
-        // --- Fetch Data ---
-        const now = new Date();
-        const rowsToStream = [];
-        
-        Object.values(groupedRequests).forEach(({ market_id, market_type, typeIDs }) => {
-          try {
-            const prices = getMarketPrices(typeIDs, market_id, market_type); 
-            typeIDs.forEach(type_id => {
-              const fuzObject = prices[type_id] || {};
-              const sell = fuzObject.sell || {};
-              const buy = fuzObject.buy || {};
-              if ((buy.orderCount || 0) + (sell.orderCount || 0) > 0) {
-                rowsToStream.push([
-                  now, market_id, market_type, type_id, 
-                  sell.min ?? null, buy.max ?? null, 
-                  sell.median ?? null, buy.median ?? null
-                ]);
-              }
-            });
-          } catch (apiError) {
-            LOG_FUZZ.error(`API error: ${apiError.message}`);
-          }
-        });
-
-        // --- STREAM TO BIGQUERY ---
-        if (rowsToStream.length > 0) {
-          try {
-            // Calling the utility function we created earlier
-            streamToBigQuery(rowsToStream);
-            
-            totalProcessedCount += rowsToStream.length;
-            batchesProcessedThisRun++;
-          } catch (bqError) {
-            LOG_FUZZ.error(`BigQuery stream failed: ${bqError.message}. Retrying batch...`);
-            // We don't advance the index here so it retries on the next trigger
-            scheduleOneTimeTrigger('updateFuzzMarketDataSheet', FUZZ_RESCHEDULE_MS);
-            return;
-          }
-        }
-
-        // --- Advance State ---
-        requestStartIndex = requestEndIndex;
-        SCRIPT_PROP.setProperty(FUZZ_PROP_INDEX, requestStartIndex.toString());
-        SCRIPT_PROP.setProperty(FUZZ_PROP_ROW, totalProcessedCount.toString()); 
-      }
-
-      if (requestStartIndex >= allMarketRequests.length) {
-        LOG_FUZZ.info("All data successfully pushed to BigQuery. Job Complete.");
-        currentState = "COMPLETE";
-        _resetFuzzMarketDataJobState(null);
-      }
+    // 2. EXECUTE THE PULL
+    const marketData = fuzAPI.getMarketPrices(idBatch, marketConfig.market_id, marketConfig.market_type);
+    
+    // Check if we got anything back at all
+    if (!marketData || Object.keys(marketData).length === 0) {
+      console.warn(`[FuzzWorker] FuzAPI returned empty set for this batch. Skipping.`);
+      return;
     }
+
+    const rowsToStream = [];
+    const timestamp = new Date().toISOString();
+
+    // 3. PROCESS & FILTER
+    idBatch.forEach(typeId => {
+      const data = marketData[typeId];
+      if (data) {
+        const buy = data.buy || {};
+        const sell = data.sell || {};
+
+        // Only keep items with active orders (Your "Success-Only" Filter)
+        if ((buy.orderCount || 0) + (sell.orderCount || 0) > 0) {
+          rowsToStream.push({
+            date: timestamp,
+            market_id: String(marketConfig.market_id),
+            market_type: marketConfig.market_type,
+            type_id: parseInt(typeId, 10),
+            min_sell: parseFloat(sell.min) || 0,
+            max_buy: parseFloat(buy.max) || 0,
+            median_sell: parseFloat(sell.median) || 0,
+            median_buy: parseFloat(buy.median) || 0,
+            volume_fuzz: parseFloat(sell.volume) || 0 // Optional: Track Fuzzwork volume
+          });
+        }
+      }
+    });
+
+    // 4. LOG THE FILTER RESULT
+    console.log(`[FuzzWorker] FuzAPI fetch complete. Found ${rowsToStream.length} active items (Filtered out ${idBatch.length - rowsToStream.length} empty items).`);
+
+    // 5. STREAM TO BIGQUERY
+    if (rowsToStream.length > 0) {
+      streamToBigQuery(rowsToStream);
+    }
+
   } catch (e) {
-    LOG_FUZZ.error(`Unhandled error: ${e.message}`);
-    _resetFuzzMarketDataJobState(e);
+    LOG.error(`Worker Failure: ${e.message}`);
+    throw e; // Re-throw to trigger the RESUMABLE ERROR logic in the controller
   }
 }
 
-// ... (pruneOldRows, _deleteInBlocks_, _trimTrailing_ remain the same) ...
 
 /* ---------------------- Light Mode hygiene ---------------------- */
 
