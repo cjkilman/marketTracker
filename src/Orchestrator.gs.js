@@ -41,6 +41,21 @@ function scheduleOneTimeTrigger(functionName, delayMs) {
 }
 
 /**
+ * Helper to ensure we don't spam the ESI publish
+ */
+function isTimeForInterfaceSync() {
+  const lastSync = parseInt(SCRIPT_PROPS.getProperty('last_esi_sync') || '0', 10);
+  const now = new Date().getTime();
+  
+  // Only sync once every 5 minutes
+  if (now - lastSync > 300000) {
+    SCRIPT_PROPS.setProperty('last_esi_sync', String(now));
+    return true;
+  }
+  return false;
+}
+
+/**
  * Deletes all time-based triggers for a specific function name.
  */
 function deleteTriggersByName(functionName) {
@@ -143,46 +158,57 @@ function executeWithWaitLock(func, funcName) {
   return functionResult;
 }
 
+/**
+ * Helper to check if it's time to refresh the Google Sheet displays
+ */
+function isTimeForDisplayRefresh() {
+  // Logic: Always return true to refresh whenever the Orchestrator pulses, 
+  // or add a timer check (e.g., every 5 minutes).
+  return true; 
+}
+
+function isTimeForInterfaceSync() {
+  const lastSync = parseInt(SCRIPT_PROPS.getProperty('last_interface_sync') || '0', 10);
+  const now = new Date().getTime();
+  // If this property was never set, it stays 0, and (now - 0) is always > 300000.
+  // BUT, if it was set to a time in the future by mistake, it will never run.
+  return (now - lastSync) > 300000; 
+}
 
 /**
- * REVISED: Master orchestrator
- * Now manages Fuzz, ESI, SDE, and Market Refresh.
+ * FUEL GAUGE: Returns true if we have enough time to start a new task.
+ * @param {number} requiredSeconds - Minimum buffer needed (default 30s)
  */
+function hasFuel(requiredSeconds = 30) {
+  const startTime = PropertiesService.getScriptProperties().getProperty('exec_start_time');
+  if (!startTime) return true; // Fallback if not set
+  
+  const elapsed = (Date.now() - parseInt(startTime)) / 1000;
+  const limit = 360; // Google's 6-minute limit
+  
+  return (limit - elapsed) > requiredSeconds;
+}
+
 function masterOrchestrator() {
-  const LOG = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('Orchestrator') : console);
-  const SCRIPT_PROP = PropertiesService.getScriptProperties();
-  const NOW_MS = Date.now();
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty('exec_start_time', String(Date.now())); // Mark the start
 
-  // --- 1. SDE JOB MONITORING (High Priority) ---
-  const sdeRunning = SCRIPT_PROP.getProperty('SDE_JOB_RUNNING') === 'true';
-  if (sdeRunning) {
-    LOG.warn("SDE Import Job detected as ACTIVE. Checking trigger health...");
-    
-    // Auto-resume logic: If the trigger died, recreate it
-    const hasTrigger = ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === 'sde_job_PROCESS');
-    if (!hasTrigger) {
-      LOG.error("SDE Process trigger missing while job active. Re-jumpstarting SDE Engine.");
-      ScriptApp.newTrigger('sde_job_PROCESS').timeBased().after(1000).create();
-    }
-    
-    LOG.info("Deferring Market operations until SDE is finished.");
-    return; // Exit here to prevent collisions with SDE writes
-  }
+  // --- TASK 1: FUZZ ---
+  updateFuzzMarketDataSheet();
 
-  // --- 2. Check Fuzz Snapshot Job (MarketFetcher.gs.js) ---
-  const fuzzLease = parseInt(SCRIPT_PROP.getProperty('fuzzJobLeaseUntil') || '0', 10);
-  if (fuzzLease > NOW_MS) {
-    LOG.warn(`Fuzz job is active. Lease expires in ${((fuzzLease - NOW_MS) / 60000).toFixed(1)} min.`);
+  // --- TASK 2: SYNC ---
+  if (hasFuel(45)) { // Need 45s buffer for ESI
+    console.log("Fuel Good. Syncing Interfaces...");
+    ESI_publishClientInterfaces();
   } else {
-    LOG.info("Fuzz job idle. Dispatching bump.");
-    SCRIPT_PROP.setProperty('fuzzJobLeaseUntil', (NOW_MS + 1800000).toString()); // 30m Lease
-    updateFuzzMarketDataSheet();
+    console.warn("Low Fuel! Skipping Sync to avoid hard timeout.");
   }
 
-  // --- 3. Link to Master Market Refresh ---
-  if (fuzzLease <= NOW_MS && !sdeRunning) {
-    if (typeof masterMarketRefresh === 'function') {
-      masterMarketRefresh(); 
-    }
+  // --- TASK 3: REFRESH ---
+  if (hasFuel(30)) { // Need 30s buffer for Refreshes
+    console.log("Fuel Good. Running Refreshes...");
+    masterMarketRefresh();
   }
 }
+
+

@@ -69,20 +69,26 @@ function _resetFuzzMarketDataJobState(error) {
 
 
 /**
- * Processes a single chunk of market data: 
- * Discovery -> FuzAPI Fetch -> BigQuery Stream
+ * REVISED: Worker with Undefined Safety Gate
  */
 function _updateFuzzMarketDataWorker(idBatch, marketConfig, isNewRun) {
   const LOG = LoggerEx.withTag('FuzzWorker');
   
+  // --- SAFETY GATE: Catch undefined/empty batches before they hit .length ---
+  if (!idBatch || !Array.isArray(idBatch) || idBatch.length === 0) {
+    console.warn(`[FuzzWorker] Worker invoked with empty or invalid idBatch. Ending cycle.`);
+    // Reset the job state so the Orchestrator doesn't keep "bumping" a dead job
+    SCRIPT_PROPS.setProperty('fuzz_job_active', 'false');
+    SCRIPT_PROPS.setProperty('fuzz_cursor', '0');
+    return;
+  }
+
   try {
-    // 1. LOG THE FETCH START
+    // Now it is safe to check .length
     console.log(`[FuzzWorker] Starting FuzAPI Pull for ${idBatch.length} items in ${marketConfig.market_type}: ${marketConfig.market_id}`);
 
-    // 2. EXECUTE THE PULL
     const marketData = fuzAPI.getMarketPrices(idBatch, marketConfig.market_id, marketConfig.market_type);
     
-    // Check if we got anything back at all
     if (!marketData || Object.keys(marketData).length === 0) {
       console.warn(`[FuzzWorker] FuzAPI returned empty set for this batch. Skipping.`);
       return;
@@ -91,14 +97,12 @@ function _updateFuzzMarketDataWorker(idBatch, marketConfig, isNewRun) {
     const rowsToStream = [];
     const timestamp = new Date().toISOString();
 
-    // 3. PROCESS & FILTER
     idBatch.forEach(typeId => {
       const data = marketData[typeId];
       if (data) {
         const buy = data.buy || {};
         const sell = data.sell || {};
 
-        // Only keep items with active orders (Your "Success-Only" Filter)
         if ((buy.orderCount || 0) + (sell.orderCount || 0) > 0) {
           rowsToStream.push({
             date: timestamp,
@@ -108,24 +112,21 @@ function _updateFuzzMarketDataWorker(idBatch, marketConfig, isNewRun) {
             min_sell: parseFloat(sell.min) || 0,
             max_buy: parseFloat(buy.max) || 0,
             median_sell: parseFloat(sell.median) || 0,
-            median_buy: parseFloat(buy.median) || 0,
-            volume_fuzz: parseFloat(sell.volume) || 0 // Optional: Track Fuzzwork volume
+            median_buy: parseFloat(buy.median) || 0
           });
         }
       }
     });
 
-    // 4. LOG THE FILTER RESULT
-    console.log(`[FuzzWorker] FuzAPI fetch complete. Found ${rowsToStream.length} active items (Filtered out ${idBatch.length - rowsToStream.length} empty items).`);
+    console.log(`[FuzzWorker] FuzAPI fetch complete. Found ${rowsToStream.length} active items.`);
 
-    // 5. STREAM TO BIGQUERY
     if (rowsToStream.length > 0) {
       streamToBigQuery(rowsToStream);
     }
 
   } catch (e) {
     LOG.error(`Worker Failure: ${e.message}`);
-    throw e; // Re-throw to trigger the RESUMABLE ERROR logic in the controller
+    throw e; 
   }
 }
 

@@ -6,12 +6,17 @@ function masterMarketRefresh() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const NOW_MS = Date.now();
 
-  // 1. ORCHESTRATOR LEASE CHECK (Check once for the whole fleet)
-  const leaseUntil = parseInt(SCRIPT_PROP.getProperty('fuzzJobLeaseUntil') || '0', 10);
-  if (NOW_MS < leaseUntil) {
-    console.warn(`[ORCHESTRATOR] Engine Busy until ${new Date(leaseUntil).toLocaleTimeString()}. Skipping refresh cycle.`);
-    return;
+// --- THE NEW GATE (Multi-task friendly) ---
+  const isWorkerActive = SCRIPT_PROPS.getProperty('fuzz_job_active') === 'true';
+  
+  if (isWorkerActive) {
+    console.warn("[REFRESH] Market Fetcher is currently STREAMING. Skipping refresh to avoid partial data.");
+    return; 
   }
+
+  // If we get here, the engine is either IDLE or on LEASE (Cooling down).
+  // It is 100% safe to refresh the sheets now.
+  console.log("[REFRESH] Engine is parked. Proceeding with Display Sheet update...");
 
   // 2. THE FLEET: List every sheet that uses the C4/D4/A7 layout
   const marketSheets = [

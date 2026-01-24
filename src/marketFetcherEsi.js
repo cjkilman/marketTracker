@@ -882,10 +882,27 @@ function ESI_publishClientInterfaces() {
   const ss = SpreadsheetApp.getActive();
   const srcSh = ss.getSheetByName('Publish_ESI_Region');
   const cliSh = ss.getSheetByName('Interface Clients');
-  if (!srcSh || !cliSh) throw new Error('Missing required sheets');
+  
+  console.log("[PUBLISH] Starting Sync... Checking source sheets.");
+
+  if (!srcSh || !cliSh) {
+    console.error("[PUBLISH] Failed: One or more sheets missing.");
+    return;
+  }
 
   const src = srcSh.getDataRange().getValues();
-  if (src.length < 2) return;
+  console.log("[PUBLISH] Source rows found: " + src.length);
+  if (src.length < 2) {
+    console.warn("[PUBLISH] Aborted: 'Publish_ESI_Region' is empty.");
+    return;
+  }
+
+  const lastCliRow = cliSh.getLastRow();
+  console.log("[PUBLISH] Interface Clients found: " + (lastCliRow - 1));
+  if (lastCliRow < 2) {
+    console.warn("[PUBLISH] Aborted: 'Interface Clients' has no entries.");
+    return;
+  }
 
   // ---- helpers ----
   const normStatus = (s) => String(s || '').trim().toUpperCase().replace(/_/g, '-');
@@ -940,7 +957,6 @@ function ESI_publishClientInterfaces() {
   }
 
   // ---- read clients ----
-  const lastCliRow = cliSh.getLastRow();
   if (lastCliRow < 2) return;
   const cliRows = cliSh.getRange(2, 1, lastCliRow - 1, 3).getValues();
 
