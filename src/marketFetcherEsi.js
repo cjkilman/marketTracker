@@ -822,11 +822,13 @@ function readListFlex_(spec, opts) {
     // Column B (Index 1) holds the Name for our diagnostic log
     let itemName = vals[i][1] ? String(vals[i][1]).trim() : "Unknown Item";
 
-    // --- THE DIAGNOSTIC GATE ---
-    if (typeIdRaw === "#N/A" || typeIdRaw === "#VALUE!" || typeIdRaw === "#REF!") {
-      // Now using itemName so you can see "Dual 'Afocal' Heavy Laser I"
-      console.error(`[SDE_DISCREPANCY] Broken ID for Item: "${itemName}" in ${spec}.`);
-      continue; 
+// --- THE SILENT GATE ---
+    // If the ID is a known spreadsheet error, just skip it. No logs.
+    if (String(typeIdRaw).includes("#N/A") || 
+        String(typeIdRaw).includes("Check Name") || 
+        String(typeIdRaw).includes("#VALUE!") || 
+        String(typeIdRaw).includes("#REF!")) {
+      return; // Silent skip.
     }
 
     if (!typeIdRaw.length) continue; 
