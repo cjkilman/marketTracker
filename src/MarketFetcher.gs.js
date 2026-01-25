@@ -34,13 +34,36 @@ const PRUNE_BATCH_SIZE = 5000; // How many rows to read/process at a time
 const LOG_FUZZ = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('FuzzWorker') : console);
 
 /**
- * Public wrapper function called by the orchestrator. Uses ScriptLock.
+ * WRAPPER: Handles Lease & Lock.
+ * - Checks if 30 minutes have passed.
+ * - Calls executeWithTryLock(_updateFuzzMarketDataWorker).
+ * - Updates Lease Timestamp ONLY if successful.
  */
 function updateFuzzMarketDataSheet() {
-  // Uses executeWithTryLock from Orchestrator.gs.js
+  const LOG_HEADER = '[Orchestrator]';
+  const LEASE_MINUTES = 30;
+  const PROPS = PropertiesService.getScriptProperties();
+
+  // --- 1. LEASE CHECK ---
+  const lastRun = parseFloat(PROPS.getProperty('LAST_FUZZ_FETCH') || '0');
+  const now = Date.now();
+  const minutesSince = (now - lastRun) / (1000 * 60);
+
+  if (minutesSince < LEASE_MINUTES) {
+    console.log(`${LOG_HEADER} Lease Active. Skipping Fetch. (Next run in ${(LEASE_MINUTES - minutesSince).toFixed(1)} min)`);
+    return;
+  }
+
+  // --- 2. EXECUTE WITH LOCK ---
+  // This calls the worker with NO arguments.
   const result = executeWithTryLock(_updateFuzzMarketDataWorker, 'updateFuzzMarketDataSheet');
-  if (result === null) {
-    LOG_FUZZ.warn("Execution skipped by ScriptLock. Will retry on next trigger.");
+
+  // --- 3. UPDATE LEASE (On Success) ---
+  if (result !== null) {
+    console.log(`${LOG_HEADER} Cycle Complete. Updating Lease Timestamp.`);
+    PROPS.setProperty('LAST_FUZZ_FETCH', now.toString());
+  } else {
+    console.warn(`${LOG_HEADER} Execution skipped by ScriptLock.`);
   }
 }
 
@@ -71,92 +94,69 @@ function _resetFuzzMarketDataJobState(error) {
 
 
 /**
- * REVISED: Multi-Market Self-Healing Worker
- * - If Orchestrator sends no config, it reads ALL hubs from 'Market Settings' and iterates.
+ * WORKER: Smart Execution.
+ * - Reads 'Item List Back End' & 'Market Settings' internally.
+ * - Loops through all markets.
  */
-function _updateFuzzMarketDataWorker(typeIdBatch, marketConfig, isNewRun) {
+function _updateFuzzMarketDataWorker() {
   // Polyfill logger
   const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('FuzzWorker') : console;
   const ss = SpreadsheetApp.getActiveSpreadsheet();
 
-  // --- 1. MAINTENANCE GATES ---
-  if (typeof isSdeJobRunning === 'function' && isSdeJobRunning()) {
-    if (typeof LOG.warn === 'function') LOG.warn("ABORT: SDE Update in progress. Parking Fuzz Worker.");
-    SCRIPT_PROPS.setProperty('fuzz_job_active', 'false');
+  // --- 1. LOAD ITEMS ---
+  const itemSheet = ss.getSheetByName("Item List Back End");
+  if (!itemSheet) {
+    console.error("[FuzzWorker] Critical: 'Item List Back End' sheet missing.");
     return;
   }
-  if (typeof isEngineRunning_ === 'function' && !isEngineRunning_()) {
-    if (typeof LOG.warn === 'function') LOG.warn("ABORT: Engine is parked. Skipping Fuzz fetch.");
-    return;
+  
+  const itemData = itemSheet.getDataRange().getValues();
+  const typeIdBatch = [];
+  
+  // Skip Header, Read Col A (Index 0)
+  for (let i = 1; i < itemData.length; i++) {
+    const id = parseInt(itemData[i][0]);
+    if (!isNaN(id)) typeIdBatch.push(id);
   }
 
-  // --- 2. SELF-HEALING: ID BATCH ---
-  if (!typeIdBatch || !Array.isArray(typeIdBatch) || typeIdBatch.length === 0) {
-    console.warn("[FuzzWorker] Empty typeIdBatch. Self-Healing from 'Item List Back End'...");
-    const itemSheet = ss.getSheetByName("Item List Back End");
-    if (itemSheet) {
-      const data = itemSheet.getDataRange().getValues();
-      typeIdBatch = [];
-      for (let i = 1; i < data.length; i++) {
-        const id = parseInt(data[i][0]);
-        if (!isNaN(id)) typeIdBatch.push(id);
-      }
-      console.log(`[FuzzWorker] Loaded ${typeIdBatch.length} items from backend.`);
-    }
-  }
-
-  // --- 3. SELF-HEALING: BUILD MARKET LIST ---
-  let marketsToProcess = [];
-
-  // Case A: Orchestrator sent a specific config (Standard Operation)
-  if (marketConfig && marketConfig.market_id) {
-    marketsToProcess.push(marketConfig);
-  } 
-  // Case B: Orchestrator failed (Current Situation) -> Read ALL from Sheet
-  else {
-    console.warn("[FuzzWorker] Missing Market Config. Reading ALL hubs from 'Market Settings'...");
-    const hubSheet = ss.getSheetByName("Market Settings");
-    if (hubSheet) {
-      const hubData = hubSheet.getDataRange().getValues();
-      // CSV Offset: Col D (Index 3)=Station, Col E (Index 4)=System
-      for (let i = 1; i < hubData.length; i++) {
-        const sysId = parseInt(hubData[i][4]);
-        const statId = parseInt(hubData[i][3]);
-
-        if (!isNaN(sysId)) {
-          marketsToProcess.push({ market_id: sysId, market_type: 'system' });
-        } else if (!isNaN(statId)) {
-          marketsToProcess.push({ market_id: statId, market_type: 'station' });
-        }
-      }
-    }
-    // Fallback if sheet is totally empty
-    if (marketsToProcess.length === 0) {
-      marketsToProcess.push({ market_id: 60003760, market_type: 'station' });
-    }
-  }
-
-  // --- 4. SAFETY CHECK ---
   if (typeIdBatch.length === 0) {
-    console.error(`[FuzzWorker] Abort: No Items found to fetch.`);
-    SCRIPT_PROPS.setProperty('fuzz_job_active', 'false');
+    console.warn("[FuzzWorker] No Type IDs found in backend list.");
     return;
   }
 
-  console.log(`[FuzzWorker] Processing ${marketsToProcess.length} Markets...`);
+  // --- 2. LOAD MARKETS ---
+  const hubSheet = ss.getSheetByName("Market Settings");
+  const marketsToProcess = [];
+  
+  if (hubSheet) {
+    const hubData = hubSheet.getDataRange().getValues();
+    // CSV Offset: Col D (Index 3)=Station, Col E (Index 4)=System
+    for (let i = 1; i < hubData.length; i++) {
+      const sysId = parseInt(hubData[i][4]);
+      const statId = parseInt(hubData[i][3]);
 
-  // --- 5. ITERATE AND FETCH ---
+      if (!isNaN(sysId)) {
+        marketsToProcess.push({ market_id: sysId, market_type: 'system' });
+      } else if (!isNaN(statId)) {
+        marketsToProcess.push({ market_id: statId, market_type: 'station' });
+      }
+    }
+  }
+
+  // Fallback to Jita
+  if (marketsToProcess.length === 0) {
+    marketsToProcess.push({ market_id: 60003760, market_type: 'station' });
+  }
+
+  // --- 3. EXECUTE LOOP ---
+  console.log(`[FuzzWorker] Starting Cycle: ${typeIdBatch.length} items across ${marketsToProcess.length} markets.`);
+
   marketsToProcess.forEach(activeConfig => {
     try {
-      // Fetch
       const marketData = getMarketPrices(typeIdBatch, activeConfig.market_id, activeConfig.market_type);
       
-      if (!marketData || Object.keys(marketData).length === 0) {
-        console.warn(`[FuzzWorker] No data returned for ${activeConfig.market_id}. Skipping.`);
-        return; 
-      }
+      if (!marketData || Object.keys(marketData).length === 0) return;
 
-      // Transform
       const rowsToStream = [];
       const timestamp = new Date().toISOString();
 
@@ -180,23 +180,19 @@ function _updateFuzzMarketDataWorker(typeIdBatch, marketConfig, isNewRun) {
         }
       });
 
-      // Stream
       if (rowsToStream.length > 0) {
         if (typeof streamToBigQuery === 'function') {
           streamToBigQuery(rowsToStream);
-          // Small delay to prevent hitting BigQuery "concurrent rate" limits
-          Utilities.sleep(500); 
-        } else {
-          console.warn("[FuzzWorker] streamToBigQuery missing.");
+          Utilities.sleep(200); 
         }
       }
 
     } catch (e) {
-      console.error(`[FuzzWorker] Failed processing Hub ${activeConfig.market_id}: ${e.message}`);
+      console.error(`[FuzzWorker] Error on Hub ${activeConfig.market_id}: ${e.message}`);
     }
   });
-  
-  console.log(`[FuzzWorker] Batch Complete.`);
+
+  console.log(`[FuzzWorker] Cycle Complete.`);
 }
 
 

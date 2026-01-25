@@ -196,10 +196,25 @@ function masterOrchestrator() {
   // --- TASK 1: FUZZ ---
   updateFuzzMarketDataSheet();
 
-  // --- TASK 2: SYNC ---
-  if (hasFuel(45)) { // Need 45s buffer for ESI
+// --- TASK 2: SYNC ---
+  // We bump the fuel requirement slightly (60s) because we are doing two steps now.
+  if (hasFuel(60)) { 
     console.log("Fuel Good. Syncing Interfaces...");
+    
+    // STEP A: Pull data from Cache -> Publish Sheet
+    // This ensures 'Publish_ESI_Region' is never empty, even if the worker is running.
+    if (typeof publishMarketResultESIRegion === 'function') {
+      try {
+        publishMarketResultESIRegion(); 
+        console.log("Intermediate Publish Table Updated.");
+      } catch (e) {
+        console.warn("Intermediate Publish Failed (Skipping Sync): " + e.message);
+      }
+    }
+
+    // STEP B: Push data from Publish Sheet -> Client Sheets
     ESI_publishClientInterfaces();
+    
   } else {
     console.warn("Low Fuel! Skipping Sync to avoid hard timeout.");
   }

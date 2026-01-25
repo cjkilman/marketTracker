@@ -559,6 +559,67 @@ function isValidRegionId_(n) {
   return Number.isFinite(n) && n >= 10000000 && n < 20000000;
 }
 
+/**
+ * GAP FILLER: Scans 'Item List Back End' vs 'Cache_Market_ESI_Region'.
+ * Fetches any item that is missing from the Cache.
+ */
+function fillMissingEsiHistory() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const cacheSh = ss.getSheetByName('Cache_Market_ESI_Region');
+  
+  // 1. Get Expected IDs (From Source)
+  const expectedIds = readListFlex_(ITEMS_SOURCE, { numeric: true });
+  
+  // 2. Get Existing IDs (From Cache)
+  const existingIds = new Set();
+  if (cacheSh && cacheSh.getLastRow() > 1) {
+    // Cache has data: [type_id, region_id, ...]
+    // We only care about type_id (Col A) for now, or you can check pair key.
+    const data = cacheSh.getRange(2, 1, cacheSh.getLastRow()-1, 1).getValues();
+    data.forEach(r => existingIds.add(Number(r[0])));
+  }
+
+  // 3. Find Gaps
+  const missing = expectedIds.filter(id => !existingIds.has(id));
+
+  if (missing.length === 0) {
+    console.log("[GapFiller] Cache is complete. No missing items.");
+    return;
+  }
+
+  console.log(`[GapFiller] Found ${missing.length} missing items. Fetching...`);
+
+  // 4. Manual Fetch Loop (Reusing your internal logic)
+  // We target your default regions from 'Market Settings'
+  const regions = readListFlex_(REGIONS_SOURCE, { 
+    numeric: true, integer: true, dropZeros: true, validator: isValidRegionId_ 
+  });
+  
+  regions.forEach(rid => {
+    // Reuse your existing batch fetcher
+    const results = fetchHistoryBatchGESI_(rid, missing);
+    
+    // Format for Cache Upsert
+    const rowsOut = [];
+    results.forEach(r => {
+      if (r.status === 'OK') {
+        rowsOut.push([r.typeId, rid, r.vol30, r.vel, new Date(), 'OK']);
+      } else {
+        rowsOut.push([r.typeId, rid, "", "", new Date(), r.status]);
+      }
+    });
+
+    // Save to Cache
+    if (rowsOut.length) {
+      upsertRegionCache_(ensureCacheMarketESIRegion_(ss), rowsOut);
+      console.log(`[GapFiller] Saved ${rowsOut.length} items for Region ${rid}`);
+    }
+  });
+
+  // 5. Update Publish Sheet immediately
+  publishMarketResultESIRegion();
+  console.log("[GapFiller] Complete. Cache & Publish updated.");
+}
 
 /* ============================ CLIENT SIDE ============================== */
 /**
