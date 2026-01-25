@@ -68,52 +68,89 @@ function _resetFuzzMarketDataJobState(error) {
 }
 
 
-/**
- * Internal check to see if the refresh "Engine" is active.
- * Returns true if the ESI toggle (D3) in the Utility sheet is set to 1.
- */
-function isEngineRunning_() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const util = ss.getSheetByName("Utility");
-  if (!util) return false;
-  
-  // Checks cell D3 (TICK.ESI)
-  return util.getRange("D3").getValue() === 1;
-}
+
 
 /**
- * REVISED: Worker with Undefined Safety Gate
+ * REVISED: Self-Healing Worker (Variable Renamed)
+ * - Uses 'typeIdBatch' for clarity.
+ * - Auto-detects empty batch and refills from 'Item List Back End'.
+ * - Defaults to Jita/Amarr if config is missing.
  */
-function _updateFuzzMarketDataWorker(idBatch, marketConfig, isNewRun) {
-  const LOG = LoggerEx.withTag('FuzzWorker');
+function _updateFuzzMarketDataWorker(typeIdBatch, marketConfig, isNewRun) {
+  // Polyfill logger if LoggerEx missing in this context
+  const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('FuzzWorker') : console;
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
   
-// --- ADDED MAINTENANCE GATES ---
-  if (isSdeJobRunning()) {
-    LOG.warn("ABORT: SDE Update in progress. Parking Fuzz Worker.");
+  // --- 1. MAINTENANCE GATES ---
+  if (typeof isSdeJobRunning === 'function' && isSdeJobRunning()) {
+    if (typeof LOG.warn === 'function') LOG.warn("ABORT: SDE Update in progress. Parking Fuzz Worker.");
     SCRIPT_PROPS.setProperty('fuzz_job_active', 'false');
     return;
   }
 
-  if (!isEngineRunning_()) {
-    LOG.warn("ABORT: Engine is parked. Skipping Fuzz fetch.");
+  if (typeof isEngineRunning_ === 'function' && !isEngineRunning_()) {
+    if (typeof LOG.warn === 'function') LOG.warn("ABORT: Engine is parked. Skipping Fuzz fetch.");
     return;
   }
 
+  // --- 2. SELF-HEALING: ID BATCH ---
+  // If Orchestrator sent nothing (due to sheet mismatch), we fetch from backend.
+  if (!typeIdBatch || !Array.isArray(typeIdBatch) || typeIdBatch.length === 0) {
+    console.warn("[FuzzWorker] Empty typeIdBatch detected. Attempting Self-Heal from 'Item List Back End'...");
+    
+    const itemSheet = ss.getSheetByName("Item List Back End");
+    if (itemSheet) {
+      const data = itemSheet.getDataRange().getValues();
+      typeIdBatch = []; // Reset
+      // Skip Header, Read Col A (Index 0)
+      for (let i = 1; i < data.length; i++) {
+        const id = parseInt(data[i][0]);
+        if (!isNaN(id)) typeIdBatch.push(id);
+      }
+      console.log(`[FuzzWorker] Self-Heal complete. Loaded ${typeIdBatch.length} items.`);
+    }
+  }
 
-  // --- SAFETY GATE: Catch undefined/empty batches before they hit .length ---
-  if (!idBatch || !Array.isArray(idBatch) || idBatch.length === 0) {
-    console.warn(`[FuzzWorker] Worker invoked with empty or invalid idBatch. Ending cycle.`);
-    // Reset the job state so the Orchestrator doesn't keep "bumping" a dead job
+  // --- 3. SELF-HEALING: MARKET CONFIG ---
+  // If Orchestrator sent no config, grab the first valid hub from Settings.
+  if (!marketConfig || !marketConfig.market_id) {
+    console.warn("[FuzzWorker] Missing Market Config. Reading 'Market Settings'...");
+    const hubSheet = ss.getSheetByName("Market Settings");
+    if (hubSheet) {
+      const hubData = hubSheet.getDataRange().getValues();
+      // Look for Amarr (System 30002187) or Jita (Station 60003760)
+      // Your CSV Offset: Col D (Index 3)=Station, Col E (Index 4)=System
+      for (let i = 1; i < hubData.length; i++) {
+        const sysId = parseInt(hubData[i][4]);
+        const statId = parseInt(hubData[i][3]);
+        
+        if (!isNaN(sysId)) {
+          marketConfig = { market_id: sysId, market_type: 'system' };
+          break; // Use first valid system
+        }
+        if (!isNaN(statId)) {
+          marketConfig = { market_id: statId, market_type: 'station' };
+        }
+      }
+    }
+    // Final Fallback: Jita 4-4
+    if (!marketConfig) marketConfig = { market_id: 60003760, market_type: 'station' };
+  }
+
+  // --- 4. FINAL SAFETY GATE ---
+  // If it's STILL empty after self-healing, then we truly abort.
+  if (!typeIdBatch || typeIdBatch.length === 0) {
+    console.error(`[FuzzWorker] Worker invoked with empty or invalid typeIdBatch (Self-Heal failed). Ending cycle.`);
     SCRIPT_PROPS.setProperty('fuzz_job_active', 'false');
     SCRIPT_PROPS.setProperty('fuzz_cursor', '0');
     return;
   }
 
   try {
-    // Now it is safe to check .length
-    console.log(`[FuzzWorker] Starting FuzAPI Pull for ${idBatch.length} items in ${marketConfig.market_type}: ${marketConfig.market_id}`);
+    console.log(`[FuzzWorker] Starting FuzAPI Pull for ${typeIdBatch.length} items in ${marketConfig.market_type}: ${marketConfig.market_id}`);
 
-    const marketData = fuzAPI.getMarketPrices(idBatch, marketConfig.market_id, marketConfig.market_type);
+    // Call the Global Wrapper (NOT fuzAPI.getMarketPrices)
+    const marketData = getMarketPrices(typeIdBatch, marketConfig.market_id, marketConfig.market_type);
     
     if (!marketData || Object.keys(marketData).length === 0) {
       console.warn(`[FuzzWorker] FuzAPI returned empty set for this batch. Skipping.`);
@@ -123,7 +160,7 @@ function _updateFuzzMarketDataWorker(idBatch, marketConfig, isNewRun) {
     const rowsToStream = [];
     const timestamp = new Date().toISOString();
 
-    idBatch.forEach(typeId => {
+    typeIdBatch.forEach(typeId => {
       const data = marketData[typeId];
       if (data) {
         const buy = data.buy || {};
@@ -147,11 +184,16 @@ function _updateFuzzMarketDataWorker(idBatch, marketConfig, isNewRun) {
     console.log(`[FuzzWorker] FuzAPI fetch complete. Found ${rowsToStream.length} active items.`);
 
     if (rowsToStream.length > 0) {
-      streamToBigQuery(rowsToStream);
+      if (typeof streamToBigQuery === 'function') {
+        streamToBigQuery(rowsToStream);
+      } else {
+        console.warn("[FuzzWorker] streamToBigQuery function missing. Skipping upload.");
+      }
     }
 
   } catch (e) {
-    LOG.error(`Worker Failure: ${e.message}`);
+    if (typeof LOG.error === 'function') LOG.error(`Worker Failure: ${e.message}`);
+    else console.error(`Worker Failure: ${e.message}`);
     throw e; 
   }
 }
