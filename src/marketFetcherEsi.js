@@ -823,12 +823,13 @@ function readListFlex_(spec, opts) {
     let itemName = vals[i][1] ? String(vals[i][1]).trim() : "Unknown Item";
 
 // --- THE SILENT GATE ---
-    // If the ID is a known spreadsheet error, just skip it. No logs.
+    // If the ID is a known spreadsheet error, skip this row but keep going.
     if (String(typeIdRaw).includes("#N/A") || 
         String(typeIdRaw).includes("Check Name") || 
         String(typeIdRaw).includes("#VALUE!") || 
         String(typeIdRaw).includes("#REF!")) {
-      return; // Silent skip.
+      
+      continue; // <--- CORRECT: Skips this item, proceeds to the next.
     }
 
     if (!typeIdRaw.length) continue; 
