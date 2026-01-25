@@ -493,6 +493,11 @@ function fuzAPI_DailyReset_Trigger() {
   fuzAPI.resetCircuit();
 }
 
+function force_Engine_Wake() {
+  PropertiesService.getScriptProperties().setProperty('GLOBAL_SYSTEM_STATE', 'RUNNING');
+  SpreadsheetApp.getActiveSpreadsheet().toast("Engine Woken Manually", "System Status");
+}
+
 /**
  * MANUAL UI HOOK: You can run this from the editor to reset immediately.
  */
