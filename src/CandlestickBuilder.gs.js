@@ -2,6 +2,11 @@
 // is this Sheet Formula 
 // Something about All Items Candle Stick chaart?
 
+/**
+ * Note this projects Paused pending Time and Updates
+ */
+
+
 function getDailyCandlestick(type_id, market_id, market_type, date) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName("Market History");

@@ -78,10 +78,10 @@ function _resetFuzzMarketDataJobState(error) {
     SCRIPT_PROP.deleteProperty(FUZZ_PROP_STEP);
     SCRIPT_PROP.deleteProperty(FUZZ_PROP_INDEX);
     SCRIPT_PROP.deleteProperty(FUZZ_PROP_ROW);
-    
+
     // REMOVE OR COMMENT OUT THIS LINE:
     // SCRIPT_PROP.deleteProperty(FUZZ_PROP_LEASE); 
-    
+
     // Delete potential triggers
     deleteTriggersByName('updateFuzzMarketDataSheet');
   } catch (propError) {
@@ -109,10 +109,10 @@ function _updateFuzzMarketDataWorker() {
     console.error("[FuzzWorker] Critical: 'Item List Back End' sheet missing.");
     return;
   }
-  
+
   const itemData = itemSheet.getDataRange().getValues();
   const typeIdBatch = [];
-  
+
   // Skip Header, Read Col A (Index 0)
   for (let i = 1; i < itemData.length; i++) {
     const id = parseInt(itemData[i][0]);
@@ -127,7 +127,7 @@ function _updateFuzzMarketDataWorker() {
   // --- 2. LOAD MARKETS ---
   const hubSheet = ss.getSheetByName("Market Settings");
   const marketsToProcess = [];
-  
+
   if (hubSheet) {
     const hubData = hubSheet.getDataRange().getValues();
     // CSV Offset: Col D (Index 3)=Station, Col E (Index 4)=System
@@ -154,7 +154,7 @@ function _updateFuzzMarketDataWorker() {
   marketsToProcess.forEach(activeConfig => {
     try {
       const marketData = getMarketPrices(typeIdBatch, activeConfig.market_id, activeConfig.market_type);
-      
+
       if (!marketData || Object.keys(marketData).length === 0) return;
 
       const rowsToStream = [];
@@ -180,15 +180,22 @@ function _updateFuzzMarketDataWorker() {
         }
       });
 
+      // --- CRITICAL: STREAM TO BIGQUERY ---
       if (rowsToStream.length > 0) {
-        if (typeof streamToBigQuery === 'function') {
-          streamToBigQuery(rowsToStream);
-          Utilities.sleep(200); 
-        }
+        // 1. Lock the Orchestrator out while we write
+        PropertiesService.getScriptProperties().setProperty('fuzz_job_active', 'true');
+
+        console.log(`[BQ] Streaming ${rowsToStream.length} rows for Market: ${activeConfig.market_id}`);
+        streamToBigQuery(rowsToStream); // This pushes data to your BQ table
+
+        // 2. Unlock immediately after this batch finishes
+        PropertiesService.getScriptProperties().setProperty('fuzz_job_active', 'false');
       }
 
     } catch (e) {
       console.error(`[FuzzWorker] Error on Hub ${activeConfig.market_id}: ${e.message}`);
+      // Safety: Ensure flag is cleared even on error
+      PropertiesService.getScriptProperties().setProperty('fuzz_job_active', 'false');
     }
   });
 
@@ -216,7 +223,7 @@ function postTighten_(sh) {
 
 function _trimTrailing_(sh) {
   if (!sh) return;
-  
+
   const lastRow = sh.getLastRow();
   const maxRows = sh.getMaxRows();
   const lastCol = sh.getLastColumn();
@@ -280,7 +287,7 @@ function _deleteInBlocks_(sh, startRow, count) {
 
 
 /** Batch/contiguous prune for "older than N days" assuming chronological appends. */
-function pruneOldRows(sheet, retentionDays, dateCol /* 1-based */ ) {
+function pruneOldRows(sheet, retentionDays, dateCol /* 1-based */) {
   if (!retentionDays || !sheet) return;
   const lastRow = sheet.getLastRow();
   if (lastRow < 2) return;
@@ -388,7 +395,7 @@ function _heavyPruneWorker() {
   const LOG = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('PruneWorker') : console); // <-- Uses LOG
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const START_TIME = Date.now();
-  
+
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const cfg = getConfig(); // Corrected config call
   const sourceSheetName = FUZZ_SHEET_FINAL; // Market Prices is now the source
@@ -400,9 +407,9 @@ function _heavyPruneWorker() {
 
   try {
     // --- State: NEW_RUN (Start) ---
-  // REFACTORED: Use strings directly
+    // REFACTORED: Use strings directly
     if (currentState === "NEW_RUN") {
-      LOG.info(`State: NEW_RUN. Preparing prune temp sheet.`); 
+      LOG.info(`State: NEW_RUN. Preparing prune temp sheet.`);
       const docLock = LockService.getDocumentLock();
       if (docLock.tryLock(FUZZ_DOC_LOCK_TIMEOUT)) {
         try {
@@ -410,34 +417,34 @@ function _heavyPruneWorker() {
           const oldSheetName = FUZZ_SHEET_FINAL + "_Prune_Old";
           const oldSheet = ss.getSheetByName(oldSheetName);
           if (oldSheet) {
-             LOG.info(`Deleting old backup sheet to free space: ${oldSheetName}`);
-             ss.deleteSheet(oldSheet);
+            LOG.info(`Deleting old backup sheet to free space: ${oldSheetName}`);
+            ss.deleteSheet(oldSheet);
           }
-          
+
           const existingTemp = ss.getSheetByName(tempSheetName);
           if (existingTemp) {
-             LOG.info(`Deleting stale temp sheet to free space: ${tempSheetName}`);
-             ss.deleteSheet(existingTemp);
+            LOG.info(`Deleting stale temp sheet to free space: ${tempSheetName}`);
+            ss.deleteSheet(existingTemp);
           }
           SpreadsheetApp.flush(); // Ensure deletion is committed before insertion
           // [END FIX]
 
           const tempSheet = getOrCreateSheet(ss, tempSheetName, FUZZ_SHEET_HEADERS);
           // (No need to clear content since we just deleted and recreated it)
-          
+
           tempSheet.hideSheet();
           SpreadsheetApp.flush();
 
           SCRIPT_PROP.setProperty(PRUNE_PROP_READ_ROW, '2'); // Data starts row 2
-          
+
           currentState = "PROCESSING";
           SCRIPT_PROP.setProperty(PRUNE_PROP_STEP, currentState);
-          LOG.info(`Temp sheet '${tempSheetName}' prepared. Transitioning to ${currentState}.`); 
+          LOG.info(`Temp sheet '${tempSheetName}' prepared. Transitioning to ${currentState}.`);
         } finally {
           docLock.releaseLock();
         }
       } else {
-        LOG.warn(`Document Lock busy during prune setup. Rescheduling.`); 
+        LOG.warn(`Document Lock busy during prune setup. Rescheduling.`);
         scheduleOneTimeTrigger('_heavyPruneWorker', FUZZ_RESCHEDULE_MS);
         return;
       }
@@ -447,7 +454,7 @@ function _heavyPruneWorker() {
     // REFACTORED: Use strings directly
     if (currentState === "PROCESSING") {
       LOG.info(`State: PROCESSING. Reading/deduping batches.`); // <-- Uses LOG
-      
+
       const sourceSheet = ss.getSheetByName(sourceSheetName);
       const tempSheet = ss.getSheetByName(tempSheetName);
       if (!sourceSheet || !tempSheet) {
@@ -456,21 +463,21 @@ function _heavyPruneWorker() {
 
       let readRow = parseInt(SCRIPT_PROP.getProperty(PRUNE_PROP_READ_ROW) || '2');
       const lastRow = sourceSheet.getLastRow();
-      
+
       // --- Find Header Indices ---
       const header = sourceSheet.getRange(1, 1, 1, sourceSheet.getLastColumn()).getValues()[0];
       const lower = header.map(h => String(h).trim().toLowerCase());
       const find = (name) => lower.findIndex(h => h === name);
       const DATE = find('date'), TYPE = find('type_id'), MID = find('market_id'), MTP = find('market_type');
-      
+
       // --- REFACTORED: Find price columns for filtering ---
       const MIN_SELL = find('min_sell');
       const MAX_BUY = find('max_buy');
-      
+
       if (DATE < 0 || TYPE < 0 || MID < 0 || MTP < 0 || MIN_SELL < 0 || MAX_BUY < 0) {
         throw new Error('Missing required columns (date/type_id/market_id/market_type/min_sell/max_buy) in source sheet.');
       }
-      
+
       // --- Processing Loop ---
       while (readRow <= lastRow) {
         // --- 1. Time Limit Check ---
@@ -483,11 +490,11 @@ function _heavyPruneWorker() {
 
         // --- 2. Read Batch ---
         const rowsToRead = Math.min(PRUNE_BATCH_SIZE, lastRow - readRow + 1);
-        if (rowsToRead <= 0) break; 
-        
+        if (rowsToRead <= 0) break;
+
         LOG.info(`Reading ${rowsToRead} rows from ${sourceSheetName} (starting row ${readRow})...`); // <-- Uses LOG
         const data = sourceSheet.getRange(readRow, 1, rowsToRead, header.length).getValues();
-        
+
         // --- 3. Process Batch (Retention, Bucket, Dedupe) ---
         const retentionDays = cfg.PriceRetentionDays || 1; // Use PriceRetentionDays from config
         const bucketMinutes = cfg.BucketMinutes || 20; // Use BucketMinutes from config
@@ -520,7 +527,7 @@ function _heavyPruneWorker() {
             keep.set(key, r); // Dedupe filter
           }
         }
-        
+
         const rowsToWrite = Array.from(keep.values());
 
         // --- 4. Write Batch (Throttle Sheet Writes / Retrigger) ---
@@ -540,11 +547,11 @@ function _heavyPruneWorker() {
             return;
           }
         }
-        
+
         // --- 5. Advance Index ---
         readRow += rowsToRead;
         SCRIPT_PROP.setProperty(PRUNE_PROP_READ_ROW, readRow.toString());
-      
+
       } // --- End while loop ---
 
       // --- Post-Loop Check ---
@@ -572,7 +579,7 @@ function _heavyPruneWorker() {
 function _finalizePrune() {
   const LOG = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('PruneFinalizer') : console);
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
-  
+
   // REFACTORED: Use strings directly
   if (SCRIPT_PROP.getProperty(PRUNE_PROP_STEP) !== "FINALIZING") {
     LOG.warn(`Finalizer called in incorrect state (${SCRIPT_PROP.getProperty(PRUNE_PROP_STEP)}). Aborting.`);
@@ -598,18 +605,18 @@ function _finalizePrune() {
         // --- 1. Secondary Deduplication (in memory) ---
         LOG.info("Reading temp sheet for final deduplication...");
         const data = tempSheet.getRange(2, 1, tempSheet.getLastRow() - 1, tempSheet.getLastColumn()).getValues();
-        
+
         const bucketMinutes = cfg.BucketMinutes || 20; // Use BucketMinutes from config
         const maxRows = cfg.PricesMaxRows || 100000; // Use PricesMaxRows from config
 
         const msPerBucket = bucketMinutes * 60 * 1000;
         const keep = new Map();
-        
+
         const header = tempSheet.getRange(1, 1, 1, tempSheet.getLastColumn()).getValues()[0];
         const lower = header.map(h => String(h).trim().toLowerCase());
         const find = (name) => lower.findIndex(h => h === name);
         const DATE = find('date'), TYPE = find('type_id'), MID = find('market_id'), MTP = find('market_type');
-        
+
         // --- REFACTORED: Find price columns for filtering ---
         const MIN_SELL = find('min_sell');
         const MAX_BUY = find('max_buy');
@@ -629,7 +636,7 @@ function _finalizePrune() {
           // --- END REFACTOR ---
 
           const d = r[DATE];
-          if (!(d instanceof Date)) continue; 
+          if (!(d instanceof Date)) continue;
 
           const bucket = Math.floor(d.getTime() / msPerBucket);
           const key = bucket + '|' + r[TYPE] + '|' + r[MID] + '|' + r[MTP];
@@ -639,17 +646,17 @@ function _finalizePrune() {
             keep.set(key, r);
           }
         }
-        
+
         let deduped = Array.from(keep.values());
         LOG.info(`Final deduplication complete. Kept ${deduped.length} rows.`);
 
         // --- 2. Cap Rows ---
         if (deduped.length > maxRows) {
-          deduped.sort((a,b) => a[DATE] - b[DATE]); // Sort by date ascending
+          deduped.sort((a, b) => a[DATE] - b[DATE]); // Sort by date ascending
           deduped = deduped.slice(deduped.length - maxRows); // Keep the newest rows
           LOG.info(`Capped rows to ${deduped.length} (max: ${maxRows}).`);
         }
-        
+
         // --- 3. Rewrite Temp Sheet ---
         tempSheet.clearContents(); // Clear everything
         tempSheet.getRange(1, 1, 1, header.length).setValues([header]); // Set header
@@ -668,11 +675,11 @@ function _finalizePrune() {
         if (finalSheet) finalSheet.setName(oldSheetName);
         tempSheet.setName(finalSheetName);
         tempSheet.showSheet(); // Use tempSheet handle which is now the final sheet
-        
+
         // --- THIS WAS THE FIX YOU MADE ---
         SpreadsheetApp.flush(); // <-- You fixed this! (Was Spreadfuzz.flush())
         // --- END OF FIX ---
-        
+
         LOG.info("Atomic sheet swap successful."); // <-- CORRECTED LOG VARIABLE
 
         // --- 5. Reset Prune Job State ---
@@ -725,7 +732,7 @@ function emergencyCleanup() {
     'Market Prices_Prune_Old',  // Old backup from previous swaps
     'Market_Prices_Prune_Temp'  // Stale temp sheet from failed runs
   ];
-  
+
   sheetsToDelete.forEach(name => {
     const sheet = ss.getSheetByName(name);
     if (sheet) {
@@ -740,6 +747,6 @@ function emergencyCleanup() {
   const mainSheet = ss.getSheetByName('Market Prices');
   if (mainSheet) {
     console.log('Trimming trailing empty rows from Market Prices...');
-    _trimTrailing_(mainSheet); 
+    _trimTrailing_(mainSheet);
   }
 }

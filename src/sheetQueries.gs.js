@@ -28,7 +28,7 @@ function masterMarketRefresh() {
 // 3. ROTATE AND REFRESH
   marketSheets.forEach(sheetName => {
     try {
-      refreshFilteredPrices(sheetName);
+      refreshPriceInterfaceSheets(sheetName);
       SpreadsheetApp.flush(); // Force the write to finish
       Utilities.sleep(500);   // Tiny gap to keep the UI snappy
     } catch (e) {
@@ -41,7 +41,7 @@ function masterMarketRefresh() {
  * WORKER: Hardened BigQuery Puller for a specific sheet.
  * Now acts as a modular unit for the Dispatcher.
  */
-function refreshFilteredPrices(targetSheetName) {
+function refreshPriceInterfaceSheets(targetSheetName) {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
   const projectId = 'tenacious-tiger-345318';
   
@@ -70,17 +70,20 @@ function refreshFilteredPrices(targetSheetName) {
     return; 
   }
 
-  // --- 2. THE BIGQUERY PULL ---
+// --- OPTIMIZED SINGLE QUERY ---
   const sql = `
-    SELECT date, type_id, max_buy, min_sell 
-    FROM (
-      SELECT *, ROW_NUMBER() OVER(PARTITION BY type_id ORDER BY date DESC) as rn
-      FROM \`${projectId}.market_data.market_prices\`
-      WHERE market_id = ${marketId}
+    SELECT 
+      type_id, 
+      ROUND(AVG(median_buy), 2) as median_buy_24h, 
+      ROUND(AVG(median_sell), 2) as median_sell_24h,
+      ARRAY_AGG(median_buy ORDER BY date DESC LIMIT 1)[OFFSET(0)] as current_buy,
+      ARRAY_AGG(median_sell ORDER BY date DESC LIMIT 1)[OFFSET(0)] as current_sell
+    FROM \`${projectId}.market_data.market_prices\`
+    WHERE market_id = ${marketId}
       AND LOWER(market_type) = LOWER('${marketType}')
-      AND date >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
-    )
-    WHERE rn = 1
+      /* Narrowing to 24 hours reduces data scan by ~96% */
+      AND date >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+    GROUP BY type_id
     ORDER BY type_id ASC
   `;
 
@@ -94,19 +97,32 @@ function refreshFilteredPrices(targetSheetName) {
       return;
     }
 
+    // --- 2. DATA MAPPING (Corrected to match the 5 SQL columns) ---
     const data = rows.map(row => [
-      new Date(row.f[0].v), 
-      row.f[1].v, 
-      row.f[2].v, 
-      row.f[3].v
+      row.f[0].v, // type_id (Replaces Date in Column E)
+      row.f[1].v, // Median Buy (24h Average)
+      row.f[2].v, // Median Sell (24h Average)
+      row.f[3].v, // Current Buy (Latest record)
+      row.f[4].v  // Current Sell (Latest record)
     ]);
 
-    // --- 3. THE WRITE (Starting Row 7) ---
-    sheet.getRange("A7:D").clearContent();
-    sheet.getRange(7, 1, 1, 4).setValues([["Date", "Type ID", "Max Buy", "Min Sell"]]);
-    sheet.getRange(8, 1, data.length, 4).setValues(data);
+    // --- 3. THE WRITE (Aligning with Row 7, Column E) ---
+    // Clear old data from Column E to I
+    sheet.getRange("E7:I").clearContent();
+
+    // Set Headers at E7 (Row 7, Column 5)
+    sheet.getRange(7, 5, 1, 5).setValues([[
+      "type_id_filtered", 
+      "Median Buy", 
+      "Median Sell", 
+      "Current Buy", 
+      "Current Sell"
+    ]]);
     
-    // Individual heartbeat for this sheet
+    // Set Data starting at E8
+    sheet.getRange(8, 5, data.length, 5).setValues(data);
+
+    // Heartbeat update
     sheet.getRange("E4").setValue(`✅ Synced: ${new Date().toLocaleTimeString()}`);
     console.log(`[${targetSheetName}] Success: ${data.length} items.`);
     

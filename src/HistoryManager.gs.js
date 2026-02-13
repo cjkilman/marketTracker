@@ -7,6 +7,11 @@
  * Target sheet:  "Market History"
  */
 
+
+/**
+ * Note: Disabled pending updates and Needed Dev time
+ */
+
 /* global LockService, PropertiesService, SpreadsheetApp, LoggerEx, 
    executeWithTryLock, scheduleOneTimeTrigger, getOrCreateSheet, _trimTrailing_,
    FUZZ_TIME_LIMIT_MS, FUZZ_RESCHEDULE_MS, FUZZ_DOC_LOCK_TIMEOUT, PT, mtConfig */

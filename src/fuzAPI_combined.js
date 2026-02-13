@@ -511,12 +511,19 @@ function marketStatData(type_ids, location_type, location_id, order_type, order_
     return Number.isFinite(n) ? n : null;
   });
 
-  // --- IMPROVED ERROR LOGGING ---
-  const lt = String(location_type || "").toLowerCase();
-  if (!["region","system","station"].includes(lt)) {
-    throw new Error(`Location Undefined: Received "${location_type}". Valid types are 'region', 'system', or 'station'. Check your spreadsheet parameters.`);
+// --- IMPROVED ERROR LOGGING & AUTO-CORRECTION ---
+  let lt = String(location_type || "").toLowerCase();
+  
+  // If the sheet sends #REF! or an empty cell, default to 'station' 
+  // so the script doesn't explode and kill your whole price table.
+  if (lt === "#ref!" || lt === "" || lt === "undefined") {
+    console.warn("FuzAPI: Received #REF! or empty location. Defaulting to 'station'.");
+    lt = "station"; 
   }
-  // ------------------------------
+
+  if (!["region","system","station"].includes(lt)) {
+    throw new Error(`Location Undefined: Received "${location_type}". Valid types are 'region', 'system', or 'station'.`);
+  }
 
   const { type: side, level: lvl } = _normalizeOrder(order_type, order_level);
   const validIds = flatIds.filter(n => n != null);
