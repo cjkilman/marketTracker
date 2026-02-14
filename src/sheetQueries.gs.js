@@ -1,133 +1,163 @@
 /**
- * MASTER DISPATCHER: Rotates through all listed market-pull sheets.
- * Hook this to your 30-minute trigger.
+ * Wrapper for the scheduler (Hardened against null/undefined event objects)
  */
-function masterMarketRefresh() {
-  const SCRIPT_PROP = PropertiesService.getScriptProperties();
-  const NOW_MS = Date.now();
+function refreshPriceInterfaceSheetsManual(e) {
+  let targetSheetName;
 
-// --- THE NEW GATE (Multi-task friendly) ---
-  const isWorkerActive = SCRIPT_PROPS.getProperty('fuzz_job_active') === 'true';
-  
-  if (isWorkerActive) {
-    console.warn("[REFRESH] Market Fetcher is currently STREAMING. Skipping refresh to avoid partial data.");
-    return; 
+  // 1. Check if 'e' exists at all
+  if (e) {
+    // If called directly with a string: ManualRefresh("Mineral Supply Prices")
+    if (typeof e === 'string') {
+      targetSheetName = e;
+    } 
+    // If called by a Time Trigger, 'e' is an object containing 'triggerUid'
+    else if (e.triggerUid) {
+      targetSheetName = PropertiesService.getScriptProperties().getProperty('last_scheduled_sheet');
+    }
   }
 
-  // If we get here, the engine is either IDLE or on LEASE (Cooling down).
-  // It is 100% safe to refresh the sheets now.
-  console.log("[REFRESH] Engine is parked. Proceeding with Display Sheet update...");
+  // 2. Fallback for manual IDE runs (Default to main sheet if e is null)
+  if (!targetSheetName) {
+    console.warn("[IDE RUN] No event object detected. Defaulting to 'filtered prices'.");
+    targetSheetName = 'filtered prices';
+  }
 
-  // 2. THE FLEET: List every sheet that uses the C4/D4/A7 layout
-  const marketSheets = [
-    'filtered prices', 
-    'Mineral Supply Prices', 
-    'T1 Supply Prices',
-  ];
-
-// 3. ROTATE AND REFRESH
-  marketSheets.forEach(sheetName => {
-    try {
-      refreshPriceInterfaceSheets(sheetName);
-      SpreadsheetApp.flush(); // Force the write to finish
-      Utilities.sleep(500);   // Tiny gap to keep the UI snappy
-    } catch (e) {
-      console.error(`[CRITICAL] Failed to refresh sheet "${sheetName}": ${e.message}`);
-    }
-  });
-}
-
-/**
- * WORKER: Hardened BigQuery Puller for a specific sheet.
- * Now acts as a modular unit for the Dispatcher.
- */
-function refreshPriceInterfaceSheets(targetSheetName) {
-  const SCRIPT_PROP = PropertiesService.getScriptProperties();
-  const projectId = 'tenacious-tiger-345318';
-  
-  // Default to main sheet if called manually without an argument
-  if (!targetSheetName) targetSheetName = 'filtered prices';
-  
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName(targetSheetName);
-
-  if (!sheet) {
-    console.warn(`[SKIP] Sheet "${targetSheetName}" not found in workbook.`);
+  // 3. Final validation to prevent the [object Object] crash
+  if (targetSheetName === "[object Object]") {
+    console.error("[ERROR] Resolved target was an object string. Aborting.");
     return;
   }
 
-  // --- 1. INPUT GATING (Handle ImportRange Failures) ---
+  console.log(`[EXECUTE] Background pulse starting for: ${targetSheetName}`);
+  refreshPriceInterfaceSheets(null, targetSheetName, null);
+}
+
+
+/**
+ * WORKER: Surgical BigQuery Puller with ID Filtering & API Fallback.
+ * Targets Column E:I on the target sheet using Item List Back End (A2:A).
+ */
+function refreshPriceInterfaceSheets(ss, targetSheetName, uniqueIds) {
+  const projectId = 'tenacious-tiger-345318';
+  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(targetSheetName);
+
+  if (!sheet) {
+    console.warn(`[SKIP] Sheet "${targetSheetName}" not found.`);
+    return;
+  }
+
+  // --- 1. ID FILTERING (The Cost Shield) ---
+  if (!uniqueIds) {
+    const itemSheet = ss.getSheetByName("Item List Back End");
+    const rawIds = itemSheet.getRange(2, 1, Math.max(1, itemSheet.getLastRow() - 1), 1).getValues();
+    uniqueIds = [...new Set(rawIds.flat().map(id => parseInt(id)).filter(id => !isNaN(id) && id > 0))];
+  }
+  
+  if (uniqueIds.length === 0) return;
+  const idString = uniqueIds.join(',');
+
+  // --- 2. INPUT GATING ---
   const marketId = sheet.getRange("C4").getValue();
   const marketType = sheet.getRange("D4").getValue();
 
-  // Validate inputs: Abort if #N/A or Loading
-  const isIdValid = marketId && !isNaN(marketId) && marketId !== "#N/A" && marketId !== "";
-  const isTypeValid = marketType && marketType !== "#N/A" && marketType !== "" && marketType.toLowerCase() !== "loading...";
-
-  if (!isIdValid || !isTypeValid) {
-    console.warn(`[${targetSheetName}] GATE BLOCKED: Settings missing or invalid. Retrying next cycle.`);
-    sheet.getRange("E4").setValue(`⚠️ Delayed: Settings Loading... (${new Date().toLocaleTimeString()})`);
+  if (!marketId || marketId === "#N/A" || !marketType || marketType.toLowerCase().includes("loading")) {
+    sheet.getRange("E4").setValue(`⚠️ Waiting for Settings...`);
     return; 
   }
 
-// --- OPTIMIZED SINGLE QUERY ---
+  // --- 3. THE RECALL SQL ---
   const sql = `
     SELECT 
-      type_id, 
-      ROUND(AVG(median_buy), 2) as median_buy_24h, 
-      ROUND(AVG(median_sell), 2) as median_sell_24h,
-      ARRAY_AGG(median_buy ORDER BY date DESC LIMIT 1)[OFFSET(0)] as current_buy,
-      ARRAY_AGG(median_sell ORDER BY date DESC LIMIT 1)[OFFSET(0)] as current_sell
+      type_id, ROUND(AVG(median_buy), 2), ROUND(AVG(median_sell), 2),
+      ARRAY_AGG(median_buy ORDER BY date DESC LIMIT 1)[OFFSET(0)],
+      ARRAY_AGG(median_sell ORDER BY date DESC LIMIT 1)[OFFSET(0)]
     FROM \`${projectId}.market_data.market_prices\`
     WHERE market_id = ${marketId}
       AND LOWER(market_type) = LOWER('${marketType}')
-      /* Narrowing to 24 hours reduces data scan by ~96% */
       AND date >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
-    GROUP BY type_id
-    ORDER BY type_id ASC
+      AND type_id IN (${idString})
+    GROUP BY type_id ORDER BY type_id ASC
   `;
 
   try {
     const queryResults = BigQuery.Jobs.query({query: sql, useLegacySql: false}, projectId);
-    const rows = queryResults.rows;
+    const data = queryResults.rows ? queryResults.rows.map(row => row.f.map(field => field.v)) : [];
 
-    if (!rows || rows.length === 0) {
-      console.warn(`[${targetSheetName}] No data found in BQ for Market ${marketId}.`);
-      sheet.getRange("E4").setValue("⚠️ No Data Found in BQ");
-      return;
-    }
+    if (data.length === 0) throw new Error("Empty BQ result");
+    writeToInterfaceSheet(sheet, data, "✅ Synced");
 
-    // --- 2. DATA MAPPING (Corrected to match the 5 SQL columns) ---
-    const data = rows.map(row => [
-      row.f[0].v, // type_id (Replaces Date in Column E)
-      row.f[1].v, // Median Buy (24h Average)
-      row.f[2].v, // Median Sell (24h Average)
-      row.f[3].v, // Current Buy (Latest record)
-      row.f[4].v  // Current Sell (Latest record)
-    ]);
-
-    // --- 3. THE WRITE (Aligning with Row 7, Column E) ---
-    // Clear old data from Column E to I
-    sheet.getRange("E7:I").clearContent();
-
-    // Set Headers at E7 (Row 7, Column 5)
-    sheet.getRange(7, 5, 1, 5).setValues([[
-      "type_id_filtered", 
-      "Median Buy", 
-      "Median Sell", 
-      "Current Buy", 
-      "Current Sell"
-    ]]);
-    
-    // Set Data starting at E8
-    sheet.getRange(8, 5, data.length, 5).setValues(data);
-
-    // Heartbeat update
-    sheet.getRange("E4").setValue(`✅ Synced: ${new Date().toLocaleTimeString()}`);
-    console.log(`[${targetSheetName}] Success: ${data.length} items.`);
-    
   } catch (err) {
-    console.error(`[${targetSheetName}] BQ Error: ${err.message}`);
-    sheet.getRange("E4").setValue("❌ BQ Query Error");
+    console.warn(`[${targetSheetName}] BQ Fail (Quota/Error). Starting API Fallback...`);
+    
+    // --- 4. THE API FALLBACK (The Fail-Safe) ---
+    try {
+      const apiData = getMarketPrices(uniqueIds, marketId, marketType);
+      const fallbackData = uniqueIds.map(id => {
+        const item = apiData[id] || {};
+        return [id, item.buy?.median || 0, item.sell?.median || 0, item.buy?.max || 0, item.sell?.min || 0];
+      });
+      writeToInterfaceSheet(sheet, fallbackData, "⚠️ API Fallback");
+    } catch (apiErr) {
+      sheet.getRange("E4").setValue("❌ Sync Failed");
+    }
   }
+}
+
+/**
+ * HELPER: Aligns data with your Row 7 Header / Row 8 Start format.
+ */
+function writeToInterfaceSheet(sheet, data, statusPrefix) {
+  sheet.getRange("E8:I").clearContent();
+  sheet.getRange(7, 5, 1, 5).setValues([["type_id_filtered", "Median Buy", "Median Sell", "Current Buy", "Current Sell"]]);
+  if (data.length > 0) sheet.getRange(8, 5, data.length, 5).setValues(data);
+  sheet.getRange("E4").setValue(`${statusPrefix}: ${new Date().toLocaleTimeString()}`);
+}
+
+
+/**
+ * MASTER DISPATCHER: The heartbeat of your 132-slot farm.
+ * Schedules background pulses for each market sheet to avoid timeouts.
+ */
+function masterMarketRefresh() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const props = PropertiesService.getScriptProperties();
+  
+  
+  // 1. Data Integrity Gate: Don't pulse if BigQuery is currently being streamed to
+  if (props.getProperty('fuzz_job_active') === 'true') {
+    console.warn("[REFRESH] BQ Stream active. Skipping pulse to avoid data collision.");
+    return; 
+  }
+
+  // 2. The Sheet Queue
+  const marketSheets = ['filtered prices', 'Mineral Supply Prices', 'T1 Supply Prices'];
+
+  // 3. ID Filtering: Get unique IDs once to share across the whole engine
+  const itemSheet = ss.getSheetByName("Item List Back End");
+  const lastRow = itemSheet.getLastRow();
+  if (lastRow < 2) {
+    console.error("[ERROR] Item List Back End is empty.");
+    return;
+  }
+  
+  const rawIds = itemSheet.getRange(2, 1, lastRow - 1, 1).getValues();
+  const uniqueIds = [...new Set(rawIds.flat().map(id => parseInt(id)).filter(id => !isNaN(id) && id > 0))];
+
+  // 4. Action: Run the first sheet immediately (Main Money Printer)
+  console.log(`[PULSE] Starting immediate refresh for: ${marketSheets[0]}`);
+  refreshPriceInterfaceSheets(ss, marketSheets[0], uniqueIds);
+
+  // 5. Stagger: Schedule the rest to give each its own fresh 6-minute window
+  marketSheets.slice(1).forEach((sheetName, index) => {
+    // delayMs: 30s for Mineral, 60s for T1
+    const delayMs = (index + 1) * 30000; 
+    
+    // Pass the name to the background worker via ScriptProperties
+    // Note: This works because we only schedule one background sheet at a time in sequence
+    props.setProperty('last_scheduled_sheet', sheetName);
+    
+    scheduleOneTimeTrigger('refreshPriceInterfaceSheetsManual', delayMs);
+    console.log(`[STAGGER] Scheduled ${sheetName} to pulse in ${delayMs/1000}s`);
+  });
 }
