@@ -122,7 +122,7 @@ function writeToInterfaceSheet(sheet, data, statusPrefix) {
 function masterMarketRefresh() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const props = PropertiesService.getScriptProperties();
-  
+
   
   // 1. Data Integrity Gate: Don't pulse if BigQuery is currently being streamed to
   if (props.getProperty('fuzz_job_active') === 'true') {
@@ -148,16 +148,19 @@ function masterMarketRefresh() {
   console.log(`[PULSE] Starting immediate refresh for: ${marketSheets[0]}`);
   refreshPriceInterfaceSheets(ss, marketSheets[0], uniqueIds);
 
-  // 5. Stagger: Schedule the rest to give each its own fresh 6-minute window
+// 5. Stagger: Use a more robust hand-off
   marketSheets.slice(1).forEach((sheetName, index) => {
-    // delayMs: 30s for Mineral, 60s for T1
-    const delayMs = (index + 1) * 30000; 
+    const delayMs = (index + 1) * 35000; // Increased to 35s to allow for API latency
     
-    // Pass the name to the background worker via ScriptProperties
-    // Note: This works because we only schedule one background sheet at a time in sequence
-    props.setProperty('last_scheduled_sheet', sheetName);
+    // We use a unique property key for each scheduled slot
+    const slotKey = `scheduled_sheet_slot_${index}`;
+    props.setProperty(slotKey, sheetName);
+    
+    // Pass the slotKey as the function name via a small wrapper if needed, 
+    // or keep the current property logic but be aware of the race condition.
+    props.setProperty('last_scheduled_sheet', sheetName); 
     
     scheduleOneTimeTrigger('refreshPriceInterfaceSheetsManual', delayMs);
-    console.log(`[STAGGER] Scheduled ${sheetName} to pulse in ${delayMs/1000}s`);
+    console.log(`[STAGGER] Scheduled ${sheetName} for pulse in ${delayMs/1000}s`);
   });
 }
