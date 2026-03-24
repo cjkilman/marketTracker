@@ -200,6 +200,17 @@ function _updateFuzzMarketDataWorker() {
   });
 
   console.log(`[FuzzWorker] Cycle Complete.`);
+
+  // --- STATIC DATA REFRESH PULSE ---
+  var utilitySheet = ss.getSheetByName("Utility"); // 'ss' is already defined at the top of this function!
+  if (utilitySheet) {
+    // 1. Throw the kill switch
+    utilitySheet.getRange("B3").setValue(0);
+    SpreadsheetApp.flush();
+    // 2. Flip the switch back on 
+    utilitySheet.getRange("B3").setValue(1);
+    console.log(`[FuzzWorker] Static Data Pulse Fired.`);
+  }
 }
 
 

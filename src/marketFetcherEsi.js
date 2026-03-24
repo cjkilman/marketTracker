@@ -29,8 +29,8 @@ const DAILY_UTC_HOUR = 11;
 const DAILY_UTC_MIN = 20;
 
 // Engine headers
-const HEADERS_REGION = ['type_id', 'region_id', 'volume30_region', 'velocity_region', 'last_updated', 'status'];
-const HEADERS_PUBLISH = ['type_id', 'region_id', 'volume30_region', 'last_updated', 'status'];
+const HEADERS_REGION = ['type_id', 'region_id', 'volume30_region', 'velocity30_region', 'volume7_region', 'velocity7_region', 'volume5_region', 'velocity5_region', 'last_updated', 'status'];
+const HEADERS_PUBLISH = ['type_id', 'region_id', 'volume30_region', 'volume7_region', 'volume5_region', 'last_updated', 'status'];
 
 
 /** ---------- Rate limit + backoff (lightweight) ---------- **/
@@ -99,13 +99,29 @@ function buildHistoryRequests_(client, regionId, typeIds) {
   });
 }
 
-function summarizeHistory30_(rows) {
-  if (!rows || !rows.length) return { vol30: 0, vel: 0 };
-  var start = Math.max(0, rows.length - 30);
-  var v = 0;
-  for (var i = start; i < rows.length; i++) v += (+rows[i].volume || 0);
-  var n = rows.length - start;
-  return { vol30: v, vel: (n ? v / n : 0) };
+function summarizeHistoryMulti_(rows) {
+  if (!rows || !rows.length) return { vol30: 0, vel30: 0, vol7: 0, vel7: 0, vol5: 0, vel5: 0 };
+  
+  var v30 = 0, v7 = 0, v5 = 0;
+  // ESI returns chronological. Count backwards from the newest day.
+  var daysToCount = Math.min(rows.length, 30);
+  
+  for (var k = 1; k <= daysToCount; k++) {
+    var dailyVol = +rows[rows.length - k].volume || 0;
+    v30 += dailyVol;
+    if (k <= 7) v7 += dailyVol;
+    if (k <= 5) v5 += dailyVol;
+  }
+  
+  var n30 = daysToCount;
+  var n7 = Math.min(rows.length, 7);
+  var n5 = Math.min(rows.length, 5);
+  
+  return { 
+    vol30: v30, vel30: (n30 ? v30 / n30 : 0),
+    vol7: v7, vel7: (n7 ? v7 / n7 : 0),
+    vol5: v5, vel5: (n5 ? v5 / n5 : 0)
+  };
 }
 
 function mapGESIRespToResult_(resp, typeId) {
@@ -113,8 +129,13 @@ function mapGESIRespToResult_(resp, typeId) {
   if (code === 200) {
     try {
       var arr = JSON.parse(resp.getContentText()) || [];
-      var m = summarizeHistory30_(arr);
-      return { typeId: typeId, status: 'OK', vol30: m.vol30, vel: m.vel };
+      var m = summarizeHistoryMulti_(arr);
+      return { 
+        typeId: typeId, status: 'OK', 
+        vol30: m.vol30, vel30: m.vel30,
+        vol7: m.vol7, vel7: m.vel7,
+        vol5: m.vol5, vel5: m.vel5
+      };
     } catch (e) {
       return { typeId: typeId, status: 'ERR_PARSE' };
     }
@@ -453,38 +474,31 @@ function marketFetchChunk() {
     // --- GESI batch (auth handled by GESI, paced by token bucket) ---
     var results = fetchHistoryBatchGESI_(regionId, chunk);
 
-    // --- REFACTORED: These were the duplicates ---
-    // var rowsOut = [];
-    // var processed = 0;
-    // var hitRate = false;
-    // var ok = 0, err = 0, errAuth = 0;
-    // --- END REFACTOR ---
-
     for (var i = 0; i < results.length; i++) {
       var r = results[i];
 
       if (r.status === 'ERR_RATE') {
         hitRate = true;
         LoggerEx.warn('mf.rate.hit rid=' + rid + ' region=' + regionId + ' processed=' + processed);
-        break; // leave remainder for next run
+        break; 
       }
 
       if (r.status === 'ERR_AUTH') {
         errAuth++;
-        rowsOut.push([r.typeId, regionId, "", "", new Date(), 'ERR_AUTH']);
-        continue; // do NOT advance processed; we'll fail-fast after flush
+        rowsOut.push([r.typeId, regionId, "", "", "", "", "", "", new Date(), 'ERR_AUTH']);
+        continue; 
       }
 
       if (r.status === 'OK') {
         ok++;
-        rowsOut.push([r.typeId, regionId, r.vol30, r.vel, new Date(), 'OK']);
+        rowsOut.push([r.typeId, regionId, r.vol30, r.vel30, r.vol7, r.vel7, r.vol5, r.vel5, new Date(), 'OK']);
         if (r.vol30 === 0) (LoggerEx?.info || console.info)('mf.vol30.zero', { regionId: regionId, typeId: r.typeId });
         processed++;
       } else {
         err++;
-        rowsOut.push([r.typeId, regionId, "", "", new Date(), r.status]);
+        rowsOut.push([r.typeId, regionId, "", "", "", "", "", "", new Date(), r.status]);
         LoggerEx.warn('mf.item.err rid=' + rid + ' region=' + regionId + ' type=' + r.typeId + ' status=' + r.status);
-        processed++; // non-auth errors still advance so we avoid stalls
+        processed++; 
       }
     }
 
@@ -714,23 +728,27 @@ function publishMarketResultESIRegion() {
     const h = vals[0];
     const ix = {
       t: h.indexOf('type_id'), r: h.indexOf('region_id'),
-      v: h.indexOf('volume30_region'), u: h.indexOf('last_updated'),
-      s: h.indexOf('status')
+      v30: h.indexOf('volume30_region'), 
+      v7: h.indexOf('volume7_region'), 
+      v5: h.indexOf('volume5_region'),
+      u: h.indexOf('last_updated'), s: h.indexOf('status')
     };
 
     for (let i = 1; i < vals.length; i++) {
       const row = vals[i];
       const t = row[ix.t], r = row[ix.r];
       if (t === "" || r === "") continue;
-      if (!keepPairs.has(`${Math.floor(t)}:${Math.floor(r)}`)) continue;  // ← NEW
+      if (!keepPairs.has(`${Math.floor(t)}:${Math.floor(r)}`)) continue;  
 
       let status = String(row[ix.s] || "").toUpperCase();
       if (status === "STALE") status = "STALE-ESI";
 
       const keepNumeric = (status === "OK" || status === "STALE-ESI");
-      const vol = keepNumeric ? row[ix.v] : "";
+      const vol30 = keepNumeric ? row[ix.v30] : "";
+      const vol7 = keepNumeric ? row[ix.v7] : "";
+      const vol5 = keepNumeric ? row[ix.v5] : "";
 
-      out.push([t, r, vol, row[ix.u], status]);
+      out.push([t, r, vol30, vol7, vol5, row[ix.u], status]);
     }
   }
 
