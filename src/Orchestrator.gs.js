@@ -40,16 +40,14 @@ function scheduleOneTimeTrigger(functionName, delayMs) {
   }
 }
 
-/**
- * Helper to ensure we don't spam the ESI publish
- */
 function isTimeForInterfaceSync() {
-  const lastSync = parseInt(SCRIPT_PROPS.getProperty('last_esi_sync') || '0', 10);
+  const props = PropertiesService.getScriptProperties();
+  const lastSync = parseInt(props.getProperty('last_interface_sync') || '0', 10);
   const now = new Date().getTime();
   
   // Only sync once every 5 minutes
   if (now - lastSync > 300000) {
-    SCRIPT_PROPS.setProperty('last_esi_sync', String(now));
+    props.setProperty('last_interface_sync', String(now));
     return true;
   }
   return false;

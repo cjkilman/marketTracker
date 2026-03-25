@@ -84,24 +84,27 @@ function refreshPriceInterfaceSheets(ss, targetSheetName, uniqueIds) {
     const queryResults = BigQuery.Jobs.query({query: sql, useLegacySql: false}, projectId);
     const data = queryResults.rows ? queryResults.rows.map(row => row.f.map(field => field.v)) : [];
 
-    if (data.length === 0) throw new Error("Empty BQ result");
+    if (data.length === 0) throw new Error("Empty BQ result (Waiting for next stream)");
     writeToInterfaceSheet(sheet, data, "✅ Synced");
 
   } catch (err) {
-    console.warn(`[${targetSheetName}] BQ Fail (Quota/Error). Starting API Fallback...`);
+    // 1. Log the exact error instantly
+    console.warn(`[${targetSheetName}] BQ Query Failed: ${err.message}`);
     
-    // --- 4. THE API FALLBACK (The Fail-Safe) ---
-    try {
-      const apiData = getMarketPrices(uniqueIds, marketId, marketType);
-      const fallbackData = uniqueIds.map(id => {
-        const item = apiData[id] || {};
-        return [id, item.buy?.median || 0, item.sell?.median || 0, item.buy?.max || 0, item.sell?.min || 0];
-      });
-      writeToInterfaceSheet(sheet, fallbackData, "⚠️ API Fallback");
-    } catch (apiErr) {
-      sheet.getRange("E4").setValue("❌ Sync Failed");
-    }
+    // 2. Print it to the sheet instantly
+    sheet.getRange("E4").setValue(`⚠️ BQ Error: ${err.message}`);
+    
+    // 3. DO NOT RUN THE API FALLBACK. Just exit.
+    return; 
   }
+}
+
+function getLatestPricesQuery(marketId) {
+  // Ensure the project ID 'tenacious-tiger-345318' is correct here
+  return `SELECT * FROM \`tenacious-tiger-345318.market_data.market_prices\`
+          WHERE market_id = ${marketId}
+          AND date > TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+          ORDER BY date DESC`;
 }
 
 /**
