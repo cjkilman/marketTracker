@@ -1,9 +1,6 @@
 // Global Property Service
 const SCRIPT_PROPS = PropertiesService.getScriptProperties();
 
-/**
- * Creates the "Admin Tools" menu when the spreadsheet is opened.
- */
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Admin Tools')
@@ -11,13 +8,41 @@ function onOpen() {
     .addItem('Delete All Triggers', '_deleteExistingTriggers')
     .addSeparator()
     .addItem('Run 15-Min Orchestrator', 'masterOrchestrator')
-    .addItem('Run SDE Update (Full)', 'sde_job_START') // New SDE Start
+    .addItem('Run SDE Update (Full)', 'sde_job_START')
+    .addSeparator()
+    // --- PIPE MAINTENANCE (THE CROWBARS) ---
+    .addItem('⚠️ Manual: Reset BigQuery (Hard Reset)', 'resetBigQueryTable')
+    .addItem('🔄 Manual: Toggle BQ Circuit Breaker', 'toggleBigQueryCircuitBreaker')
     .addSeparator()
     .addItem('Manual: Reset Fuzz Job State', '_resetFuzzMarketDataJobState_MENU')
     .addItem('Manual: Reset ESI Job State', '_resetEsiHistoryJobState_MENU')
-    .addItem('Manual: Reset SDE Job State', '_resetSdeJobState_MENU') // New SDE Reset
+    .addItem('Manual: Reset SDE Job State', '_resetSdeJobState_MENU') 
     .addToUi();
 }
+
+/**
+ * Helper to flip the BQ_ENABLED flag from the menu
+ */
+function toggleBigQueryCircuitBreaker() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const configSheet = ss.getSheetByName("Market Config");
+  if (!configSheet) return;
+
+  const data = configSheet.getDataRange().getValues();
+  for (let i = 0; i < data.length; i++) {
+    if (data[i][0] === "BQ_ENABLED") {
+      const currentValue = data[i][1];
+      const newValue = (currentValue === true || String(currentValue).toLowerCase() === "true") ? false : true;
+      configSheet.getRange(i + 1, 2).setValue(newValue);
+      
+      const status = newValue ? "✅ ENABLED" : "🛑 DISABLED";
+      ss.toast(`BigQuery Pipe is now ${status}`, "Circuit Breaker");
+      return;
+    }
+  }
+  ss.toast("BQ_ENABLED setting not found in Market Config.", "Error");
+}
+
 
 function GET_SDE_CONFIG() {
   return [
