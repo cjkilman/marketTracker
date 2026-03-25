@@ -190,39 +190,39 @@ function hasFuel(requiredSeconds = 30) {
 }
 
 function masterOrchestrator() {
+  const startTime = Date.now();
   const props = PropertiesService.getScriptProperties();
-  props.setProperty('exec_start_time', String(Date.now())); // Mark the start
+  props.setProperty('exec_start_time', String(startTime)); 
 
-  // --- TASK 1: FUZZ ---
+  // --- TASK 1: FUZZ (Market Data to BQ) ---
+  // This is now working but takes time.
   updateFuzzMarketDataSheet();
 
-// --- TASK 2: SYNC ---
-  // We bump the fuel requirement slightly (60s) because we are doing two steps now.
-  if (hasFuel(60)) { 
+  // --- TASK 2: SYNC (Publishing) ---
+  // Require at least 2 minutes (120s) remaining to attempt a sync
+  if (hasFuel(120)) { 
     console.log("Fuel Good. Syncing Interfaces...");
-    
-    // STEP A: Pull data from Cache -> Publish Sheet
-    // This ensures 'Publish_ESI_Region' is never empty, even if the worker is running.
     if (typeof publishMarketResultESIRegion === 'function') {
       try {
         publishMarketResultESIRegion(); 
-        console.log("Intermediate Publish Table Updated.");
       } catch (e) {
-        console.warn("Intermediate Publish Failed (Skipping Sync): " + e.message);
+        console.warn("Intermediate Publish Failed: " + e.message);
       }
     }
-
-    // STEP B: Push data from Publish Sheet -> Client Sheets
     ESI_publishClientInterfaces();
-    
   } else {
-    console.warn("Low Fuel! Skipping Sync to avoid hard timeout.");
+    console.warn("[SKIP] Low Fuel: Skipping Sync to prevent timeout.");
   }
 
-  // --- TASK 3: REFRESH ---
-  if (hasFuel(30)) { // Need 30s buffer for Refreshes
+  // --- TASK 3: REFRESH (The Timeout Culprit) ---
+  // If we have less than 90s left, do NOT run immediate refresh.
+  // Instead, schedule it to run in a fresh 6-minute window.
+  if (hasFuel(90)) { 
     console.log("Fuel Good. Running Refreshes...");
     masterMarketRefresh();
+  } else {
+    console.info("[STAGGER] Low Fuel: Scheduling Refresh for a separate execution.");
+    scheduleOneTimeTrigger('refreshPriceInterfaceSheetsManual', 15000); // Run in 15s
   }
 }
 

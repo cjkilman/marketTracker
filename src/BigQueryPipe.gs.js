@@ -17,16 +17,16 @@ const jobConfig = {
   }
 };
 
+// cjkilman/markettracker/marketTracker-dev/src/BigQueryPipe.gs.js
+
 /**
- * Streams market data to BigQuery using free "Load Jobs".
- * REVISED: Handles Object inputs and includes Circuit Breaker + Schema Autodetect.
+ * REVISED: Uses a hardcoded schema to prevent "No schema specified" errors
+ * during fresh table creation.
  */
 function streamToBigQuery(rows) {
-  // 1. CIRCUIT BREAKER CHECK
-  // Fetches configuration to check if BigQuery is enabled
   const config = getConfig(); 
-  if (config.BQ_ENABLED === false || config.BQ_ENABLED === "false") {
-    console.warn("[CIRCUIT BREAKER] BigQuery streaming is disabled via Config.");
+  if (config.BQ_ENABLED === false || String(config.BQ_ENABLED).toLowerCase() === "false") {
+    console.warn("[CIRCUIT BREAKER] BigQuery streaming is disabled.");
     return;
   }
 
@@ -36,55 +36,45 @@ function streamToBigQuery(rows) {
   const datasetId = 'market_data';
   const tableId = 'market_prices';
 
-  // 2. Transform rows into Newline-Delimited JSON
+// Define the explicit schema to match your manual table exactly
+  const schema = {
+    fields: [
+      { name: 'date', type: 'TIMESTAMP', mode: 'REQUIRED' }, // Match the REQUIRED mode
+      { name: 'market_id', type: 'INTEGER', mode: 'NULLABLE' },
+      { name: 'market_type', type: 'STRING', mode: 'NULLABLE' },
+      { name: 'type_id', type: 'INTEGER', mode: 'NULLABLE' },
+      { name: 'min_sell', type: 'FLOAT', mode: 'NULLABLE' },
+      { name: 'max_buy', type: 'FLOAT', mode: 'NULLABLE' },
+      { name: 'median_sell', type: 'FLOAT', mode: 'NULLABLE' },
+      { name: 'median_buy', type: 'FLOAT', mode: 'NULLABLE' }
+    ]
+  };
+  
+
+  // Transform rows to NDJSON
   const jsonRows = rows.map(row => {
     const isObject = !Array.isArray(row);
-
-    const rawDate    = isObject ? row.date        : row[0];
-    const marketId   = isObject ? row.market_id   : row[1];
-    const marketType = isObject ? row.market_type : row[2];
-    const typeId     = isObject ? row.type_id     : row[3];
-    const minSell    = isObject ? row.min_sell    : row[4];
-    const maxBuy     = isObject ? row.max_buy     : row[5];
-    const medSell    = isObject ? row.median_sell : row[6];
-    const medBuy     = isObject ? row.median_buy  : row[7];
-
-    let validDate;
-    if (rawDate instanceof Date) {
-      validDate = !isNaN(rawDate) ? rawDate.toISOString() : new Date().toISOString();
-    } else if (typeof rawDate === 'string') {
-      validDate = rawDate || new Date().toISOString();
-    } else {
-      validDate = new Date().toISOString();
-    }
-
+    const rawDate = isObject ? row.date : row[0];
+    
     return JSON.stringify({
-      date: validDate,
-      market_id: parseInt(marketId),
-      market_type: String(marketType),
-      type_id: parseInt(typeId),
-      min_sell: parseFloat(minSell) || null,
-      max_buy: parseFloat(maxBuy) || null,
-      median_sell: parseFloat(medSell) || null,
-      median_buy: parseFloat(medBuy) || null
+      date: (rawDate instanceof Date) ? rawDate.toISOString() : new Date().toISOString(),
+      market_id: parseInt(isObject ? row.market_id : row[1]),
+      market_type: String(isObject ? row.market_type : row[2]),
+      type_id: parseInt(isObject ? row.type_id : row[3]),
+      min_sell: parseFloat(isObject ? row.min_sell : row[4]) || null,
+      max_buy: parseFloat(isObject ? row.max_buy : row[5]) || null,
+      median_sell: parseFloat(isObject ? row.median_sell : row[6]) || null,
+      median_buy: parseFloat(isObject ? row.median_buy : row[7]) || null
     });
   }).join('\n');
 
   const blob = Utilities.newBlob(jsonRows, 'application/octet-stream');
 
-  // 3. Configure the Load Job with THE FIX
-  const jobConfig = {
+  const job = {
     configuration: {
       load: {
-        destinationTable: {
-          projectId: projectId,
-          datasetId: datasetId,
-          tableId: tableId
-        },
-        // --- THE CRITICAL FIX ---
-        // Tells BigQuery to infer the schema from the JSON keys
-        autodetect: true, 
-        // ------------------------
+        destinationTable: { projectId, datasetId, tableId },
+        schema: schema, // Explicit schema is safer than autodetect
         sourceFormat: 'NEWLINE_DELIMITED_JSON',
         writeDisposition: 'WRITE_APPEND' 
       }
@@ -92,8 +82,8 @@ function streamToBigQuery(rows) {
   };
 
   try {
-    const runJob = BigQuery.Jobs.insert(jobConfig, projectId, blob);
-    console.log(`[BIGQUERY] Load Job started: ${runJob.jobReference.jobId}. Rows: ${rows.length}`);
+    const runJob = BigQuery.Jobs.insert(job, projectId, blob);
+    console.log(`[BIGQUERY] Job started: ${runJob.jobReference.jobId}`);
   } catch (err) {
     console.error("[BIGQUERY] Pipe Error: " + err.message);
   }
