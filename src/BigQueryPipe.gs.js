@@ -1,62 +1,70 @@
+// cjkilman/markettracker/marketTracker-dev/src/BigQueryPipe.gs.js
+
 function streamToBigQuery(rows) {
   if (!rows || rows.length === 0) return;
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName("BQ_LIVE_DATA");
+  
+  if (!sheet) {
+    sheet = ss.insertSheet("BQ_LIVE_DATA");
+    sheet.appendRow(['date', 'market_id', 'market_type', 'type_id', 'min_sell', 'max_buy', 'median_sell', 'median_buy']);
+  }
 
-  const projectId = 'tenacious-tiger-345318';
+  // Keep only the last 5000 rows to stay fast
+  const lastRow = sheet.getLastRow();
+  if (lastRow > 5000) {
+    sheet.deleteRows(2, rows.length); 
+  }
+
+  const dataToAppend = rows.map(row => {
+    const isArr = Array.isArray(row);
+    return [
+      isArr ? row[0] : row.date,
+      isArr ? row[1] : row.market_id,
+      isArr ? row[2] : row.market_type,
+      isArr ? row[3] : row.type_id,
+      isArr ? row[4] : row.min_sell,
+      isArr ? row[5] : row.max_buy,
+      isArr ? row[6] : row.median_sell,
+      isArr ? row[7] : row.median_buy
+    ];
+  });
+
+  sheet.getRange(sheet.getLastRow() + 1, 1, dataToAppend.length, 8).setValues(dataToAppend);
+  console.log(`[LOCAL] Wrote ${rows.length} rows to BQ_LIVE_DATA sheet.`);
+}
+/**
+ * THE RESET CROWBAR
+ * Logic: Deletes the existing table so the next stream job 
+ * can recreate it with a fresh schema.
+ */
+function resetBigQueryTable() {
+  const projectId = 'tenacious-tiger-345318'; 
   const datasetId = 'market_data';
   const tableId = 'market_prices';
-
-  // 1. UNIVERSAL MAPPER: Handles both Objects (from fetcher) and Arrays (from sheet)
-  const jsonRows = rows.map(row => {
-    const isArr = Array.isArray(row);
+  
+  try {
+    BigQuery.Tables.remove(projectId, datasetId, tableId);
+    console.log(`[CROWBAR] Table ${tableId} deleted. The sandbox clock has been reset.`);
     
-    // Safely extract date
-    let rawDate = isArr ? row[0] : row.date;
-    let isoDate = (rawDate instanceof Date) ? rawDate.toISOString() : new Date(rawDate || Date.now()).toISOString();
-
-    // Map everything securely
-    const obj = {
-      date: isoDate,
-      market_id: parseInt(isArr ? row[1] : row.market_id) || 0,
-      market_type: String(isArr ? row[2] : row.market_type || 'system'),
-      type_id: parseInt(isArr ? row[3] : row.type_id) || 0,
-      min_sell: parseFloat(isArr ? row[4] : row.min_sell) || 0,
-      max_buy: parseFloat(isArr ? row[5] : row.max_buy) || 0,
-      median_sell: parseFloat(isArr ? row[6] : row.median_sell) || 0,
-      median_buy: parseFloat(isArr ? row[7] : row.median_buy) || 0
-    };
-    return JSON.stringify(obj);
-  }).join('\n');
-
-  // 2. Create the Blob
-  const blob = Utilities.newBlob(jsonRows, 'application/octet-stream');
-
-  // 3. Configure the Job
-  const job = {
-    configuration: {
-      load: {
-        destinationTable: { projectId, datasetId, tableId },
-        sourceFormat: 'NEWLINE_DELIMITED_JSON', // Back to the safest standard
-        writeDisposition: 'WRITE_APPEND',
-        schema: {
-          fields: [
-            { name: 'date', type: 'TIMESTAMP', mode: 'REQUIRED' },
-            { name: 'market_id', type: 'INTEGER' },
-            { name: 'market_type', type: 'STRING' },
-            { name: 'type_id', type: 'INTEGER' },
-            { name: 'min_sell', type: 'FLOAT' },
-            { name: 'max_buy', type: 'FLOAT' },
-            { name: 'median_sell', type: 'FLOAT' },
-            { name: 'median_buy', type: 'FLOAT' }
-          ]
-        }
+    console.log("[CROWBAR] Rebuilding table with fresh schema...");
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName("Market Prices");
+    
+    if(sheet) {
+      // Get the last 10 rows to prime the table
+      const lastRow = sheet.getLastRow();
+      if(lastRow > 1) {
+        const startRow = Math.max(2, lastRow - 9);
+        const rawData = sheet.getRange(startRow, 1, 10, 8).getValues();
+        streamToBigQuery(rawData);
       }
     }
-  };
-
-  try {
-    const result = BigQuery.Jobs.insert(job, projectId, blob);
-    console.log(`[BQ] Upload Success! Job ID: ${result.jobReference.jobId}`);
+    SpreadsheetApp.getActiveSpreadsheet().toast("BigQuery Reset Successful", "Tycoon Operations");
   } catch (err) {
-    console.error(`[BQ] Upload Failed: ${err.message}`);
+    console.error("[CROWBAR] Reset Failed: " + err.message);
+    if (err.message.indexOf("Not found") > -1) {
+      console.log("Table didn't exist anyway. Ready for fresh creation.");
+    }
   }
 }

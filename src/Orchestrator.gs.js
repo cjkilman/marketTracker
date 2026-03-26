@@ -165,14 +165,6 @@ function isTimeForDisplayRefresh() {
   return true; 
 }
 
-function isTimeForInterfaceSync() {
-  const lastSync = parseInt(SCRIPT_PROPS.getProperty('last_interface_sync') || '0', 10);
-  const now = new Date().getTime();
-  // If this property was never set, it stays 0, and (now - 0) is always > 300000.
-  // BUT, if it was set to a time in the future by mistake, it will never run.
-  return (now - lastSync) > 300000; 
-}
-
 /**
  * FUEL GAUGE: Returns true if we have enough time to start a new task.
  * @param {number} requiredSeconds - Minimum buffer needed (default 30s)
@@ -194,7 +186,17 @@ function masterOrchestrator() {
 
   // --- TASK 1: FUZZ (Market Data to BQ) ---
   // This is now working but takes time.
+// --- TASK 1: FUZZ (Market Data to BQ) ---
+  const beforeFuzz = Date.now();
   updateFuzzMarketDataSheet();
+  const afterFuzz = Date.now();
+  
+  // If the fuzz worker took more than 5 seconds, it means it actually ran an upload
+  // (instead of skipping due to the lease). We must wait for the BQ buffer.
+  if ((afterFuzz - beforeFuzz) > 5000) {
+      console.log("[BUFFER] Waiting 30s for BigQuery streaming buffer to index...");
+      Utilities.sleep(30000); 
+  }
 
   // --- TASK 2: SYNC (Publishing) ---
   // Require at least 2 minutes (120s) remaining to attempt a sync

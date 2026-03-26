@@ -47,17 +47,7 @@ function refreshPriceInterfaceSheets(ss, targetSheetName, uniqueIds) {
     return;
   }
 
-  // --- 1. ID FILTERING (The Cost Shield) ---
-  if (!uniqueIds) {
-    const itemSheet = ss.getSheetByName("Item List Back End");
-    const rawIds = itemSheet.getRange(2, 1, Math.max(1, itemSheet.getLastRow() - 1), 1).getValues();
-    uniqueIds = [...new Set(rawIds.flat().map(id => parseInt(id)).filter(id => !isNaN(id) && id > 0))];
-  }
-  
-  if (uniqueIds.length === 0) return;
-  const idString = uniqueIds.join(',');
-
-  // --- 2. INPUT GATING ---
+  // --- 1. INPUT GATING ---
   const marketId = sheet.getRange("C4").getValue();
   const marketType = sheet.getRange("D4").getValue();
 
@@ -66,37 +56,137 @@ function refreshPriceInterfaceSheets(ss, targetSheetName, uniqueIds) {
     return; 
   }
 
-  // --- 3. THE RECALL SQL ---
-  const sql = `
+  // --- 2. THE RECALL SQL (Optimized) ---
+  // We removed the massive 4,000+ item IN() clause. 
+  // BigQuery will just return everything for this market from the last 24h.
+const sql = `
     SELECT 
       type_id, ROUND(AVG(median_buy), 2), ROUND(AVG(median_sell), 2),
       ARRAY_AGG(median_buy ORDER BY date DESC LIMIT 1)[OFFSET(0)],
       ARRAY_AGG(median_sell ORDER BY date DESC LIMIT 1)[OFFSET(0)]
-    FROM \`${projectId}.market_data.market_prices\`
+    FROM \`${projectId}.market_data.market_prices_staged\`
     WHERE market_id = ${marketId}
       AND LOWER(market_type) = LOWER('${marketType}')
       AND date >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
-      AND type_id IN (${idString})
     GROUP BY type_id ORDER BY type_id ASC
   `;
 
   try {
+    console.log(`[${targetSheetName}] Requesting data from BigQuery...`);
     const queryResults = BigQuery.Jobs.query({query: sql, useLegacySql: false}, projectId);
+    
+    console.log(`[${targetSheetName}] Query returned. Parsing rows...`);
     const data = queryResults.rows ? queryResults.rows.map(row => row.f.map(field => field.v)) : [];
 
     if (data.length === 0) throw new Error("Empty BQ result (Waiting for next stream)");
+    
+    console.log(`[${targetSheetName}] Writing ${data.length} rows to the sheet...`);
     writeToInterfaceSheet(sheet, data, "✅ Synced");
+    console.log(`[${targetSheetName}] Write complete!`);
 
   } catch (err) {
-    // 1. Log the exact error instantly
     console.warn(`[${targetSheetName}] BQ Query Failed: ${err.message}`);
-    
-    // 2. Print it to the sheet instantly
     sheet.getRange("E4").setValue(`⚠️ BQ Error: ${err.message}`);
-    
-    // 3. DO NOT RUN THE API FALLBACK. Just exit.
     return; 
   }
+}
+
+function archiveMarketDataToBigQuery() {
+  const projectId = 'tenacious-tiger-345318';
+  
+  // This SQL moves data from the "Sheet" to the "Internal Vault"
+  // It only grabs rows that aren't already there (based on timestamp/market/type)
+  const sql = `
+    INSERT INTO \`tenacious-tiger-345318.market_data.market_prices_history\`
+    SELECT s.* FROM \`tenacious-tiger-345318.market_data.market_prices_staged\` s
+    WHERE NOT EXISTS (
+      SELECT 1 FROM \`tenacious-tiger-345318.market_data.market_prices_history\` h
+      WHERE h.date = s.date 
+        AND h.market_id = s.market_id 
+        AND h.type_id = s.type_id
+    )
+  `;
+
+  try {
+    BigQuery.Jobs.query({query: sql, useLegacySql: false}, projectId);
+    console.log("[VAULT] Successfully archived current sheet data to history.");
+  } catch (err) {
+    console.error("[VAULT ERROR] Archive failed: " + err);
+  }
+}
+
+function checkLastBqError() {
+  const projectId = 'tenacious-tiger-345318';
+  
+  try {
+    console.log("Checking BigQuery's internal logs for the last 5 jobs...");
+    const jobList = BigQuery.Jobs.list(projectId, { maxResults: 5, stateFilter: 'done' });
+    
+    if (!jobList.jobs || jobList.jobs.length === 0) {
+      console.log("No recent jobs found.");
+      return;
+    }
+    
+    jobList.jobs.forEach(job => {
+      // We have to get the full job details to see the exact row errors
+      const fullJob = BigQuery.Jobs.get(projectId, job.jobReference.jobId);
+      
+      if (fullJob.status && fullJob.status.errorResult) {
+        console.error(`🔥 FAILED JOB: ${fullJob.jobReference.jobId}`);
+        console.error(`Error: ${fullJob.status.errorResult.message}`);
+        
+        // If there are specific row errors, print them
+        if (fullJob.status.errors) {
+          fullJob.status.errors.forEach(err => {
+            console.error(` -> Detail: ${err.message}`);
+          });
+        }
+      } else {
+        console.log(`✅ Passed Job: ${fullJob.jobReference.jobId}`);
+      }
+    });
+    
+  } catch (err) {
+    console.error(`Failed to fetch job history: ${err.message}`);
+  }
+}
+
+function peekAtBigQuery() {
+  const projectId = 'tenacious-tiger-345318';
+  const sql = `
+    SELECT date, market_id, market_type, type_id, min_sell 
+    FROM \`${projectId}.market_data.market_prices\` 
+    ORDER BY date DESC LIMIT 3
+  `;
+  
+  try {
+    console.log("Looking inside BigQuery...");
+    const result = BigQuery.Jobs.query({query: sql, useLegacySql: false}, projectId);
+    
+    if (!result.rows || result.rows.length === 0) {
+      console.error("🛑 The table is COMPLETELY EMPTY. (The upload skipped or failed).");
+    } else {
+      console.log("✅ DATA FOUND! Here is exactly what is saved:");
+      result.rows.forEach((row, index) => {
+        const vals = row.f.map(field => field.v);
+        console.log(`Row ${index + 1}: Date: ${vals[0]} | Market: ${vals[1]} | Type: ${vals[2]} | Item: ${vals[3]} | Sell: ${vals[4]}`);
+      });
+    }
+  } catch(e) {
+    console.error("Query failed: " + e.message);
+  }
+}
+
+function forceStartEngine() {
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty('LAST_FUZZ_FETCH');
+  props.deleteProperty('fuzz_lease_timestamp');
+  props.deleteProperty('fuzz_job_active');
+  props.deleteProperty('exec_start_time');
+  
+  console.log("🛑 All safety timers cleared.");
+  console.log("🚀 Forcing full Fuzzwork fetch and BigQuery upload...");
+  masterOrchestrator();
 }
 
 function getLatestPricesQuery(marketId) {
