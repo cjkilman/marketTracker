@@ -179,9 +179,24 @@ function hasFuel(requiredSeconds = 30) {
   return (limit - elapsed) > requiredSeconds;
 }
 
+function forceStartEngine() {
+  const props = PropertiesService.getScriptProperties();
+  
+  // 1. Clear the "Safety Tape"
+  props.deleteProperty('LAST_FUZZ_FETCH'); 
+  props.deleteProperty('fuzz_lease_timestamp');
+  props.deleteProperty('fuzz_job_active');
+  
+  console.log("🛑 Safety timers cleared.");
+  console.log("🚀 Forcing full fetch and BigQuery upload...");
+  
+  // 2. Fire the Orchestrator
+  masterOrchestrator(); 
+}
+
 /**
  * THE ENDGAME ORCHESTRATOR
- * The single source of truth for the 132-slot farm.
+ * Implements the strict ETL (Extract, Stage, Load) Pipeline.
  */
 function masterOrchestrator() {
   const startTime = Date.now();
@@ -189,52 +204,67 @@ function masterOrchestrator() {
   const props = PropertiesService.getScriptProperties();
   props.setProperty('exec_start_time', String(startTime)); 
 
-  // --- PRE-FLIGHT: THE SAFETY COP ---
+  // ==========================================
+  // 1. CHECK VAULT GATE (Pre-Flight)
+  // ==========================================
   const cfg = getConfig(); 
-  const isVaultOk = (cfg.BQ_ENABLED === true);
+  const isVaultOk = (String(cfg.BQ_ENABLED).toUpperCase() === "TRUE");
   
-  // SELECT SOURCE: SDE (Industrial) vs Item List (Tactical Backup)
-  const itemSource = isVaultOk ? "SDE_Master_List" : "Item List Back End";
+  // Select Source based on Gate Status
+  const itemSource = isVaultOk ? "SDE_invTypes" : "Item List Back End";
   console.log(`[GATE] Vault: ${isVaultOk ? "OPEN" : "LOCKED"}. Source: ${itemSource}`);
 
-  // --- TASK 1: MARKET INGESTION ---
+  // ==========================================
+  // 2. RUN MARKET FETCHER (Extract & Stage)
+  // ==========================================
   try {
     console.log("--- PHASE 1: FETCHING ---");
-    // This function now APPENDS to 'BQ_LIVE_DATA'
+    // Worker runs, APPENDS chunked data to 'Market Prices', and sets 'fuzz_pass_complete'
     updateFuzzMarketDataSheet(itemSource); 
 
-    // ANESTHESIA: Force Google to commit the new rows before the Gate
-    console.log("[ANESTHESIA] Flushing fetch results...");
+    console.log("[ANESTHESIA] Flushing staged results...");
     SpreadsheetApp.flush(); 
-
   } catch (e) {
     if (e.message.includes("quota")) {
       console.error("!!! CRITICAL QUOTA HIT !!! Tripping Safety Switch.");
-      setMarketConfig("BQ_ENABLED", false); // Hard Stop on B10
-      return; // Exit: Path B will take over at the next 3:00 AM reset cycle
+      setMarketConfig("BQ_ENABLED", false); 
+      return;
     }
     console.warn("Fetch Failed: " + e.message);
   }
 
-  // --- TASK 2: THE VAULT GATE (Merge vs. Prune) ---
+  // ==========================================
+  // 3. VAULT GATE (Merge vs. Prune)
+  // ==========================================
   if (hasFuel(120)) { 
     console.log("--- PHASE 2: VAULT GATE ---");
-    if (isVaultOk) {
-      console.log("[PATH A] Merging Sheet to BigQuery Vault...");
+    
+    // Read the signal from the worker to ensure it finished all markets
+    const isPassComplete = (props.getProperty('fuzz_pass_complete') === 'true');
+
+    if (isVaultOk && isPassComplete) {
+      // * OK: Big Q Merge Reset Sheet
+      console.log("[PATH A] Full Pass Confirmed. Merging to Vault...");
       runVaultMergeAndReset(ss); 
-    } else {
-      console.log("[PATH B] BigQuery Locked. Pruning to Rolling 24h...");
+      props.deleteProperty('fuzz_pass_complete'); // Reset signal for next cycle
+    } 
+    else if (!isVaultOk) {
+      // * Locked: Trim Sheet Items with 24 Hour Expirettes
+      console.log("[PATH B] BigQuery Locked. Pruning local sheet to Rolling 24h...");
       pruneSheetToRolling24(ss); 
     }
+    else {
+      // Safety: Vault is open, but the pass didn't finish (timed out/errored).
+      console.warn("[SKIP] Merge Aborted: Market pass was partial. Data remains in staging.");
+    }
     
-    // ANESTHESIA: Force the "Clean Slate" before we pulse the UI
     console.log("[ANESTHESIA] Flushing Gate results...");
     SpreadsheetApp.flush();
   }
 
-// --- THE STAGGERED HANDOFF ---
-  // Instead of running Task 3 now, we schedule it for 1 minute from now.
-  // This allows BigQuery to "settle" and resets our execution timer.
+  // ==========================================
+  // 4. SET TRIGGER UI REFRESH
+  // ==========================================
   console.log("[STAGGER] Task 2 Complete. Scheduling UI Pulse for +1 Minute...");
   scheduleOneTimeTrigger('orchestratorTaskUI', 60000);
 }

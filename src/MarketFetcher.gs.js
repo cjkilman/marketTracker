@@ -100,123 +100,128 @@ function _resetFuzzMarketDataJobState(error) {
 
 /**
  * WORKER: Smart Execution.
- * - Reads 'Item List Back End' & 'Market Settings' internally.
- * - Loops through all markets.
+ * Corrected to ensure a 100% complete pass signal before any Merge occurs.
  */
 function _updateFuzzMarketDataWorker(itemSource) {
-  // Polyfill logger
   const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('FuzzWorker') : console;
   const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const props = PropertiesService.getScriptProperties();
 
-  // --- 1. LOAD ITEMS ---
-const sourceName = itemSource || "Item List Back End"; // Use the passed source OR default
-const itemSheet = ss.getSheetByName(sourceName);
+  // --- 1. LOAD ITEMS (The Dynamic Map) ---
+  const sourceName = itemSource || "Item List Back End";
+  const itemSheet = ss.getSheetByName(sourceName);
+  
   if (!itemSheet) {
-    console.error("[FuzzWorker] Critical: 'Item List Back End' sheet missing.");
-    return;
+    // FIX: Dynamic logging so you know exactly which sheet is missing
+    console.error(`[FuzzWorker] Critical: '${sourceName}' sheet missing.`);
+    return false;
   }
 
   const itemData = itemSheet.getDataRange().getValues();
   const typeIdBatch = [];
 
-  // Skip Header, Read Col A (Index 0)
   for (let i = 1; i < itemData.length; i++) {
     const id = parseInt(itemData[i][0]);
     if (!isNaN(id)) typeIdBatch.push(id);
   }
 
   if (typeIdBatch.length === 0) {
-    console.warn("[FuzzWorker] No Type IDs found in backend list.");
-    return;
+    console.warn(`[FuzzWorker] No Type IDs found in ${sourceName}.`);
+    return false;
   }
 
   // --- 2. LOAD MARKETS ---
   const hubSheet = ss.getSheetByName("Market Settings");
-  const marketsToProcess = [];
+  let marketsToProcess = [];
 
   if (hubSheet) {
     const hubData = hubSheet.getDataRange().getValues();
-    // CSV Offset: Col D (Index 3)=Station, Col E (Index 4)=System
     for (let i = 1; i < hubData.length; i++) {
       const sysId = parseInt(hubData[i][4]);
       const statId = parseInt(hubData[i][3]);
-
-      if (!isNaN(sysId)) {
-        marketsToProcess.push({ market_id: sysId, market_type: 'system' });
-      } else if (!isNaN(statId)) {
-        marketsToProcess.push({ market_id: statId, market_type: 'station' });
-      }
+      if (!isNaN(sysId)) marketsToProcess.push({ market_id: sysId, market_type: 'system' });
+      else if (!isNaN(statId)) marketsToProcess.push({ market_id: statId, market_type: 'station' });
     }
   }
 
-  // Fallback to Jita
   if (marketsToProcess.length === 0) {
-    marketsToProcess.push({ market_id: 60003760, market_type: 'station' });
+    marketsToProcess.push({ market_id: 60003760, market_type: 'station' }); // Jita Fallback
   }
 
-  // --- 3. EXECUTE LOOP ---
+  // --- 3. EXECUTE LOOP (The Mining Drill) ---
   console.log(`[FuzzWorker] Starting Cycle: ${typeIdBatch.length} items across ${marketsToProcess.length} markets.`);
 
-  marketsToProcess.forEach(activeConfig => {
+  let marketsCompleted = 0;
+  
+  // The loop MUST stay open until all work for the specific market is done
+marketsToProcess.forEach(activeConfig => {
+  if (Date.now() - startTime > 300000) { // 5-minute safety mark
+    console.warn("[TIMEOUT] Approaching 6-minute limit. Stopping at Hub: " + marketsCompleted);
+    return; // Exit the loop early
+  }
     try {
       const marketData = getMarketPrices(typeIdBatch, activeConfig.market_id, activeConfig.market_type);
 
-      if (!marketData || Object.keys(marketData).length === 0) return;
+      if (!marketData || Object.keys(marketData).length === 0) {
+        marketsCompleted++; 
+        return;
+      }
 
       const rowsToStream = [];
-      const timestamp = new Date().toISOString();
+      const timestamp = new Date(); // Anti-1969 Fix
 
       typeIdBatch.forEach(typeId => {
         const data = marketData[typeId];
-        if (data) {
-          const buy = data.buy || {};
-          const sell = data.sell || {};
-          if ((buy.orderCount || 0) + (sell.orderCount || 0) > 0) {
-            rowsToStream.push({
-              date: timestamp,
-              market_id: String(activeConfig.market_id),
-              market_type: activeConfig.market_type,
-              type_id: parseInt(typeId, 10),
-              min_sell: parseFloat(sell.min) || 0,
-              max_buy: parseFloat(buy.max) || 0,
-              median_sell: parseFloat(sell.median) || 0,
-              median_buy: parseFloat(buy.median) || 0
-            });
-          }
+        if (data && ((data.buy?.orderCount || 0) + (data.sell?.orderCount || 0) > 0)) {
+          rowsToStream.push({
+            date: timestamp,
+            market_id: String(activeConfig.market_id),
+            market_type: activeConfig.market_type,
+            type_id: parseInt(typeId, 10),
+            min_sell: parseFloat(data.sell?.min) || 0,
+            max_buy: parseFloat(data.buy?.max) || 0,
+            median_sell: parseFloat(data.sell?.median) || 0,
+            median_buy: parseFloat(data.buy?.median) || 0
+          });
         }
       });
 
-      // --- CRITICAL: STREAM TO BIGQUERY ---
+      // --- STREAM TO VAULT BUFFER ---
       if (rowsToStream.length > 0) {
-        // 1. Lock the Orchestrator out while we write
-        PropertiesService.getScriptProperties().setProperty('fuzz_job_active', 'true');
-
+        props.setProperty('fuzz_job_active', 'true');
         console.log(`[BQ] Streaming ${rowsToStream.length} rows for Market: ${activeConfig.market_id}`);
-        streamToBigQuery(rowsToStream); // This pushes data to your BQ table
-
-        // 2. Unlock immediately after this batch finishes
-        PropertiesService.getScriptProperties().setProperty('fuzz_job_active', 'false');
+        streamToBigQuery(rowsToStream); // This fills the "Staging Tank"
+        props.setProperty('fuzz_job_active', 'false');
       }
+      
+      marketsCompleted++; // Successful finished this hub
 
     } catch (e) {
       console.error(`[FuzzWorker] Error on Hub ${activeConfig.market_id}: ${e.message}`);
-      // Safety: Ensure flag is cleared even on error
-      PropertiesService.getScriptProperties().setProperty('fuzz_job_active', 'false');
+      props.setProperty('fuzz_job_active', 'false');
     }
-  });
+  }); // THE LOOP ENDS HERE
 
-  console.log(`[FuzzWorker] Cycle Complete.`);
+  // --- 4. THE COMPLETION SIGNAL (Resolves Critical Flaw) ---
+  const isFullPass = (marketsCompleted === marketsToProcess.length);
+  if (isFullPass) {
+    console.log(`[FuzzWorker] 100% Market Pass Complete (${marketsCompleted}/${marketsToProcess.length}).`);
+    props.setProperty('fuzz_pass_complete', 'true');
+  } else {
+    console.warn(`[FuzzWorker] Partial Pass: Only ${marketsCompleted}/${marketsToProcess.length} hubs processed.`);
+    props.setProperty('fuzz_pass_complete', 'false');
+  }
 
-  // --- STATIC DATA REFRESH PULSE ---
-  var utilitySheet = ss.getSheetByName("Utility"); // 'ss' is already defined at the top of this function!
+  // --- 5. STATIC DATA REFRESH PULSE ---
+  const utilitySheet = ss.getSheetByName("Utility");
   if (utilitySheet) {
-    // 1. Throw the kill switch
     utilitySheet.getRange("B3").setValue(0);
     SpreadsheetApp.flush();
-    // 2. Flip the switch back on 
     utilitySheet.getRange("B3").setValue(1);
     console.log(`[FuzzWorker] Static Data Pulse Fired.`);
   }
+
+  return isFullPass;
 }
 
 

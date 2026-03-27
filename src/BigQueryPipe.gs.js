@@ -1,38 +1,60 @@
 // cjkilman/markettracker/marketTracker-dev/src/BigQueryPipe.gs.js
 
-function streamToBigQuery(rows) {
-  if (!rows || rows.length === 0) return;
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let sheet = ss.getSheetByName("BQ_LIVE_DATA");
-  
-  if (!sheet) {
-    sheet = ss.insertSheet("BQ_LIVE_DATA");
-    sheet.appendRow(['date', 'market_id', 'market_type', 'type_id', 'min_sell', 'max_buy', 'median_sell', 'median_buy']);
-  }
+/**
+ * INDUSTRIAL PIPE: Direct-to-Vault Streaming.
+ * Bypasses Google Sheets entirely to prevent the "Spinning Wheel" crash.
+ */
+function streamToBigQuery(dataRows) {
+  if (!dataRows || dataRows.length === 0) return;
 
-  // Keep only the last 5000 rows to stay fast
-  const lastRow = sheet.getLastRow();
-  if (lastRow > 5000) {
-    sheet.deleteRows(2, rows.length); 
-  }
+  const cfg = getConfig(); // Pull IDs from your central config
+  const projectId = cfg.BQ_PROJECT_ID || 'tenacious-tiger-345318';
+  const datasetId = 'market_data';
+  const tableId = 'market_prices_staged';
 
-  const dataToAppend = rows.map(row => {
-    const isArr = Array.isArray(row);
-    return [
-      isArr ? row[0] : row.date,
-      isArr ? row[1] : row.market_id,
-      isArr ? row[2] : row.market_type,
-      isArr ? row[3] : row.type_id,
-      isArr ? row[4] : row.min_sell,
-      isArr ? row[5] : row.max_buy,
-      isArr ? row[6] : row.median_sell,
-      isArr ? row[7] : row.median_buy
-    ];
+  // 1. Convert data to Newline Delimited JSON (BigQuery's required format)
+  let ndjson = "";
+  dataRows.forEach(row => {
+    // Ensure data types match your Native BigQuery table schema perfectly
+    const bqRow = {
+      date: row.date.toISOString(), // Must be ISO string for BQ TIMESTAMP
+      market_id: String(row.market_id),
+      market_type: String(row.market_type),
+      type_id: Number(row.type_id),
+      min_sell: Number(row.min_sell),
+      max_buy: Number(row.max_buy),
+      median_sell: Number(row.median_sell),
+      median_buy: Number(row.median_buy)
+    };
+    ndjson += JSON.stringify(bqRow) + "\n";
   });
 
-  sheet.getRange(sheet.getLastRow() + 1, 1, dataToAppend.length, 8).setValues(dataToAppend);
-  console.log(`[LOCAL] Wrote ${rows.length} rows to BQ_LIVE_DATA sheet.`);
+  // 2. Build the BigQuery Upload Job
+  const blob = Utilities.newBlob(ndjson, 'application/octet-stream');
+  const job = {
+    configuration: {
+      load: {
+        destinationTable: {
+          projectId: projectId,
+          datasetId: datasetId,
+          tableId: tableId
+        },
+        sourceFormat: 'NEWLINE_DELIMITED_JSON',
+        writeDisposition: 'WRITE_APPEND' // ADD to the vault, don't overwrite
+      }
+    }
+  };
+
+  // 3. FIRE DIRECTLY TO THE CLOUD
+  try {
+    BigQuery.Jobs.insert(job, projectId, blob);
+    // Notice: We DO NOT write to BQ_LIVE_DATA or Market Prices anymore.
+  } catch (e) {
+    console.error(`[BQ PIPE FATAL] Failed to stream to BigQuery: ${e.message}`);
+    throw e; // Pass the error back up so the worker knows it failed
+  }
 }
+
 /**
  * THE RESET CROWBAR
  * Logic: Deletes the existing table so the next stream job 
