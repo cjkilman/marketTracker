@@ -243,65 +243,138 @@ function masterOrchestrator() {
  * TASK 3: UI DISTRIBUTION
  * Runs in its own execution window with dedicated fuel monitoring.
  */
+/**
+ * TASK 3: UI DISTRIBUTION (THE HEARTBEAT + THE LIVE WIRE)
+ * Runs in its own execution window after BigQuery has settled.
+ */
 function orchestratorTaskUI() {
   const startTime = Date.now();
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const props = PropertiesService.getScriptProperties();
-  
-  // Set the start time for the fuel gauge
-  props.setProperty('exec_start_time', String(startTime)); 
+  PropertiesService.getScriptProperties().setProperty('exec_start_time', String(startTime)); 
 
-  console.log("--- PHASE 3: UI PULSE (Dedicated Window) ---");
+  console.log("--- PHASE 3: UI PULSE ---");
 
-  // --- 1. REGIONAL PUBLISH ---
+  // 1. Update Regional Volumes (System A)
   if (hasFuel(120)) { 
-    console.log("[UI] Publishing Regional ESI Data...");
-    publishMarketResultESIRegion(ss); 
-  } else {
-    return console.warn("[EXIT] Insufficient fuel to start Regional Publish.");
+    console.log("[UI] Step 1: Updating Volume Heartbeat...");
+    ESI_publishVolumeInterfaces(ss); 
   }
 
-  // --- 2. CLIENT DISTRIBUTION ---
+  // 2. Distribute Everything (Consolidated Sync)
   if (hasFuel(90)) {
-    console.log("[UI] Distributing slices to Client Interfaces...");
-    // This is the heavy lifting: Slicing data for multiple sheets
-    ESI_publishClientInterfaces(ss); 
+    console.log("[UI] Step 2: Slicing data for Client Interfaces...");
+    FUZ_publishPriceInterfaces(ss); 
   } else {
-    // If we ran out of fuel here, we need to try again because the sheets are out of sync.
-    console.warn("[STAGGER] Low fuel during Client Sync. Rescheduling...");
-    return scheduleOneTimeTrigger('orchestratorTaskUI', 30000); 
+    console.warn("[STAGGER] Low fuel. Rescheduling UI pulse.");
+    scheduleOneTimeTrigger('orchestratorTaskUI', 30000);
   }
-
-  const elapsed = (Date.now() - startTime) / 1000;
-  console.log(`[COMPLETE] UI Sync finished in ${elapsed}s. Interface is Hot.`);
 }
 
 /**
- * PATH B: The 24-Hour Expiry "Crowbar"
- * Keeps the sheet from exploding when BigQuery is offline.
- * Move to MarketFetchetr
+ * TASK 2: VAULT GATE (PATH A)
+ * Merges the 'Market Prices' sheet data into BigQuery and wipes the buffer.
  */
-function pruneSheetToRolling24(ss) {
-  if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName("BQ_LIVE_DATA");
-  if (!sheet) return;
+function runVaultMergeAndReset(ss) {
+  const LOG_HEADER = '[VaultGate]';
+  const cfg = getConfig();
+  const sheetName = "Market Prices"; // FUZZ_SHEET_FINAL
+  const sh = ss.getSheetByName(sheetName);
 
-  const now = new Date().getTime();
-  const oneDayAgo = now - (24 * 60 * 60 * 1000);
-  const data = sheet.getDataRange().getValues();
-  
-  // Assuming Timestamp is in Column A (Index 0)
-  const rowsToKeep = data.filter((row, index) => {
-    if (index === 0) return true; // Keep Header
-    const rowTime = new Date(row[0]).getTime();
-    return rowTime > oneDayAgo;
-  });
-
-  sheet.clearContents();
-  if (rowsToKeep.length > 0) {
-    sheet.getRange(1, 1, rowsToKeep.length, rowsToKeep[0].length).setValues(rowsToKeep);
+  if (!sh) {
+    console.error(`${LOG_HEADER} Error: ${sheetName} not found.`);
+    return;
   }
-  console.log(`[PRUNE] Kept ${rowsToKeep.length} rows (Last 24h).`);
+
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) {
+    console.log(`${LOG_HEADER} Sheet is empty. Nothing to merge.`);
+    return;
+  }
+
+  // 1. FUEL CHECK (Need a full tank for BigQuery operations)
+  if (!hasFuel(120)) {
+    console.warn(`${LOG_HEADER} Low fuel. Aborting merge to prevent partial data loss.`);
+    return;
+  }
+
+  try {
+    // 2. PREPARE THE DATA
+    // Grab everything including headers to ensure schema alignment
+    const data = sh.getDataRange().getValues();
+    const headers = data[0];
+    const rows = data.slice(1);
+
+    console.log(`${LOG_HEADER} Preparing to bury ${rows.length} rows in the Vault...`);
+
+    // 3. BIGQUERY LOAD JOB
+    // We use a LOAD job because it's free and handles batching better than streaming for large sets
+    const projectId = cfg.BQ_PROJECT_ID; 
+    const datasetId = cfg.BQ_DATASET_ID;
+    const tableId = cfg.BQ_TABLE_ID;
+
+    if (!projectId || !datasetId || !tableId) {
+      throw new Error("Missing BigQuery Configuration (Project/Dataset/Table ID).");
+    }
+
+    const blob = Utilities.newBlob(JSON.stringify(rows), 'application/octet-stream');
+    
+    // Using the BigQuery Pipe logic (Batch Load)
+    const jobSuccess = bigQueryBatchLoad_(projectId, datasetId, tableId, data);
+
+    if (jobSuccess) {
+      console.log(`${LOG_HEADER} Merge Successful. BigQuery confirmed receipt.`);
+      
+      // 4. THE RESET (Only happens on success!)
+      // Leave the headers, kill the data.
+      const lastCol = sh.getLastColumn();
+      sh.getRange(2, 1, lastRow - 1, lastCol).clearContent();
+      
+      // OPTIONAL: Trim the sheet back down to 100 rows to keep it snappy
+      _trimTrailing_(sh);
+      
+      console.log(`${LOG_HEADER} Sheet reset. Buffer is clean.`);
+    } else {
+      throw new Error("BigQuery Job failed to verify success signal.");
+    }
+
+  } catch (e) {
+    console.error(`${LOG_HEADER} CRITICAL FAILURE: ${e.message}`);
+    // WE DO NOT RESET THE SHEET HERE. 
+    // This allows Path B (Pruning) to handle the data on the next pulse if the Vault is down.
+  }
 }
+
+/**
+ * INTERNAL HELPER: Executes the BigQuery Load Job
+ */
+function bigQueryBatchLoad_(projectId, datasetId, tableId, dataArray) {
+  // Convert 2D array to Newline Delimited JSON (Standard BQ Format)
+  const headers = dataArray[0];
+  const jsonRows = dataArray.slice(1).map(row => {
+    let obj = {};
+    headers.forEach((h, i) => obj[h] = row[i]);
+    return JSON.stringify(obj);
+  }).join('\n');
+
+  const blob = Utilities.newBlob(jsonRows, 'application/octet-stream');
+  
+  const job = {
+    configuration: {
+      load: {
+        destinationTable: {
+          projectId: projectId,
+          datasetId: datasetId,
+          tableId: tableId
+        },
+        sourceFormat: 'NEWLINE_DELIMITED_JSON',
+        writeDisposition: 'WRITE_APPEND' // Keep the history!
+      }
+    }
+  };
+
+  const runJob = BigQuery.Jobs.insert(job, projectId, blob);
+  return (runJob.status.state === 'DONE' || runJob.status.state === 'PENDING');
+}
+
 
 

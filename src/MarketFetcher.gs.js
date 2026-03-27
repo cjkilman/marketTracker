@@ -765,28 +765,76 @@ function emergencyCleanup() {
   }
 }
 
+/**
+ * PATH B: The 24-Hour Expiry "Crowbar"
+ * Keeps the sheet from exploding when BigQuery is offline.
+ * Move to MarketFetchetr
+ */
+function pruneSheetToRolling24(ss) {
+  if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("BQ_LIVE_DATA");
+  if (!sheet) return;
+
+  const now = new Date().getTime();
+  const oneDayAgo = now - (24 * 60 * 60 * 1000);
+  const data = sheet.getDataRange().getValues();
+  
+  // Assuming Timestamp is in Column A (Index 0)
+  const rowsToKeep = data.filter((row, index) => {
+    if (index === 0) return true; // Keep Header
+    const rowTime = new Date(row[0]).getTime();
+    return rowTime > oneDayAgo;
+  });
+
+  sheet.clearContents();
+  if (rowsToKeep.length > 0) {
+    sheet.getRange(1, 1, rowsToKeep.length, rowsToKeep[0].length).setValues(rowsToKeep);
+  }
+  console.log(`[PRUNE] Kept ${rowsToKeep.length} rows (Last 24h).`);
+}
+
+
 
 /**
- * THE GENERAL: Consolidates Heartbeat (ESI) and Live Wire (Prices).
+ * THE GENERAL: Now with Error-Gating for IMPORTRANGE cells.
  * Targets: 'filtered prices', 'Mineral Supply Prices', 'T1 Supply Prices'.
  */
-function ESI_publishClientInterfaces(ss) {
+function FUZ_publishPriceInterfaces(ss) {
   if(!ss) ss = SpreadsheetApp.getActive();
   const cfg = getConfig();
   const isVaultOk = (cfg.BQ_ENABLED === true);
   
-  // 1. THE MARKET PRICE INTERFACES
   const priceSheets = ['filtered prices', 'Mineral Supply Prices', 'T1 Supply Prices'];
   
   priceSheets.forEach(sheetName => {
     const sh = ss.getSheetByName(sheetName);
     if (!sh) return console.warn(`[SKIP] Interface "${sheetName}" not found.`);
 
-    // --- 1. READ REQUEST (C4, D4, and Column B) ---
-    const marketId = sh.getRange("C4").getValue();
-    const marketType = sh.getRange("D4").getValue();
-    
-    // Get item list from Column B (Starting B8)
+    // --- 1. THE GATING CHECK (C4, D4) ---
+    const mktIdRaw = sh.getRange("C4").getValue();
+    const mktTypeRaw = sh.getRange("D4").getValue();
+
+    // Helper: Detect Errors or Loading states from IMPORTRANGE
+    const isError = (val) => {
+      const s = String(val);
+      return s.indexOf('#') === 0 || s.toLowerCase().includes('loading') || s.trim() === '';
+    };
+
+    if (isError(mktIdRaw) || isError(mktTypeRaw)) {
+      console.warn(`[${sheetName}] Gated: Market Settings contain Error/Loading.`);
+      sh.getRange("E4").setValue("!! ERROR: Market Settings Loading/Broken !!");
+      return; // Skip this sheet and move to the next
+    }
+
+    const marketId = parseInt(mktIdRaw);
+    const marketType = String(mktTypeRaw).trim();
+
+    if (isNaN(marketId)) {
+      sh.getRange("E4").setValue("!! ERROR: Market ID is not a number !!");
+      return;
+    }
+
+    // --- 2. READ ITEM REQUESTS (Column B) ---
     const lastRow = sh.getLastRow();
     if (lastRow < 8) return console.warn(`[${sheetName}] No items found in Col B.`);
     
@@ -798,16 +846,22 @@ function ESI_publishClientInterfaces(ss) {
 
     console.log(`[${sheetName}] Requesting ${itemIds.length} items for ${marketType} ${marketId}`);
 
-    // --- 2. THE RECALL ---
+    // --- 3. THE RECALL ---
     let data = [];
-    if (isVaultOk) {
-      data = getPricesFromVault_(cfg.BQ_PROJECT_ID, marketId, marketType, itemIds);
-    } else {
-      data = getPricesFromLocalBuffer_(ss.getSheetByName('Market Prices'), marketId, itemIds);
-    }
+    try {
+      if (isVaultOk) {
+        data = getPricesFromVault_(cfg.BQ_PROJECT_ID, marketId, marketType, itemIds);
+      } else {
+        data = getPricesFromLocalBuffer_(ss.getSheetByName('Market Prices'), marketId, itemIds);
+      }
 
-    // --- 3. THE RESPONSE (Write to E7:K) ---
-    writeToPriceInterface_(sh, data, isVaultOk);
+      // --- 4. THE RESPONSE (Write to E7:K) ---
+      writeToPriceInterface_(sh, data, isVaultOk);
+
+    } catch (e) {
+      console.error(`[${sheetName}] Sync Failed: ${e.message}`);
+      sh.getRange("E4").setValue("!! Sync Error: Check Logs !!");
+    }
   });
 }
 
