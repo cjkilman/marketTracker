@@ -1056,9 +1056,9 @@ function ESI_installClientInterfaceRefresh(everyMinutes) {
   const n = Number(everyMinutes || 5);
   if (!allowed.includes(n)) throw new Error('everyMinutes must be 1, 5, 10, 15, or 30.');
   ScriptApp.getProjectTriggers()
-    .filter(t => t.getHandlerFunction() === 'ESI_publishClientInterfaces')
+    .filter(t => t.getHandlerFunction() === 'ESI_publishVolumeInterfaces')
     .forEach(t => ScriptApp.deleteTrigger(t));
-  ScriptApp.newTrigger('ESI_publishClientInterfaces').timeBased().everyMinutes(n).create();
+  ScriptApp.newTrigger('ESI_publishVolumeInterfaces').timeBased().everyMinutes(n).create();
 }
 
 /** Remove the refresh trigger */

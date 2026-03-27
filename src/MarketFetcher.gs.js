@@ -42,7 +42,7 @@ const LOG_FUZZ = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('FuzzWorker
  * - Calls executeWithTryLock(_updateFuzzMarketDataWorker).
  * - Updates Lease Timestamp ONLY if successful.
  */
-function updateFuzzMarketDataSheet() {
+function updateFuzzMarketDataSheet(itemSource) {
   const LOG_HEADER = '[Orchestrator]';
   const LEASE_MINUTES = 30;
   const PROPS = PropertiesService.getScriptProperties();
@@ -59,7 +59,9 @@ function updateFuzzMarketDataSheet() {
 
   // --- 2. EXECUTE WITH LOCK ---
   // This calls the worker with NO arguments.
-  const result = executeWithTryLock(_updateFuzzMarketDataWorker, 'updateFuzzMarketDataSheet');
+  const result = executeWithTryLock(() => {
+    _updateFuzzMarketDataWorker(itemSource); // Pass it to the worker
+  }, 'updateFuzzMarketDataSheet');
 
   // --- 3. UPDATE LEASE (On Success) ---
   if (result !== null) {
