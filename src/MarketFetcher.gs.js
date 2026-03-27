@@ -4,7 +4,10 @@
  *
  * NOTE: This file has been modified for an APPEND-ONLY workflow and implements 
  * a "Cold Start Sentinel" to preserve data integrity on all subsequent runs.
- */
+ * 
+ * NOTE: This Impliments Big Query as the Primary Sources of Market Data by using 
+ * Fuz Works Aggergation stored to a Sheet Table and then merged into the Google Vault
+ *  */
 
 /* global LockService, PropertiesService, SpreadsheetApp, LoggerEx, fuzAPI, getMarketPrices, getMasterMarketRequests, getOrCreateSheet, scheduleOneTimeTrigger, JOB_LEASE_DURATION_MS, pruneOldRows, _trimTrailing_, getConfig */
 
@@ -760,4 +763,125 @@ function emergencyCleanup() {
     console.log('Trimming trailing empty rows from Market Prices...');
     _trimTrailing_(mainSheet);
   }
+}
+
+
+/**
+ * THE GENERAL: Consolidates Heartbeat (ESI) and Live Wire (Prices).
+ * Targets: 'filtered prices', 'Mineral Supply Prices', 'T1 Supply Prices'.
+ */
+function ESI_publishClientInterfaces(ss) {
+  if(!ss) ss = SpreadsheetApp.getActive();
+  const cfg = getConfig();
+  const isVaultOk = (cfg.BQ_ENABLED === true);
+  
+  // 1. THE MARKET PRICE INTERFACES
+  const priceSheets = ['filtered prices', 'Mineral Supply Prices', 'T1 Supply Prices'];
+  
+  priceSheets.forEach(sheetName => {
+    const sh = ss.getSheetByName(sheetName);
+    if (!sh) return console.warn(`[SKIP] Interface "${sheetName}" not found.`);
+
+    // --- 1. READ REQUEST (C4, D4, and Column B) ---
+    const marketId = sh.getRange("C4").getValue();
+    const marketType = sh.getRange("D4").getValue();
+    
+    // Get item list from Column B (Starting B8)
+    const lastRow = sh.getLastRow();
+    if (lastRow < 8) return console.warn(`[${sheetName}] No items found in Col B.`);
+    
+    const itemIds = sh.getRange(8, 2, lastRow - 7, 1).getValues()
+                      .flat()
+                      .filter(id => !isNaN(parseInt(id)) && id > 0);
+
+    if (itemIds.length === 0) return;
+
+    console.log(`[${sheetName}] Requesting ${itemIds.length} items for ${marketType} ${marketId}`);
+
+    // --- 2. THE RECALL ---
+    let data = [];
+    if (isVaultOk) {
+      data = getPricesFromVault_(cfg.BQ_PROJECT_ID, marketId, marketType, itemIds);
+    } else {
+      data = getPricesFromLocalBuffer_(ss.getSheetByName('Market Prices'), marketId, itemIds);
+    }
+
+    // --- 3. THE RESPONSE (Write to E7:K) ---
+    writeToPriceInterface_(sh, data, isVaultOk);
+  });
+}
+
+/**
+ * BUFFER: Pulls from the local 'Market Prices' sheet if the Vault is locked.
+ */
+function getPricesFromLocalBuffer_(sh) {
+  if (!sh) return [];
+  const data = sh.getDataRange().getValues();
+  // Filter for the last 24h and map to your [id, buy_med, sell_med, buy_curr, sell_curr] format
+  // (Assuming your local sheet schema matches FUZZ_SHEET_HEADERS)
+  return data.slice(1).map(r => [r[3], r[7], r[6], r[5], r[4]]);
+}
+
+/**
+ * RECALL: Targeted SQL query for specific items.
+ */
+function getPricesFromVault_(projectId, mktId, mktType, ids) {
+  const idString = ids.join(',');
+  const sql = `
+    SELECT 
+      type_id, 
+      ROUND(AVG(median_buy), 2) as avg_buy, 
+      ROUND(AVG(median_sell), 2) as avg_sell,
+      ARRAY_AGG(median_buy ORDER BY date DESC LIMIT 1)[OFFSET(0)] as curr_buy,
+      ARRAY_AGG(median_sell ORDER BY date DESC LIMIT 1)[OFFSET(0)] as curr_sell
+    FROM \`${projectId}.market_data.market_prices_staged\`
+    WHERE market_id = ${mktId}
+      AND LOWER(market_type) = LOWER('${mktType}')
+      AND type_id IN (${idString})
+      AND date >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+    GROUP BY type_id ORDER BY type_id ASC
+  `;
+  
+  try {
+    const queryResults = BigQuery.Jobs.query({query: sql, useLegacySql: false}, projectId);
+    if (!queryResults.rows) return [];
+    
+    return queryResults.rows.map(row => {
+      const v = row.f.map(field => field.v);
+      const avgB = parseFloat(v[1]), avgS = parseFloat(v[2]), curB = parseFloat(v[3]), curS = parseFloat(v[4]);
+      // Calculate % Change: (Current - 24h Median) / 24h Median
+      const chgS = avgS > 0 ? (curS - avgS) / avgS : 0;
+      const chgB = avgB > 0 ? (curB - avgB) / avgB : 0;
+      return [v[0], avgB, avgS, curB, curS, chgS, chgB];
+    });
+  } catch (e) {
+    console.error("Vault Query Failed: " + e.message);
+    return [];
+  }
+}
+
+/**
+ * RESPONSE: Surgical write to the E7:K range.
+ */
+function writeToPriceInterface_(sheet, data, isVault) {
+  const HEADERS = [["type_id_filtered", "Median Buy", "Median Sell", "Current Buy", "Current Sell", "Sell Change", "Buy Change"]];
+  
+  // Clear only the output range
+  const lastRow = sheet.getLastRow();
+  if (lastRow >= 8) sheet.getRange(8, 5, lastRow - 7, 7).clearContent();
+  
+  // Write Headers (E7:K7)
+  sheet.getRange(7, 5, 1, 7).setValues(HEADERS);
+  
+  if (data.length > 0) {
+    sheet.getRange(8, 5, data.length, 7).setValues(data);
+    
+    // Formatting for Changes (J and K)
+    sheet.getRange(8, 10, data.length, 2).setNumberFormat('0.00%');
+    // Formatting for ISK
+    sheet.getRange(8, 6, data.length, 4).setNumberFormat('#,##0.00 "ISK"');
+  }
+  
+  const status = isVault ? "✅ Vault" : "⚠️ Buffer";
+  sheet.getRange("E4").setValue(`${status} Synced: ${new Date().toLocaleTimeString()}`);
 }

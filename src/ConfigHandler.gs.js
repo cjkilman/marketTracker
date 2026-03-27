@@ -7,12 +7,14 @@ function getConfigSheet() {
   if (configSheet.getLastRow() < 2) {
     // Default settings
     const defaults = [
-      ["type_id", 34, "Default item type ID"],
+      ["type_id", 34, "Default item type ID (Tritanium)"],
       ["market_id", 30002187, "Amarr system ID"],
       ["market_type", "system", "System or region market type"],
-      ["MaxLogIDs", 700, "Max item IDs to keep in logs (blank = keep all)"],
+      ["BQ_ENABLED", true, "MASTER SWITCH: TRUE = BigQuery Vault | FALSE = Sheet Backup"],
+      ["BQ_QUOTA_GIB", 30.72, "Daily BigQuery Free Tier Limit (Hard Stop)"],
+      ["MaxLogIDs", 700, "Max item IDs to keep in logs"],
       ["DaysForCandlestick", 30, "Days to build candlestick chart"],
-      ["RebuildAlways", false, "Always rebuild history"],
+      ["RebuildAlways", false, "Always rebuild history (Slow)"],
       ["OpenTime", "11:00", "Daily open window start (HH:mm)"],
       ["CloseTime", "18:00", "Daily close window start (HH:mm)"]
     ];
@@ -20,6 +22,25 @@ function getConfigSheet() {
   }
 
   return configSheet;
+}
+
+/**
+ * Updates a specific config value in the 'Market Config' sheet.
+ * Used by the Orchestrator to kill BQ_ENABLED if the wallet-locker is hit.
+ */
+function setMarketConfig(key, value) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Market Config");
+  if (!sheet) return;
+
+  const data = sheet.getRange(2, 1, sheet.getLastRow() - 1, 1).getValues();
+  for (let i = 0; i < data.length; i++) {
+    if (data[i][0] === key) {
+      sheet.getRange(i + 2, 2).setValue(value);
+      console.log(`[CONFIG] ${key} updated to: ${value}`);
+      return;
+    }
+  }
+  console.warn(`[CONFIG] Key '${key}' not found. No update made.`);
 }
 
 function getConfig() {

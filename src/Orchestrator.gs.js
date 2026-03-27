@@ -179,51 +179,129 @@ function hasFuel(requiredSeconds = 30) {
   return (limit - elapsed) > requiredSeconds;
 }
 
+/**
+ * THE ENDGAME ORCHESTRATOR
+ * The single source of truth for the 132-slot farm.
+ */
 function masterOrchestrator() {
   const startTime = Date.now();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
   const props = PropertiesService.getScriptProperties();
   props.setProperty('exec_start_time', String(startTime)); 
 
-  // --- TASK 1: FUZZ (Market Data to BQ) ---
-  // This is now working but takes time.
-// --- TASK 1: FUZZ (Market Data to BQ) ---
-  const beforeFuzz = Date.now();
-  updateFuzzMarketDataSheet();
-  const afterFuzz = Date.now();
+  // --- PRE-FLIGHT: THE SAFETY COP ---
+  const cfg = getConfig(); 
+  const isVaultOk = (cfg.BQ_ENABLED === true);
   
-  // If the fuzz worker took more than 5 seconds, it means it actually ran an upload
-  // (instead of skipping due to the lease). We must wait for the BQ buffer.
-  if ((afterFuzz - beforeFuzz) > 5000) {
-      console.log("[BUFFER] Waiting 30s for BigQuery streaming buffer to index...");
-      Utilities.sleep(30000); 
-  }
+  // SELECT SOURCE: SDE (Industrial) vs Item List (Tactical Backup)
+  const itemSource = isVaultOk ? "SDE_Master_List" : "Item List Back End";
+  console.log(`[GATE] Vault: ${isVaultOk ? "OPEN" : "LOCKED"}. Source: ${itemSource}`);
 
-  // --- TASK 2: SYNC (Publishing) ---
-  // Require at least 2 minutes (120s) remaining to attempt a sync
-  if (hasFuel(120)) { 
-    console.log("Fuel Good. Syncing Interfaces...");
-    if (typeof publishMarketResultESIRegion === 'function') {
-      try {
-        publishMarketResultESIRegion(); 
-      } catch (e) {
-        console.warn("Intermediate Publish Failed: " + e.message);
-      }
+  // --- TASK 1: MARKET INGESTION ---
+  try {
+    console.log("--- PHASE 1: FETCHING ---");
+    // This function now APPENDS to 'BQ_LIVE_DATA'
+    updateFuzzMarketDataSheet(itemSource); 
+
+    // ANESTHESIA: Force Google to commit the new rows before the Gate
+    console.log("[ANESTHESIA] Flushing fetch results...");
+    SpreadsheetApp.flush(); 
+
+  } catch (e) {
+    if (e.message.includes("quota")) {
+      console.error("!!! CRITICAL QUOTA HIT !!! Tripping Safety Switch.");
+      setMarketConfig("BQ_ENABLED", false); // Hard Stop on B10
+      return; // Exit: Path B will take over at the next 3:00 AM reset cycle
     }
-    ESI_publishClientInterfaces();
-  } else {
-    console.warn("[SKIP] Low Fuel: Skipping Sync to prevent timeout.");
+    console.warn("Fetch Failed: " + e.message);
   }
 
-  // --- TASK 3: REFRESH (The Timeout Culprit) ---
-  // If we have less than 90s left, do NOT run immediate refresh.
-  // Instead, schedule it to run in a fresh 6-minute window.
-  if (hasFuel(90)) { 
-    console.log("Fuel Good. Running Refreshes...");
-    masterMarketRefresh();
-  } else {
-    console.info("[STAGGER] Low Fuel: Scheduling Refresh for a separate execution.");
-    scheduleOneTimeTrigger('refreshPriceInterfaceSheetsManual', 15000); // Run in 15s
+  // --- TASK 2: THE VAULT GATE (Merge vs. Prune) ---
+  if (hasFuel(120)) { 
+    console.log("--- PHASE 2: VAULT GATE ---");
+    if (isVaultOk) {
+      console.log("[PATH A] Merging Sheet to BigQuery Vault...");
+      runVaultMergeAndReset(ss); 
+    } else {
+      console.log("[PATH B] BigQuery Locked. Pruning to Rolling 24h...");
+      pruneSheetToRolling24(ss); 
+    }
+    
+    // ANESTHESIA: Force the "Clean Slate" before we pulse the UI
+    console.log("[ANESTHESIA] Flushing Gate results...");
+    SpreadsheetApp.flush();
   }
+
+// --- THE STAGGERED HANDOFF ---
+  // Instead of running Task 3 now, we schedule it for 1 minute from now.
+  // This allows BigQuery to "settle" and resets our execution timer.
+  console.log("[STAGGER] Task 2 Complete. Scheduling UI Pulse for +1 Minute...");
+  scheduleOneTimeTrigger('orchestratorTaskUI', 60000);
+}
+
+/**
+ * TASK 3: UI DISTRIBUTION
+ * Runs in its own execution window with dedicated fuel monitoring.
+ */
+function orchestratorTaskUI() {
+  const startTime = Date.now();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const props = PropertiesService.getScriptProperties();
+  
+  // Set the start time for the fuel gauge
+  props.setProperty('exec_start_time', String(startTime)); 
+
+  console.log("--- PHASE 3: UI PULSE (Dedicated Window) ---");
+
+  // --- 1. REGIONAL PUBLISH ---
+  if (hasFuel(120)) { 
+    console.log("[UI] Publishing Regional ESI Data...");
+    publishMarketResultESIRegion(ss); 
+  } else {
+    return console.warn("[EXIT] Insufficient fuel to start Regional Publish.");
+  }
+
+  // --- 2. CLIENT DISTRIBUTION ---
+  if (hasFuel(90)) {
+    console.log("[UI] Distributing slices to Client Interfaces...");
+    // This is the heavy lifting: Slicing data for multiple sheets
+    ESI_publishClientInterfaces(ss); 
+  } else {
+    // If we ran out of fuel here, we need to try again because the sheets are out of sync.
+    console.warn("[STAGGER] Low fuel during Client Sync. Rescheduling...");
+    return scheduleOneTimeTrigger('orchestratorTaskUI', 30000); 
+  }
+
+  const elapsed = (Date.now() - startTime) / 1000;
+  console.log(`[COMPLETE] UI Sync finished in ${elapsed}s. Interface is Hot.`);
+}
+
+/**
+ * PATH B: The 24-Hour Expiry "Crowbar"
+ * Keeps the sheet from exploding when BigQuery is offline.
+ * Move to MarketFetchetr
+ */
+function pruneSheetToRolling24(ss) {
+  if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("BQ_LIVE_DATA");
+  if (!sheet) return;
+
+  const now = new Date().getTime();
+  const oneDayAgo = now - (24 * 60 * 60 * 1000);
+  const data = sheet.getDataRange().getValues();
+  
+  // Assuming Timestamp is in Column A (Index 0)
+  const rowsToKeep = data.filter((row, index) => {
+    if (index === 0) return true; // Keep Header
+    const rowTime = new Date(row[0]).getTime();
+    return rowTime > oneDayAgo;
+  });
+
+  sheet.clearContents();
+  if (rowsToKeep.length > 0) {
+    sheet.getRange(1, 1, rowsToKeep.length, rowsToKeep[0].length).setValues(rowsToKeep);
+  }
+  console.log(`[PRUNE] Kept ${rowsToKeep.length} rows (Last 24h).`);
 }
 
 
