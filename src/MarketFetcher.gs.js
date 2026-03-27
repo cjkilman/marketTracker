@@ -103,13 +103,14 @@ function _resetFuzzMarketDataJobState(error) {
  * - Reads 'Item List Back End' & 'Market Settings' internally.
  * - Loops through all markets.
  */
-function _updateFuzzMarketDataWorker() {
+function _updateFuzzMarketDataWorker(itemSource) {
   // Polyfill logger
   const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('FuzzWorker') : console;
   const ss = SpreadsheetApp.getActiveSpreadsheet();
 
   // --- 1. LOAD ITEMS ---
-  const itemSheet = ss.getSheetByName("Item List Back End");
+const sourceName = itemSource || "Item List Back End"; // Use the passed source OR default
+const itemSheet = ss.getSheetByName(sourceName);
   if (!itemSheet) {
     console.error("[FuzzWorker] Critical: 'Item List Back End' sheet missing.");
     return;
@@ -774,7 +775,7 @@ function emergencyCleanup() {
  */
 function pruneSheetToRolling24(ss) {
   if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName("BQ_LIVE_DATA");
+  const sheet = ss.getSheetByName(FUZZ_SHEET_FINAL);
   if (!sheet) return;
 
   const now = new Date().getTime();
@@ -795,7 +796,91 @@ function pruneSheetToRolling24(ss) {
   console.log(`[PRUNE] Kept ${rowsToKeep.length} rows (Last 24h).`);
 }
 
+/**
+ * THE LIVE WIRE RECALL: Surgical BigQuery Puller.
+ * Refined to match the E7:K standard and ConfigHandler logic.
+ */
+function FUZ_refreshPriceInterface(ss, targetSheetName) {
+  const cfg = getConfig(); // Pull IDs from your central config
+  const projectId = cfg.BQ_PROJECT_ID || 'tenacious-tiger-345318';
+  
+  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(targetSheetName);
+  if (!sheet) return console.warn(`[SKIP] Sheet "${targetSheetName}" not found.`);
 
+  // --- 1. THE GATE (C4:D4) ---
+  const settings = sheet.getRange("C4:D4").getValues()[0];
+  const marketId = parseInt(settings[0]);
+  const marketType = String(settings[1]).trim();
+
+  if (isNaN(marketId) || marketType.toLowerCase().includes("loading")) {
+    sheet.getRange("E4").setValue(`⚠️ Waiting for IMPORTRANGE...`);
+    return; 
+  }
+
+  // --- 2. THE RECALL SQL (Optimized for E7:K) ---
+  // Calculates 24h Medians + Current Prices + % Changes in the Vault
+  const sql = `
+    SELECT 
+      type_id, 
+      ROUND(AVG(median_buy), 2) as avg_buy, 
+      ROUND(AVG(median_sell), 2) as avg_sell,
+      ARRAY_AGG(median_buy ORDER BY date DESC LIMIT 1)[OFFSET(0)] as cur_buy,
+      ARRAY_AGG(median_sell ORDER BY date DESC LIMIT 1)[OFFSET(0)] as cur_sell
+    FROM \`${projectId}.market_data.market_prices_staged\`
+    WHERE market_id = ${marketId}
+      AND LOWER(market_type) = LOWER('${marketType}')
+      AND date >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+    GROUP BY type_id ORDER BY type_id ASC
+  `;
+
+  try {
+    console.log(`[${targetSheetName}] Vault Recall Started...`);
+    const queryResults = BigQuery.Jobs.query({query: sql, useLegacySql: false}, projectId);
+    
+    const data = queryResults.rows ? queryResults.rows.map(row => {
+      const v = row.f.map(field => field.v);
+      const avgB = parseFloat(v[1]), avgS = parseFloat(v[2]), curB = parseFloat(v[3]), curS = parseFloat(v[4]);
+      // Calculate % Change here to keep the sheet light
+      const chgS = avgS > 0 ? (curS - avgS) / avgS : 0;
+      const chgB = avgB > 0 ? (curB - avgB) / avgB : 0;
+      return [v[0], avgB, avgS, curB, curS, chgS, chgB];
+    }) : [];
+
+    if (data.length === 0) throw new Error("Vault is Empty (Waiting for next fetch)");
+    
+    // --- 3. THE RESPONSE (Write to E7:K) ---
+    FUZ_writeToInterfaceSheet(sheet, data, "✅ Vault Synced");
+
+  } catch (err) {
+    console.warn(`[${targetSheetName}] Sync Failed: ${err.message}`);
+    sheet.getRange("E4").setValue(`⚠️ Sync Error: ${err.message}`);
+  }
+}
+
+/**
+ * HELPER: Surgical write to the E7:K range.
+ */
+function FUZ_writeToInterfaceSheet(sheet, data, statusPrefix) {
+  const HEADERS = [["type_id_filtered", "Median Buy", "Median Sell", "Current Buy", "Current Sell", "Sell Change", "Buy Change"]];
+  
+  // Clear Column E through K starting at row 8
+  const lastRow = sheet.getLastRow();
+  if (lastRow >= 8) sheet.getRange(8, 5, lastRow - 7, 7).clearContent();
+  
+  // Set Headers at Row 7
+  sheet.getRange(7, 5, 1, 7).setValues(HEADERS);
+  
+  // Write Data at Row 8
+  if (data.length > 0) {
+    sheet.getRange(8, 5, data.length, 7).setValues(data);
+    // Formatting: J-K as Percentages, F-I as ISK
+    sheet.getRange(8, 10, data.length, 2).setNumberFormat('0.00%');
+    sheet.getRange(8, 6, data.length, 4).setNumberFormat('#,##0.00 "ISK"');
+  }
+  
+  sheet.getRange("E4").setValue(`${statusPrefix}: ${new Date().toLocaleTimeString()}`);
+}
 
 /**
  * THE GENERAL: Now with Error-Gating for IMPORTRANGE cells.
