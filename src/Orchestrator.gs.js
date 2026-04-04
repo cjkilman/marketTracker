@@ -19,6 +19,33 @@ const JOB_LEASE_DURATION_MS = 1800000; // 5 minutes
 var EXECUTION_LOCK_DEPTH_TRY = 0;
 var EXECUTION_LOCK_DEPTH_WAIT = 0;
 
+function rebuildMarketPricesSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const HEADERS = ["date", "market_id", "market_type", "type_id", "min_sell", "max_buy", "median_sell", "median_buy"];
+  
+  // Creates the sheet, adds headers, and deletes columns I-Z automatically
+  const sheet = getOrCreateSheet(ss, 'Market Prices', HEADERS);
+  
+  console.log("Market Prices sheet rebuilt and optimized!");
+}
+
+
+
+function forceStartEngine() {
+  const props = PropertiesService.getScriptProperties();
+  
+  // 1. Clear the "Safety Tape"
+  props.deleteProperty('LAST_FUZZ_FETCH'); 
+  props.deleteProperty('fuzz_lease_timestamp');
+  props.deleteProperty('fuzz_job_active');
+  
+  console.log("🛑 Safety timers cleared.");
+  console.log("🚀 Forcing full fetch and BigQuery upload...");
+  
+  // 2. Fire the Orchestrator
+  masterOrchestrator(); 
+}
+
 /**
  * Creates a one-time trigger for a function after a delay. Deletes existing triggers first.
  */
@@ -179,20 +206,26 @@ function hasFuel(requiredSeconds = 30) {
   return (limit - elapsed) > requiredSeconds;
 }
 
-function forceStartEngine() {
+
+
+/**
+ * THE RESUME BUTTON
+ * Clears ONLY the 30-minute cooldown lease, leaving the Bookmark intact, 
+ * then fires the Orchestrator to finish the pass.
+ */
+function resumeEngine() {
   const props = PropertiesService.getScriptProperties();
   
-  // 1. Clear the "Safety Tape"
-  props.deleteProperty('LAST_FUZZ_FETCH'); 
+  // Clear ONLY the cooldown timers
   props.deleteProperty('fuzz_lease_timestamp');
-  props.deleteProperty('fuzz_job_active');
+  props.deleteProperty('LAST_FUZZ_FETCH');
   
-  console.log("🛑 Safety timers cleared.");
-  console.log("🚀 Forcing full fetch and BigQuery upload...");
+  console.log("🛑 Cooldown bypassed. Resuming from Bookmark...");
   
-  // 2. Fire the Orchestrator
-  masterOrchestrator(); 
+  // Fire the engine
+  masterOrchestrator();
 }
+
 
 /**
  * THE ENDGAME ORCHESTRATOR
@@ -267,12 +300,83 @@ function masterOrchestrator() {
   // ==========================================
   console.log("[STAGGER] Task 2 Complete. Scheduling UI Pulse for +1 Minute...");
   scheduleOneTimeTrigger('orchestratorTaskUI', 60000);
+
+  // ==========================================
+  // 5. MAINTENANCE & GARBAGE COLLECTION
+  // ==========================================
+  if (hasFuel(60)) { 
+    console.log("--- PHASE 4: MAINTENANCE ---");
+    runMaintenanceJobs();
+  } else {
+    console.warn("[Maintenance] Skipped: Insufficient execution fuel remaining.");
+  }
 }
 
 /**
- * TASK 3: UI DISTRIBUTION
- * Runs in its own execution window with dedicated fuel monitoring.
+ * ROUND-ROBIN MAINTENANCE SCHEDULER
+ * Executes one garbage collection or maintenance chore per cycle to save RAM and prevent timeouts.
  */
+function runMaintenanceJobs() {
+  const SCRIPT_PROP = PropertiesService.getScriptProperties();
+  const NOW_MS = new Date().getTime();
+
+  // 1. Job Registry with targeted intervals (in milliseconds)
+  const JOB_QUEUE = [
+    { name: 'dailyHeavyPrune_Prices', interval: 86400000 }, // 24 hours
+    { name: 'dailyJobReset', interval: 86400000 },          // 24 hours
+    { name: 'emergencyCleanup', interval: 604800000 }       // 7 days (Weekly deep clean)
+  ];
+
+  const QUEUE_INDEX_KEY = 'MAINTENANCE_QUEUE_INDEX';
+  let currentIndex = parseInt(SCRIPT_PROP.getProperty(QUEUE_INDEX_KEY) || '0', 10);
+  if (currentIndex >= JOB_QUEUE.length) currentIndex = 0;
+
+  let iterations = 0;
+  
+  // 2. Loop through the queue until we find one job that is due
+  while (iterations < JOB_QUEUE.length) {
+    const job = JOB_QUEUE[currentIndex];
+    const lastRunKey = 'LAST_RUN_' + job.name;
+    const lastRunTs = parseInt(SCRIPT_PROP.getProperty(lastRunKey) || '0', 10);
+    const isDue = (NOW_MS - lastRunTs) >= job.interval;
+
+    // 3. Execution Logic
+    if (isDue) {
+      console.log(`[Maintenance] Dispatching: ${job.name}`);
+
+      try {
+        // Safer Dispatcher: Maps string names directly to the global functions
+        // This prevents the V8 engine from blocking dynamic eval() calls.
+        const jobFunctions = {
+          'dailyHeavyPrune_Prices': () => { if (typeof dailyHeavyPrune_Prices === 'function') dailyHeavyPrune_Prices(); },
+          'dailyJobReset': () => { if (typeof dailyJobReset === 'function') dailyJobReset(); },
+          'emergencyCleanup': () => { if (typeof emergencyCleanup === 'function') emergencyCleanup(); }
+        };
+
+        if (jobFunctions[job.name]) {
+          jobFunctions[job.name](); // Execute the chore
+          
+          // Mark it complete and advance the queue index for the next Orchestrator run
+          SCRIPT_PROP.setProperty(lastRunKey, NOW_MS.toString());
+          SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, ((currentIndex + 1) % JOB_QUEUE.length).toString());
+          console.log(`[Maintenance] ${job.name} completed successfully.`);
+          
+          return; // EXIT EARLY: Only do ONE chore per Orchestrator pulse to prevent Google timeouts.
+        } else {
+          console.warn(`[Maintenance] Function ${job.name} is not defined in the workspace.`);
+        }
+      } catch (e) {
+        console.error(`[Maintenance] Critical Failure in ${job.name}: ${e.message}`);
+      }
+    }
+
+    // Move to the next item if the current one isn't due
+    currentIndex = (currentIndex + 1) % JOB_QUEUE.length;
+    iterations++;
+  }
+  
+  console.log("[Maintenance] Cycle Complete: All jobs are currently within their wait windows.");
+}
 /**
  * TASK 3: UI DISTRIBUTION (THE HEARTBEAT + THE LIVE WIRE)
  * Runs in its own execution window after BigQuery has settled.
@@ -301,13 +405,26 @@ function orchestratorTaskUI() {
 }
 
 /**
- * TASK 2: VAULT GATE (PATH A)
- * Merges the 'Market Prices' sheet data into BigQuery and wipes the buffer.
+ * THE VAULT BYPASS
+ * Pushes the currently staged 162k rows into BigQuery and clears the sheet.
  */
+function forceVaultMerge() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  console.log("[LAUNCH] Manually triggering Vault Merge for staged data...");
+  
+  // THE FIX: Reset the stopwatch so the fuel gauge reads 100%
+  PropertiesService.getScriptProperties().setProperty('exec_start_time', String(Date.now()));
+  
+  // Drive the truck to the Vault
+  runVaultMergeAndReset(ss); 
+  
+  console.log("[SUCCESS] Vault Merge Complete. Pipeline is now fully operational.");
+}
+
 function runVaultMergeAndReset(ss) {
   const LOG_HEADER = '[VaultGate]';
   const cfg = getConfig();
-  const sheetName = "Market Prices"; // FUZZ_SHEET_FINAL
+  const sheetName = "Market Prices"; 
   const sh = ss.getSheetByName(sheetName);
 
   if (!sh) {
@@ -321,56 +438,81 @@ function runVaultMergeAndReset(ss) {
     return;
   }
 
-  // 1. FUEL CHECK (Need a full tank for BigQuery operations)
   if (!hasFuel(120)) {
     console.warn(`${LOG_HEADER} Low fuel. Aborting merge to prevent partial data loss.`);
     return;
   }
 
   try {
-    // 2. PREPARE THE DATA
-    // Grab everything including headers to ensure schema alignment
-    const data = sh.getDataRange().getValues();
-    const headers = data[0];
-    const rows = data.slice(1);
+    const rawData = sh.getDataRange().getValues();
+    let ndjson = "";
 
-    console.log(`${LOG_HEADER} Preparing to bury ${rows.length} rows in the Vault...`);
+    // Start at index 1 to skip the header row
+    for (let i = 1; i < rawData.length; i++) {
+      let row = rawData[i];
+      let dateCell = row[0];
 
-    // 3. BIGQUERY LOAD JOB
-    // We use a LOAD job because it's free and handles batching better than streaming for large sets
-    const projectId = cfg.BQ_PROJECT_ID; 
-    const datasetId = cfg.BQ_DATASET_ID;
-    const tableId = cfg.BQ_TABLE_ID;
+      // Format date to UTC strict
+      let formattedDate = "";
+      if (dateCell instanceof Date) {
+        formattedDate = Utilities.formatDate(dateCell, "UTC", "yyyy-MM-dd HH:mm:ss");
+      } else if (typeof dateCell === 'string') {
+        let parsed = new Date(dateCell);
+        if (!isNaN(parsed)) {
+           formattedDate = Utilities.formatDate(parsed, "UTC", "yyyy-MM-dd HH:mm:ss");
+        } else {
+           formattedDate = dateCell; 
+        }
+      }
 
-    if (!projectId || !datasetId || !tableId) {
-      throw new Error("Missing BigQuery Configuration (Project/Dataset/Table ID).");
+      // Explicitly map every column to the exact BigQuery schema name
+      const bqRow = {
+        date: formattedDate,
+        market_id: String(row[1]),
+        market_type: String(row[2]),
+        type_id: Number(row[3]),
+        min_sell: Number(row[4]) || 0,
+        max_buy: Number(row[5]) || 0,
+        median_sell: Number(row[6]) || 0,
+        median_buy: Number(row[7]) || 0
+      };
+
+      ndjson += JSON.stringify(bqRow) + "\n";
     }
 
-    const blob = Utilities.newBlob(JSON.stringify(rows), 'application/octet-stream');
+    console.log(`${LOG_HEADER} Preparing to bury ${rawData.length - 1} explicitly mapped rows in the Vault...`);
+
+    const projectId = 'tenacious-tiger-345318'; 
+    const datasetId = 'market_data';            
+    const tableId   = 'market_prices_staged';   
+
+    const blob = Utilities.newBlob(ndjson, 'application/octet-stream');
+
+    const job = {
+      configuration: {
+        load: {
+          destinationTable: {
+            projectId: projectId,
+            datasetId: datasetId,
+            tableId: tableId
+          },
+          sourceFormat: 'NEWLINE_DELIMITED_JSON',
+          writeDisposition: 'WRITE_APPEND'
+        }
+      }
+    };
+
+    // Fire the payload directly via the Advanced Service, ignoring the helper function
+    BigQuery.Jobs.insert(job, projectId, blob);
+
+    console.log(`${LOG_HEADER} Merge Successful. BigQuery confirmed receipt.`);
     
-    // Using the BigQuery Pipe logic (Batch Load)
-    const jobSuccess = bigQueryBatchLoad_(projectId, datasetId, tableId, data);
-
-    if (jobSuccess) {
-      console.log(`${LOG_HEADER} Merge Successful. BigQuery confirmed receipt.`);
-      
-      // 4. THE RESET (Only happens on success!)
-      // Leave the headers, kill the data.
-      const lastCol = sh.getLastColumn();
-      sh.getRange(2, 1, lastRow - 1, lastCol).clearContent();
-      
-      // OPTIONAL: Trim the sheet back down to 100 rows to keep it snappy
-      _trimTrailing_(sh);
-      
-      console.log(`${LOG_HEADER} Sheet reset. Buffer is clean.`);
-    } else {
-      throw new Error("BigQuery Job failed to verify success signal.");
-    }
+    const lastCol = sh.getLastColumn();
+    sh.getRange(2, 1, lastRow - 1, lastCol).clearContent();
+    console.log(`${LOG_HEADER} Sheet reset. Buffer is clean.`);
 
   } catch (e) {
     console.error(`${LOG_HEADER} CRITICAL FAILURE: ${e.message}`);
-    // WE DO NOT RESET THE SHEET HERE. 
-    // This allows Path B (Pruning) to handle the data on the next pulse if the Vault is down.
   }
 }
 
