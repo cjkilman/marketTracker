@@ -192,18 +192,12 @@ function isTimeForDisplayRefresh() {
   return true; 
 }
 
-/**
- * FUEL GAUGE: Returns true if we have enough time to start a new task.
- * @param {number} requiredSeconds - Minimum buffer needed (default 30s)
- */
-function hasFuel(requiredSeconds = 30) {
-  const startTime = PropertiesService.getScriptProperties().getProperty('exec_start_time');
-  if (!startTime) return true; // Fallback if not set
-  
-  const elapsed = (Date.now() - parseInt(startTime)) / 1000;
-  const limit = 360; // Google's 6-minute limit
-  
-  return (limit - elapsed) > requiredSeconds;
+/** Helper to check if we have enough execution time left (in seconds) */
+function hasFuel(secondsNeeded) {
+  const props = PropertiesService.getScriptProperties();
+  const startTime = parseInt(props.getProperty('exec_start_time') || Date.now());
+  const elapsedSeconds = (Date.now() - startTime) / 1000;
+  return (300 - elapsedSeconds) > secondsNeeded; // 300s = 5 minutes (Leaves 1 min safety buffer)
 }
 
 
