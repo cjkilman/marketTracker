@@ -20,28 +20,6 @@ function onOpen() {
     .addToUi();
 }
 
-/**
- * Helper to flip the BQ_ENABLED flag from the menu
- */
-function toggleBigQueryCircuitBreaker() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const configSheet = ss.getSheetByName("Market Config");
-  if (!configSheet) return;
-
-  const data = configSheet.getDataRange().getValues();
-  for (let i = 0; i < data.length; i++) {
-    if (data[i][0] === "BQ_ENABLED") {
-      const currentValue = data[i][1];
-      const newValue = (currentValue === true || String(currentValue).toLowerCase() === "true") ? false : true;
-      configSheet.getRange(i + 1, 2).setValue(newValue);
-      
-      const status = newValue ? "✅ ENABLED" : "🛑 DISABLED";
-      ss.toast(`BigQuery Pipe is now ${status}`, "Circuit Breaker");
-      return;
-    }
-  }
-  ss.toast("BQ_ENABLED setting not found in Market Config.", "Error");
-}
 
 
 function GET_SDE_CONFIG() {

@@ -85,9 +85,15 @@ const sql = `
     console.log(`[${targetSheetName}] Write complete!`);
 
   } catch (err) {
-    console.warn(`[${targetSheetName}] BQ Query Failed: ${err.message}`);
-    sheet.getRange("E4").setValue(`⚠️ BQ Error: ${err.message}`);
-    return; 
+console.warn(`[${targetSheetName}] BQ Query Failed: ${err.message}`);
+    sheet.getRange("E4").setValue(`BQ Error: ${err.message}`);
+    
+    // Auto-trip the circuit breaker on quota errors
+    if (err.message.toLowerCase().includes("quota exceeded")) {
+      console.error("Quota limit hit. Engaging circuit breaker automatically.");
+      toggleBigQueryCircuitBreaker();
+    }
+    return;
   }
 }
 

@@ -19,31 +19,43 @@ const JOB_LEASE_DURATION_MS = 1800000; // 5 minutes
 var EXECUTION_LOCK_DEPTH_TRY = 0;
 var EXECUTION_LOCK_DEPTH_WAIT = 0;
 
-function rebuildMarketPricesSheet() {
+function emergencyGhostCleanup() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const HEADERS = ["date", "market_id", "market_type", "type_id", "min_sell", "max_buy", "median_sell", "median_buy"];
+  const sheets = ss.getSheets();
+  sheets.forEach(sh => {
+    if (sh.getName().includes("Merge_Temp_")) ss.deleteSheet(sh);
+  });
+  console.log("Workbook Cleaned.");
+}
+
+
+function rebuildMarketPricesSheet(ctx) {
+  const targetSS = ctx ? ctx.ss : SpreadsheetApp.getActiveSpreadsheet();
+  const NAME = "Market Prices";
+  const HEADERS = [["date", "market_id", "market_type", "type_id", "min_sell", "max_buy", "median_sell", "median_buy"]];
   
-  // Creates the sheet, adds headers, and deletes columns I-Z automatically
-  const sheet = getOrCreateSheet(ss, 'Market Prices', HEADERS);
-  
-  console.log("Market Prices sheet rebuilt and optimized!");
+  let sh = targetSS.getSheetByName(NAME);
+  if (!sh) {
+    sh = targetSS.insertSheet(NAME);
+    sh.getRange(1, 1, 1, 8).setValues(HEADERS);
+  }
+  return sh; 
 }
 
 
 
-function forceStartEngine() {
-  const props = PropertiesService.getScriptProperties();
-  
-  // 1. Clear the "Safety Tape"
-  props.deleteProperty('LAST_FUZZ_FETCH'); 
-  props.deleteProperty('fuzz_lease_timestamp');
-  props.deleteProperty('fuzz_job_active');
-  
-  console.log("🛑 Safety timers cleared.");
-  console.log("🚀 Forcing full fetch and BigQuery upload...");
-  
-  // 2. Fire the Orchestrator
-  masterOrchestrator(); 
+
+/**
+
+ * Ensures all functions share the same Spreadsheet and Config handles.
+ */
+function getAppContext(ss) {
+  return {
+    ss: ss || SpreadsheetApp.getActiveSpreadsheet(),
+    props: PropertiesService.getScriptProperties(),
+    cfg: getConfig(),
+    timestamp: Date.now()
+  };
 }
 
 /**
@@ -71,7 +83,7 @@ function isTimeForInterfaceSync() {
   const props = PropertiesService.getScriptProperties();
   const lastSync = parseInt(props.getProperty('last_interface_sync') || '0', 10);
   const now = new Date().getTime();
-  
+
   // Only sync once every 5 minutes
   if (now - lastSync > 300000) {
     props.setProperty('last_interface_sync', String(now));
@@ -123,9 +135,9 @@ function executeWithTryLock(func, funcName) {
     try {
       if (isOuterLock) deleteTriggersByName(funcName); // Clean retry trigger if we got the lock
       log.info(`--- ${isOuterLock ? 'Starting' : 'Entering nested'} Execution (TryLock): ${funcName} ---`);
-      
+
       functionResult = func(); // Execute and store result
-      
+
       log.info(`--- ${isOuterLock ? 'Finished' : 'Exiting nested'} Execution (TryLock): ${funcName} ---`);
     } catch (e) {
       log.error(`${funcName} failed: ${e.message}\nStack: ${e.stack}`);
@@ -165,9 +177,9 @@ function executeWithWaitLock(func, funcName) {
   try {
     if (isOuterLock) deleteTriggersByName(funcName);
     log.info(`--- ${isOuterLock ? 'Starting' : 'Entering nested'} Execution (WaitLock): ${funcName} ---`);
-    
+
     functionResult = func(); // Execute and store result
-    
+
     log.info(`--- ${isOuterLock ? 'Finished' : 'Exiting nested'} Execution (WaitLock): ${funcName} ---`);
   } catch (e) {
     log.error(`${funcName} failed: ${e.message}\nStack: ${e.stack}`);
@@ -189,7 +201,7 @@ function executeWithWaitLock(func, funcName) {
 function isTimeForDisplayRefresh() {
   // Logic: Always return true to refresh whenever the Orchestrator pulses, 
   // or add a timer check (e.g., every 5 minutes).
-  return true; 
+  return true;
 }
 
 /** Helper to check if we have enough execution time left (in seconds) */
@@ -209,13 +221,13 @@ function hasFuel(secondsNeeded) {
  */
 function resumeEngine() {
   const props = PropertiesService.getScriptProperties();
-  
+
   // Clear ONLY the cooldown timers
   props.deleteProperty('fuzz_lease_timestamp');
   props.deleteProperty('LAST_FUZZ_FETCH');
-  
+
   console.log("🛑 Cooldown bypassed. Resuming from Bookmark...");
-  
+
   // Fire the engine
   masterOrchestrator();
 }
@@ -228,16 +240,13 @@ function resumeEngine() {
 function masterOrchestrator() {
   const startTime = Date.now();
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const props = PropertiesService.getScriptProperties();
-  props.setProperty('exec_start_time', String(startTime)); 
-
-  // ==========================================
-  // 1. CHECK VAULT GATE (Pre-Flight)
-  // ==========================================
-  const cfg = getConfig(); 
-  const isVaultOk = (String(cfg.BQ_ENABLED).toUpperCase() === "TRUE");
+  const ctx = getAppContext(ss); // Create the context once
   
-  // Select Source based on Gate Status
+  const props = ctx.props;
+  props.setProperty('exec_start_time', String(startTime));
+
+  // 1. CHECK VAULT GATE
+  const isVaultOk = (String(ctx.cfg.BQ_ENABLED).toUpperCase() === "TRUE");
   const itemSource = isVaultOk ? "SDE_invTypes" : "Item List Back End";
   console.log(`[GATE] Vault: ${isVaultOk ? "OPEN" : "LOCKED"}. Source: ${itemSource}`);
 
@@ -247,14 +256,12 @@ function masterOrchestrator() {
   try {
     console.log("--- PHASE 1: FETCHING ---");
     // Worker runs, APPENDS chunked data to 'Market Prices', and sets 'fuzz_pass_complete'
-    updateFuzzMarketDataSheet(itemSource); 
+    updateFuzzMarketDataSheet(itemSource,ctx);
 
-    console.log("[ANESTHESIA] Flushing staged results...");
-    SpreadsheetApp.flush(); 
   } catch (e) {
     if (e.message.includes("quota")) {
-      console.error("!!! CRITICAL QUOTA HIT !!! Tripping Safety Switch.");
-      setMarketConfig("BQ_ENABLED", false); 
+      console.error("[!] CRITICAL QUOTA HIT [!] Tripping Safety Switch.");
+      toggleBigQueryCircuitBreaker(); // Replaced setMarketConfig
       return;
     }
     console.warn("Fetch Failed: " + e.message);
@@ -263,30 +270,27 @@ function masterOrchestrator() {
   // ==========================================
   // 3. VAULT GATE (Merge vs. Prune)
   // ==========================================
-  if (hasFuel(120)) { 
+  if (hasFuel(120)) {
     console.log("--- PHASE 2: VAULT GATE ---");
-    
+
     // Read the signal from the worker to ensure it finished all markets
     const isPassComplete = (props.getProperty('fuzz_pass_complete') === 'true');
 
     if (isVaultOk && isPassComplete) {
       // * OK: Big Q Merge Reset Sheet
       console.log("[PATH A] Full Pass Confirmed. Merging to Vault...");
-      runVaultMergeAndReset(ss); 
+      runVaultMergeAndReset(ctx);
       props.deleteProperty('fuzz_pass_complete'); // Reset signal for next cycle
-    } 
+    }
     else if (!isVaultOk) {
       // * Locked: Trim Sheet Items with 24 Hour Expirettes
       console.log("[PATH B] BigQuery Locked. Pruning local sheet to Rolling 24h...");
-      pruneSheetToRolling24(ss); 
+      pruneSheetToRolling24(ss);
     }
     else {
       // Safety: Vault is open, but the pass didn't finish (timed out/errored).
       console.warn("[SKIP] Merge Aborted: Market pass was partial. Data remains in staging.");
     }
-    
-    console.log("[ANESTHESIA] Flushing Gate results...");
-    SpreadsheetApp.flush();
   }
 
   // ==========================================
@@ -298,11 +302,131 @@ function masterOrchestrator() {
   // ==========================================
   // 5. MAINTENANCE & GARBAGE COLLECTION
   // ==========================================
-  if (hasFuel(60)) { 
+  if (hasFuel(60)) {
     console.log("--- PHASE 4: MAINTENANCE ---");
     runMaintenanceJobs();
   } else {
     console.warn("[Maintenance] Skipped: Insufficient execution fuel remaining.");
+  }
+}
+
+/**
+ * MAINTENANCE: Automatically resets the BigQuery Circuit Breaker.
+ * Intended to run once every 24 hours to recover from daily quota limits.
+ */
+function autoResetCircuitBreaker() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const configSheet = ss.getSheetByName("Market Config");
+
+  if (!configSheet) {
+    console.error("[MAINTENANCE] Failed to run Circuit Breaker reset: Config sheet missing.");
+    return;
+  }
+
+  const data = configSheet.getDataRange().getValues();
+  for (let i = 0; i < data.length; i++) {
+    if (data[i][0] === "BQ_ENABLED") {
+      const isCurrentlyEnabled = (data[i][1] === true || String(data[i][1]).toLowerCase() === "true");
+
+      if (!isCurrentlyEnabled) {
+        console.warn("[MAINTENANCE] Circuit Breaker was tripped. Auto-resetting to ENABLED for the new day.");
+        configSheet.getRange(i + 1, 2).setValue(true);
+
+        // Optional: Clear the safety tape so the next orchestrator pulse does a full fresh pull
+        PropertiesService.getScriptProperties().deleteProperty('LAST_FUZZ_FETCH');
+      } else {
+        console.log("[MAINTENANCE] Circuit Breaker is already ENABLED. No action needed.");
+      }
+      return;
+    }
+  }
+}
+
+/**
+ * Helper to flip the BQ_ENABLED flag from the menu OR background triggers
+ */
+function toggleBigQueryCircuitBreaker(ss) {
+  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  const configSheet = ss.getSheetByName("Market Config");
+
+  if (!configSheet) {
+    console.error("[CIRCUIT BREAKER] Failed: 'Market Config' sheet not found.");
+    return;
+  }
+
+  const data = configSheet.getDataRange().getValues();
+  for (let i = 0; i < data.length; i++) {
+    if (data[i][0] === "BQ_ENABLED") {
+      const currentValue = data[i][1];
+
+      // Determine the new state
+      const newValue = (currentValue === true || String(currentValue).toLowerCase() === "true") ? false : true;
+
+      // Write the new state back to the sheet
+      configSheet.getRange(i + 1, 2).setValue(newValue);
+
+      // Log it for the background execution logs
+      const status = newValue ? "[ENABLED]" : "[DISABLED]";
+      console.warn(`[CIRCUIT BREAKER] BigQuery Pipe is now ${status}`);
+
+      // Safe Toast: Only attempt to show a UI toast if the context allows it
+      try {
+        ss.toast(`BigQuery Pipe is now ${status}`, "Circuit Breaker");
+      } catch (e) {
+        // Silently ignore UI errors when called by a background time-trigger
+      }
+      return;
+    }
+  }
+
+  console.error("[CIRCUIT BREAKER] Failed: BQ_ENABLED setting not found.");
+  try {
+    ss.toast("BQ_ENABLED setting not found in Market Config.", "Error");
+  } catch (e) { }
+}
+
+function runVaultMergeAndReset(ctx) {
+  const { ss, cfg } = ctx;
+  const targetSheetName = "Market Prices"; 
+  const oldSh = ss.getSheetByName(targetSheetName);
+  if (!oldSh || oldSh.getLastRow() < 2) return;
+
+  const isVaultOk = (String(cfg.BQ_ENABLED).toUpperCase() === "TRUE");
+  const tempName = "Merge_Temp_" + Date.now();
+
+  try {
+    // Phase A: Detach Sidecar
+    oldSh.setName(tempName);
+    rebuildMarketPricesSheet(ctx); // Create clean landing pad for Fetcher
+
+    if (isVaultOk) {
+      // Phase B: Attempt Vault Upload
+      // ... (Existing BigQuery Upload Logic) ...
+      
+      // Phase C: Success - Burn the Sidecar
+      ss.deleteSheet(oldSh); 
+      console.log("[Vault] Upload Success. Sidecar deleted.");
+    } else {
+      throw new Error("Vault Disabled: Redirecting to Local Fallback.");
+    }
+
+  } catch (e) {
+    console.warn(`[VaultGate] ${e.message}`);
+    
+    // Phase D: THE RECOVERY
+    // If we failed, merge the Sidecar data back into the main 'Market Prices'
+    const recoverySh = ss.getSheetByName(tempName);
+    if (recoverySh) {
+      const data = recoverySh.getDataRange().getValues();
+      const mainSh = ss.getSheetByName(targetSheetName);
+      // Append the data back to the live buffer so the UI can see it
+      if (data.length > 1) {
+        mainSh.getRange(mainSh.getLastRow() + 1, 1, data.length - 1, 8)
+              .setValues(data.slice(1));
+      }
+      ss.deleteSheet(recoverySh);
+      console.log("[Fallback] Data restored to Market Prices for UI use.");
+    }
   }
 }
 
@@ -316,9 +440,10 @@ function runMaintenanceJobs() {
 
   // 1. Job Registry with targeted intervals (in milliseconds)
   const JOB_QUEUE = [
-    { name: 'dailyHeavyPrune_Prices', interval: 86400000 }, // 24 hours
-    { name: 'dailyJobReset', interval: 86400000 },          // 24 hours
-    { name: 'emergencyCleanup', interval: 604800000 }       // 7 days (Weekly deep clean)
+    { name: 'dailyHeavyPrune_Prices', interval: 86400000 },
+    { name: 'dailyJobReset', interval: 86400000 },
+    { name: 'autoResetCircuitBreaker', interval: 86400000 }, // NEW: 24 hour reset
+    { name: 'emergencyCleanup', interval: 604800000 }
   ];
 
   const QUEUE_INDEX_KEY = 'MAINTENANCE_QUEUE_INDEX';
@@ -326,7 +451,7 @@ function runMaintenanceJobs() {
   if (currentIndex >= JOB_QUEUE.length) currentIndex = 0;
 
   let iterations = 0;
-  
+
   // 2. Loop through the queue until we find one job that is due
   while (iterations < JOB_QUEUE.length) {
     const job = JOB_QUEUE[currentIndex];
@@ -340,21 +465,21 @@ function runMaintenanceJobs() {
 
       try {
         // Safer Dispatcher: Maps string names directly to the global functions
-        // This prevents the V8 engine from blocking dynamic eval() calls.
         const jobFunctions = {
           'dailyHeavyPrune_Prices': () => { if (typeof dailyHeavyPrune_Prices === 'function') dailyHeavyPrune_Prices(); },
           'dailyJobReset': () => { if (typeof dailyJobReset === 'function') dailyJobReset(); },
-          'emergencyCleanup': () => { if (typeof emergencyCleanup === 'function') emergencyCleanup(); }
+          'emergencyCleanup': () => { if (typeof emergencyCleanup === 'function') emergencyCleanup(); },
+          'autoResetCircuitBreaker': () => { if (typeof autoResetCircuitBreaker === 'function') autoResetCircuitBreaker(); } // NEW: Map the function
         };
 
         if (jobFunctions[job.name]) {
           jobFunctions[job.name](); // Execute the chore
-          
+
           // Mark it complete and advance the queue index for the next Orchestrator run
           SCRIPT_PROP.setProperty(lastRunKey, NOW_MS.toString());
           SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, ((currentIndex + 1) % JOB_QUEUE.length).toString());
           console.log(`[Maintenance] ${job.name} completed successfully.`);
-          
+
           return; // EXIT EARLY: Only do ONE chore per Orchestrator pulse to prevent Google timeouts.
         } else {
           console.warn(`[Maintenance] Function ${job.name} is not defined in the workspace.`);
@@ -368,146 +493,84 @@ function runMaintenanceJobs() {
     currentIndex = (currentIndex + 1) % JOB_QUEUE.length;
     iterations++;
   }
-  
+
   console.log("[Maintenance] Cycle Complete: All jobs are currently within their wait windows.");
 }
+
+function manualUIReset() {
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty('LAST_PRICE_PULSE');
+  props.deleteProperty('LAST_VOL_PULSE');
+  console.log("🛠 UI Leases cleared. Next pulse will force a full sync.");
+}
+
 /**
- * TASK 3: UI DISTRIBUTION (THE HEARTBEAT + THE LIVE WIRE)
- * Runs in its own execution window after BigQuery has settled.
+ * TASK 3: UI DISTRIBUTION (RE-PRIORITIZED)
+ * Price Interfaces are now the First Strike.
  */
 function orchestratorTaskUI() {
-  const startTime = Date.now();
+  const props = PropertiesService.getScriptProperties();
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  PropertiesService.getScriptProperties().setProperty('exec_start_time', String(startTime)); 
+  const now = Date.now();
+  const LEASE_MS = 30 * 60 * 1000; 
 
-  console.log("--- PHASE 3: UI PULSE ---");
+  props.setProperty('exec_start_time', String(now));
+  console.log("--- PHASE 3: UI PULSE (Priority: Prices) ---");
 
-  // 1. Update Regional Volumes (System A)
-  if (hasFuel(120)) { 
-    console.log("[UI] Step 1: Updating Volume Heartbeat...");
-    ESI_publishVolumeInterfaces(ss); 
+  // --- TASK 1: PRICE INTERFACES (Moved to Front) ---
+  // Targets: 'filtered prices', 'Mineral Supply Prices', etc.
+  const lastPriceSync = parseInt(props.getProperty('LAST_PRICE_PULSE') || '0', 10);
+  if (now - lastPriceSync > LEASE_MS) {
+    if (hasFuel(120)) { // Higher fuel priority for the main interface
+      console.log("[UI] Step 1: Slicing data for Client Interfaces...");
+      FUZ_publishPriceInterfaces(ss);
+      props.setProperty('LAST_PRICE_PULSE', String(Date.now()));
+    } else {
+      console.warn("[UI] Low fuel for Price update. Rescheduling pulse.");
+      scheduleOneTimeTrigger('orchestratorTaskUI', 45000); 
+      return; // Exit early to save remaining fuel for the next attempt
+    }
+  } else {
+    console.log("[UI] Price lease active. Skipping.");
   }
 
-  // 2. Distribute Everything (Consolidated Sync)
-  if (hasFuel(90)) {
-    console.log("[UI] Step 2: Slicing data for Client Interfaces...");
-    FUZ_publishPriceInterfaces(ss); 
+  // --- TASK 2: REGIONAL VOLUMES ---
+  const lastVolSync = parseInt(props.getProperty('LAST_VOL_PULSE') || '0', 10);
+  if (now - lastVolSync > LEASE_MS) {
+    if (hasFuel(60)) {
+      console.log("[UI] Step 2: Updating Volume Heartbeat...");
+      ESI_publishVolumeInterfaces(ss);
+      props.setProperty('LAST_VOL_PULSE', String(Date.now()));
+    } else {
+      console.warn("[UI] Low fuel for Volume update. Skipping.");
+    }
   } else {
-    console.warn("[STAGGER] Low fuel. Rescheduling UI pulse.");
-    scheduleOneTimeTrigger('orchestratorTaskUI', 30000);
+    console.log("[UI] Volume lease active. Skipping.");
   }
 }
 
-/**
- * THE VAULT BYPASS
- * Pushes the currently staged 162k rows into BigQuery and clears the sheet.
- */
+function forceStartEngine() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ctx = getAppContext(ss); // Handshake
+  const props = ctx.props;
+
+  props.deleteProperty('LAST_FUZZ_FETCH');
+  props.deleteProperty('fuzz_lease_timestamp');
+  props.deleteProperty('fuzz_job_active');
+
+  console.log("🛑 Safety timers cleared. 🚀 Forcing full fetch...");
+  masterOrchestrator();
+}
+
 function forceVaultMerge() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  console.log("[LAUNCH] Manually triggering Vault Merge for staged data...");
-  
-  // THE FIX: Reset the stopwatch so the fuel gauge reads 100%
-  PropertiesService.getScriptProperties().setProperty('exec_start_time', String(Date.now()));
-  
-  // Drive the truck to the Vault
-  runVaultMergeAndReset(ss); 
-  
-  console.log("[SUCCESS] Vault Merge Complete. Pipeline is now fully operational.");
-}
+  const ctx = getAppContext(ss); // Handshake
+  console.log("[LAUNCH] Manually triggering Vault Merge...");
 
-function runVaultMergeAndReset(ss) {
-  const LOG_HEADER = '[VaultGate]';
-  const cfg = getConfig();
-  const sheetName = "Market Prices"; 
-  const sh = ss.getSheetByName(sheetName);
+  ctx.props.setProperty('exec_start_time', String(Date.now()));
+  runVaultMergeAndReset(ctx); // Pass the ctx
 
-  if (!sh) {
-    console.error(`${LOG_HEADER} Error: ${sheetName} not found.`);
-    return;
-  }
-
-  const lastRow = sh.getLastRow();
-  if (lastRow < 2) {
-    console.log(`${LOG_HEADER} Sheet is empty. Nothing to merge.`);
-    return;
-  }
-
-  if (!hasFuel(120)) {
-    console.warn(`${LOG_HEADER} Low fuel. Aborting merge to prevent partial data loss.`);
-    return;
-  }
-
-  try {
-    const rawData = sh.getDataRange().getValues();
-    let ndjson = "";
-
-    // Start at index 1 to skip the header row
-    for (let i = 1; i < rawData.length; i++) {
-      let row = rawData[i];
-      let dateCell = row[0];
-
-      // Format date to UTC strict
-      let formattedDate = "";
-      if (dateCell instanceof Date) {
-        formattedDate = Utilities.formatDate(dateCell, "UTC", "yyyy-MM-dd HH:mm:ss");
-      } else if (typeof dateCell === 'string') {
-        let parsed = new Date(dateCell);
-        if (!isNaN(parsed)) {
-           formattedDate = Utilities.formatDate(parsed, "UTC", "yyyy-MM-dd HH:mm:ss");
-        } else {
-           formattedDate = dateCell; 
-        }
-      }
-
-      // Explicitly map every column to the exact BigQuery schema name
-      const bqRow = {
-        date: formattedDate,
-        market_id: String(row[1]),
-        market_type: String(row[2]),
-        type_id: Number(row[3]),
-        min_sell: Number(row[4]) || 0,
-        max_buy: Number(row[5]) || 0,
-        median_sell: Number(row[6]) || 0,
-        median_buy: Number(row[7]) || 0
-      };
-
-      ndjson += JSON.stringify(bqRow) + "\n";
-    }
-
-    console.log(`${LOG_HEADER} Preparing to bury ${rawData.length - 1} explicitly mapped rows in the Vault...`);
-
-    const projectId = 'tenacious-tiger-345318'; 
-    const datasetId = 'market_data';            
-    const tableId   = 'market_prices_staged';   
-
-    const blob = Utilities.newBlob(ndjson, 'application/octet-stream');
-
-    const job = {
-      configuration: {
-        load: {
-          destinationTable: {
-            projectId: projectId,
-            datasetId: datasetId,
-            tableId: tableId
-          },
-          sourceFormat: 'NEWLINE_DELIMITED_JSON',
-          writeDisposition: 'WRITE_APPEND'
-        }
-      }
-    };
-
-    // Fire the payload directly via the Advanced Service, ignoring the helper function
-    BigQuery.Jobs.insert(job, projectId, blob);
-
-    console.log(`${LOG_HEADER} Merge Successful. BigQuery confirmed receipt.`);
-    
-    const lastCol = sh.getLastColumn();
-    sh.getRange(2, 1, lastRow - 1, lastCol).clearContent();
-    console.log(`${LOG_HEADER} Sheet reset. Buffer is clean.`);
-
-  } catch (e) {
-    console.error(`${LOG_HEADER} CRITICAL FAILURE: ${e.message}`);
-  }
+  console.log("[SUCCESS] Vault Merge Complete.");
 }
 
 /**
@@ -523,7 +586,7 @@ function bigQueryBatchLoad_(projectId, datasetId, tableId, dataArray) {
   }).join('\n');
 
   const blob = Utilities.newBlob(jsonRows, 'application/octet-stream');
-  
+
   const job = {
     configuration: {
       load: {

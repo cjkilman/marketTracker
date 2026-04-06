@@ -42,7 +42,7 @@ const LOG_FUZZ = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('FuzzWorker
  * - Calls executeWithTryLock(_updateFuzzMarketDataWorker).
  * - Updates Lease Timestamp ONLY if successful.
  */
-function updateFuzzMarketDataSheet(itemSource) {
+function updateFuzzMarketDataSheet(itemSource, ctx) {
   const LOG_HEADER = '[Orchestrator]';
   const LEASE_MINUTES = 30;
   const PROPS = PropertiesService.getScriptProperties();
@@ -60,7 +60,7 @@ function updateFuzzMarketDataSheet(itemSource) {
   // --- 2. EXECUTE WITH LOCK ---
   // You MUST use 'return' here so the True/False/Null passes back to the 'success' variable
   const success = executeWithTryLock(() => {
-    return _updateFuzzMarketDataWorker(itemSource);
+    return _updateFuzzMarketDataWorker(itemSource, ctx);
   }, 'updateFuzzMarketDataSheet');
 
   // --- 3. UPDATE LEASE (The State Machine Logic) ---
@@ -108,20 +108,20 @@ function _resetFuzzMarketDataJobState(error) {
 
 /**
  * WORKER: Smart Execution.
- * Corrected to ensure a 100% complete pass signal before any Merge occurs.
- * Features: Chunked Staging (Anti-Spinning Wheel) & Bookmarking (Anti-Timeout)
+ * Updated to use Type-Safe Context and tactical burner-sheet recovery.
  */
-function _updateFuzzMarketDataWorker(itemSource) {
+function _updateFuzzMarketDataWorker(itemSource, ctx) {
   const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('FuzzWorker') : console;
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const props = PropertiesService.getScriptProperties();
+
+  // Handshake destructuring
+  const { ss, props, cfg } = ctx;
 
   // --- 1. LOAD ITEMS (The Dynamic Map) ---
   const sourceName = itemSource || "Item List Back End";
   const itemSheet = ss.getSheetByName(sourceName);
 
   if (!itemSheet) {
-    console.error(`[FuzzWorker] Critical: '${sourceName}' sheet missing.`);
+    LOG.error(`Critical: '${sourceName}' sheet missing.`);
     return false;
   }
 
@@ -134,7 +134,7 @@ function _updateFuzzMarketDataWorker(itemSource) {
   }
 
   if (typeIdBatch.length === 0) {
-    console.warn(`[FuzzWorker] No Type IDs found in ${sourceName}.`);
+    LOG.warn(`No Type IDs found in ${sourceName}.`);
     return false;
   }
 
@@ -156,23 +156,19 @@ function _updateFuzzMarketDataWorker(itemSource) {
     marketsToProcess.push({ market_id: 60003760, market_type: 'station' }); // Jita Fallback
   }
 
-  // --- 3. EXECUTE LOOP (The Bookmarked Mining Drill) ---
-  console.log(`[FuzzWorker] Starting Cycle: ${typeIdBatch.length} items across ${marketsToProcess.length} markets.`);
-
+  // --- 3. EXECUTE LOOP ---
+  LOG.info(`Starting Cycle: ${typeIdBatch.length} items across ${marketsToProcess.length} markets.`);
   const startTime = Date.now();
 
-  // 1. READ THE BOOKMARK (Default to 0 if starting fresh)
   let startIndex = parseInt(props.getProperty('fuzz_hub_bookmark')) || 0;
-  console.log(`[FuzzWorker] Resuming from Hub Index: ${startIndex}`);
+  LOG.info(`Resuming from Hub Index: ${startIndex}`);
 
-  // 2. USE A 'FOR' LOOP SO WE CAN START IN THE MIDDLE
   for (let i = startIndex; i < marketsToProcess.length; i++) {
     const activeConfig = marketsToProcess[i];
 
-    // 3. THE 4-MINUTE SAFETY TIMEOUT & BOOKMARK SAVE
-    // Change 240000 (4 min) to 180000 (3 min)
+    // 3-minute safety limit
     if (Date.now() - startTime > 180000) {
-      console.warn(`[TIMEOUT] Approaching limits. Bookmarking at Hub Index: ${i}`);
+      LOG.warn(`[TIMEOUT] Bookmarking at Hub Index: ${i}`);
       props.setProperty('fuzz_hub_bookmark', String(i));
       props.setProperty('fuzz_pass_complete', 'false');
       return false;
@@ -181,9 +177,7 @@ function _updateFuzzMarketDataWorker(itemSource) {
     try {
       const marketData = getMarketPrices(typeIdBatch, activeConfig.market_id, activeConfig.market_type);
 
-      if (!marketData || Object.keys(marketData).length === 0) {
-        continue; // Move to the next hub in the loop
-      }
+      if (!marketData || Object.keys(marketData).length === 0) continue;
 
       const rowsToStream = [];
       const timestamp = new Date();
@@ -191,61 +185,56 @@ function _updateFuzzMarketDataWorker(itemSource) {
       typeIdBatch.forEach(typeId => {
         const data = marketData[typeId];
         if (data && ((data.buy?.orderCount || 0) + (data.sell?.orderCount || 0) > 0)) {
-          rowsToStream.push({
-            date: timestamp,
-            market_id: String(activeConfig.market_id),
-            market_type: activeConfig.market_type,
-            type_id: parseInt(typeId, 10),
-            min_sell: parseFloat(data.sell?.min) || 0,
-            max_buy: parseFloat(data.buy?.max) || 0,
-            median_sell: parseFloat(data.sell?.median) || 0,
-            median_buy: parseFloat(data.buy?.median) || 0
-          });
+          rowsToStream.push([
+            timestamp,
+            String(activeConfig.market_id),
+            activeConfig.market_type,
+            parseInt(typeId, 10),
+            parseFloat(data.sell?.min) || 0,
+            parseFloat(data.buy?.max) || 0,
+            parseFloat(data.sell?.median) || 0,
+            parseFloat(data.buy?.median) || 0
+          ]);
         }
       });
 
-      // --- STAGE TO LOCAL TANK ---
+      // --- STAGE TO LOCAL TANK (Tactical & Sparring-Ready) ---
       if (rowsToStream.length > 0) {
         props.setProperty('fuzz_job_active', 'true');
-        console.log(`[STAGE] Appending ${rowsToStream.length} rows to 'Market Prices' for Hub: ${activeConfig.market_id}`);
 
-        const stagingSheet = ss.getSheetByName("Market Prices");
-        const data2D = rowsToStream.map(r => [
-          r.date, r.market_id, r.market_type, r.type_id,
-          r.min_sell, r.max_buy, r.median_sell, r.median_buy
-        ]);
+        // TACTICAL: Direct reference or instant rebuild using Context ss handle
+        const stagingSheet = ss.getSheetByName("Market Prices") || rebuildMarketPricesSheet(ctx);
 
+        const lastRow = stagingSheet.getLastRow();
         const chunkSize = 4000;
-        let startRow = stagingSheet.getLastRow() + 1;
 
-        for (let j = 0; j < data2D.length; j += chunkSize) {
-          const chunk = data2D.slice(j, j + chunkSize);
-          stagingSheet.getRange(startRow, 1, chunk.length, 8).setValues(chunk);
-          startRow += chunk.length;
-          SpreadsheetApp.flush();
+        for (let j = 0; j < rowsToStream.length; j += chunkSize) {
+          const chunk = rowsToStream.slice(j, j + chunkSize);
+          stagingSheet.getRange(lastRow + 1 + j, 1, chunk.length, 8).setValues(chunk);
+          // NO FLUSH. Let the V8 engine queue the writes natively.
         }
         props.setProperty('fuzz_job_active', 'false');
       }
 
     } catch (e) {
-      console.error(`[FuzzWorker] Error on Hub ${activeConfig.market_id}: ${e.message}`);
+      LOG.error(`Error on Hub ${activeConfig.market_id}: ${e.message}`);
       props.setProperty('fuzz_job_active', 'false');
     }
-  } // THE LOOP ENDS HERE
+  }
 
-  // --- 4. THE COMPLETION SIGNAL ---
-  // If the code reaches this line, it means it never hit the timeout and finished the loop.
-  console.log(`[FuzzWorker] 100% Market Pass Complete.`);
+  // --- 4. COMPLETION SIGNAL ---
+  LOG.info(`100% Market Pass Complete.`);
   props.setProperty('fuzz_pass_complete', 'true');
-  props.setProperty('fuzz_hub_bookmark', '0'); // Reset bookmark back to start for the next full cycle
+  props.setProperty('fuzz_hub_bookmark', '0');
 
-  // --- 5. STATIC DATA REFRESH PULSE ---
+  // --- 5. TACTICAL STATIC DATA PULSE ---
   const utilitySheet = ss.getSheetByName("Utility");
   if (utilitySheet) {
     utilitySheet.getRange("B3").setValue(0);
+    // TACTICAL FLUSH: Mandatory for triggering ImportRange formula resets
     SpreadsheetApp.flush();
     utilitySheet.getRange("B3").setValue(1);
-    console.log(`[FuzzWorker] Static Data Pulse Fired.`);
+    LOG.info(`Static Data Pulse Fired.`);
   }
 
   return true;
@@ -445,12 +434,12 @@ function _heavyPruneWorker() {
   const START_TIME = Date.now();
 
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const cfg = getConfig(); 
-  const sourceSheetName = FUZZ_SHEET_FINAL; 
+  const cfg = getConfig();
+  const sourceSheetName = FUZZ_SHEET_FINAL;
   const tempSheetName = PRUNE_SHEET_TEMP;
 
   let currentState = SCRIPT_PROP.getProperty(PRUNE_PROP_STEP) || "NEW_RUN";
-  LOG.info(`Starting worker. Current State: ${currentState}`); 
+  LOG.info(`Starting worker. Current State: ${currentState}`);
 
   try {
     // --- State: NEW_RUN (Start) ---
@@ -471,13 +460,13 @@ function _heavyPruneWorker() {
             LOG.info(`Deleting stale temp sheet to free space: ${tempSheetName}`);
             ss.deleteSheet(existingTemp);
           }
-          SpreadsheetApp.flush(); 
+          SpreadsheetApp.flush();
 
           const tempSheet = getOrCreateSheet(ss, tempSheetName, FUZZ_SHEET_HEADERS);
           tempSheet.hideSheet();
           SpreadsheetApp.flush();
 
-          SCRIPT_PROP.setProperty(PRUNE_PROP_READ_ROW, '2'); 
+          SCRIPT_PROP.setProperty(PRUNE_PROP_READ_ROW, '2');
 
           currentState = "PROCESSING";
           SCRIPT_PROP.setProperty(PRUNE_PROP_STEP, currentState);
@@ -490,11 +479,11 @@ function _heavyPruneWorker() {
         scheduleOneTimeTrigger('_heavyPruneWorker', FUZZ_RESCHEDULE_MS);
         return;
       }
-    } 
+    }
 
     // --- State: PROCESSING (Processing While Loop) ---
     if (currentState === "PROCESSING") {
-      LOG.info(`State: PROCESSING. Reading/deduping batches.`); 
+      LOG.info(`State: PROCESSING. Reading/deduping batches.`);
 
       const sourceSheet = ss.getSheetByName(sourceSheetName);
       const tempSheet = ss.getSheetByName(tempSheetName);
@@ -527,31 +516,31 @@ function _heavyPruneWorker() {
         const rowsToRead = Math.min(PRUNE_BATCH_SIZE, lastRow - readRow + 1);
         if (rowsToRead <= 0) break;
 
-        LOG.info(`Reading ${rowsToRead} rows from ${sourceSheetName} (starting row ${readRow})...`); 
+        LOG.info(`Reading ${rowsToRead} rows from ${sourceSheetName} (starting row ${readRow})...`);
         const data = sourceSheet.getRange(readRow, 1, rowsToRead, header.length).getValues();
 
-        const retentionDays = cfg.PriceRetentionDays || 1; 
-        const bucketMinutes = cfg.BucketMinutes || 20; 
+        const retentionDays = cfg.PriceRetentionDays || 1;
+        const bucketMinutes = cfg.BucketMinutes || 20;
         const cutoff = new Date(Date.now() - retentionDays * 86400000);
         const msPerBucket = bucketMinutes * 60 * 1000;
-        const keep = new Map(); 
+        const keep = new Map();
 
         for (let i = 0; i < data.length; i++) {
           const r = data[i];
-          
+
           // --- BULLETPROOF DATE CHECK ---
           let d = r[DATE];
           if (!(d instanceof Date)) {
             d = new Date(d); // Force text strings into Date objects
           }
-          if (isNaN(d.getTime()) || d < cutoff) continue; 
+          if (isNaN(d.getTime()) || d < cutoff) continue;
           // ------------------------------
 
           const validMinSell = (r[MIN_SELL] != null && r[MIN_SELL] !== "" && Number(r[MIN_SELL]) > 0);
           const validMaxBuy = (r[MAX_BUY] != null && r[MAX_BUY] !== "" && Number(r[MAX_BUY]) > 0);
 
           if (!validMinSell && !validMaxBuy) {
-            continue; 
+            continue;
           }
 
           const bucket = Math.floor(d.getTime() / msPerBucket);
@@ -559,7 +548,7 @@ function _heavyPruneWorker() {
 
           const prev = keep.get(key);
           if (!prev || (d > prev[DATE])) {
-            keep.set(key, r); 
+            keep.set(key, r);
           }
         }
 
@@ -570,12 +559,12 @@ function _heavyPruneWorker() {
           if (docLock.tryLock(FUZZ_DOC_LOCK_TIMEOUT)) {
             try {
               tempSheet.getRange(tempSheet.getLastRow() + 1, 1, rowsToWrite.length, rowsToWrite[0].length).setValues(rowsToWrite);
-              LOG.info(`Appended ${rowsToWrite.length} deduped rows to ${tempSheetName}.`); 
+              LOG.info(`Appended ${rowsToWrite.length} deduped rows to ${tempSheetName}.`);
             } finally {
               docLock.releaseLock();
             }
           } else {
-            LOG.warn(`Document Lock busy for prune write. Rescheduling (will re-process batch).`); 
+            LOG.warn(`Document Lock busy for prune write. Rescheduling (will re-process batch).`);
             scheduleOneTimeTrigger('_heavyPruneWorker', FUZZ_RESCHEDULE_MS);
             return;
           }
@@ -584,18 +573,18 @@ function _heavyPruneWorker() {
         readRow += rowsToRead;
         SCRIPT_PROP.setProperty(PRUNE_PROP_READ_ROW, readRow.toString());
 
-      } 
+      }
 
       if (readRow > lastRow) {
-        LOG.info("All source rows processed. Transitioning to FINALIZING."); 
+        LOG.info("All source rows processed. Transitioning to FINALIZING.");
         currentState = "FINALIZING";
         SCRIPT_PROP.setProperty(PRUNE_PROP_STEP, currentState);
-        scheduleOneTimeTrigger('_finalizePrune', 1000); 
+        scheduleOneTimeTrigger('_finalizePrune', 1000);
       }
-    } 
+    }
 
   } catch (e) {
-    LOG.error(`Unhandled error in prune worker: ${e.message}\nStack: ${e.stack}`); 
+    LOG.error(`Unhandled error in prune worker: ${e.message}\nStack: ${e.stack}`);
     SCRIPT_PROP.deleteProperty(PRUNE_PROP_STEP);
     SCRIPT_PROP.deleteProperty(PRUNE_PROP_READ_ROW);
   }
@@ -616,14 +605,14 @@ function _finalizePrune() {
 
   LOG.info("Starting finalization: Secondary deduplication and atomic swap.");
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const cfg = getConfig(); 
+  const cfg = getConfig();
   const tempSheetName = PRUNE_SHEET_TEMP;
-  const finalSheetName = FUZZ_SHEET_FINAL; 
-  const oldSheetName = finalSheetName + "_Prune_Old"; 
+  const finalSheetName = FUZZ_SHEET_FINAL;
+  const oldSheetName = finalSheetName + "_Prune_Old";
 
   const docLock = LockService.getDocumentLock();
   try {
-    if (docLock.tryLock(30000)) { 
+    if (docLock.tryLock(30000)) {
       try {
         const tempSheet = ss.getSheetByName(tempSheetName);
         if (!tempSheet || tempSheet.getLastRow() <= 1) {
@@ -633,8 +622,8 @@ function _finalizePrune() {
         LOG.info("Reading temp sheet for final deduplication...");
         const data = tempSheet.getRange(2, 1, tempSheet.getLastRow() - 1, tempSheet.getLastColumn()).getValues();
 
-        const bucketMinutes = cfg.BucketMinutes || 20; 
-        const maxRows = cfg.PricesMaxRows || 100000; 
+        const bucketMinutes = cfg.BucketMinutes || 20;
+        const maxRows = cfg.PricesMaxRows || 100000;
 
         const msPerBucket = bucketMinutes * 60 * 1000;
         const keep = new Map();
@@ -653,7 +642,7 @@ function _finalizePrune() {
           const validMaxBuy = (r[MAX_BUY] != null && r[MAX_BUY] !== "" && Number(r[MAX_BUY]) > 0);
 
           if (!validMinSell && !validMaxBuy) {
-            continue; 
+            continue;
           }
 
           // --- BULLETPROOF DATE CHECK ---
@@ -661,7 +650,7 @@ function _finalizePrune() {
           if (!(d instanceof Date)) {
             d = new Date(d); // Force text strings into Date objects
           }
-          if (isNaN(d.getTime())) continue; 
+          if (isNaN(d.getTime())) continue;
           // ------------------------------
 
           const bucket = Math.floor(d.getTime() / msPerBucket);
@@ -677,19 +666,19 @@ function _finalizePrune() {
         LOG.info(`Final deduplication complete. Kept ${deduped.length} rows.`);
 
         if (deduped.length > maxRows) {
-          deduped.sort((a, b) => a[DATE] - b[DATE]); 
-          deduped = deduped.slice(deduped.length - maxRows); 
+          deduped.sort((a, b) => a[DATE] - b[DATE]);
+          deduped = deduped.slice(deduped.length - maxRows);
           LOG.info(`Capped rows to ${deduped.length} (max: ${maxRows}).`);
         }
 
-        tempSheet.clearContents(); 
-        tempSheet.getRange(1, 1, 1, header.length).setValues([header]); 
+        tempSheet.clearContents();
+        tempSheet.getRange(1, 1, 1, header.length).setValues([header]);
         if (deduped.length > 0) {
           tempSheet.getRange(2, 1, deduped.length, header.length).setValues(deduped);
         }
         _trimTrailing_(tempSheet);
         SpreadsheetApp.flush();
-        LOG.info("Final data written to temp sheet."); 
+        LOG.info("Final data written to temp sheet.");
 
         const finalSheet = ss.getSheetByName(finalSheetName);
         const oldSheet = ss.getSheetByName(oldSheetName);
@@ -697,18 +686,18 @@ function _finalizePrune() {
         if (oldSheet) ss.deleteSheet(oldSheet);
         if (finalSheet) finalSheet.setName(oldSheetName);
         tempSheet.setName(finalSheetName);
-        tempSheet.showSheet(); 
+        tempSheet.showSheet();
 
-        SpreadsheetApp.flush(); 
-        LOG.info("Atomic sheet swap successful."); 
+        SpreadsheetApp.flush();
+        LOG.info("Atomic sheet swap successful.");
 
         SCRIPT_PROP.deleteProperty(PRUNE_PROP_STEP);
         SCRIPT_PROP.deleteProperty(PRUNE_PROP_READ_ROW);
-        LOG.info("Heavy Prune job state reset complete."); 
+        LOG.info("Heavy Prune job state reset complete.");
 
       } catch (swapError) {
         LOG.error(`CRITICAL error during prune swap: ${swapError.message}. State NOT reset.`);
-        scheduleOneTimeTrigger('_finalizePrune', 60000); 
+        scheduleOneTimeTrigger('_finalizePrune', 60000);
         throw swapError;
       } finally {
         docLock.releaseLock();
@@ -799,12 +788,13 @@ function pruneSheetToRolling24(ss) {
 }
 
 /**
- * THE LIVE WIRE RECALL: Surgical BigQuery Puller.
+ * THE LIVE WIRE RECALL: Surgical BigQuery Puller with Local Fallback.
  * Refined to match the E7:K standard and ConfigHandler logic.
  */
 function FUZ_refreshPriceInterface(ss, targetSheetName) {
   const cfg = getConfig(); // Pull IDs from your central config
   const projectId = cfg.BQ_PROJECT_ID || 'tenacious-tiger-345318';
+  const isVaultOk = (cfg.BQ_ENABLED === true);
 
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(targetSheetName);
@@ -816,12 +806,71 @@ function FUZ_refreshPriceInterface(ss, targetSheetName) {
   const marketType = String(settings[1]).trim();
 
   if (isNaN(marketId) || marketType.toLowerCase().includes("loading")) {
-    sheet.getRange("E4").setValue(`⚠️ Waiting for IMPORTRANGE...`);
+    sheet.getRange("E4").setValue(`[!] Waiting for IMPORTRANGE...`);
     return;
   }
 
-  // --- 2. THE RECALL SQL (Optimized for E7:K) ---
-  // Calculates 24h Medians + Current Prices + % Changes in the Vault
+  // --- 2. LOCAL FALLBACK ENGINE (CIRCUIT BREAKER ACTIVE) ---
+  if (!isVaultOk) {
+    console.log(`[${targetSheetName}] Circuit Breaker active. Running local fallback...`);
+    try {
+      const localSheet = ss.getSheetByName("Market Prices");
+      if (!localSheet) throw new Error("Local buffer missing");
+
+      const rawData = localSheet.getDataRange().getValues();
+      const cutoff = new Date().getTime() - (24 * 60 * 60 * 1000);
+      const grouped = {};
+
+      // Mimic BigQuery: Filter and group by 24h
+      for (let i = 1; i < rawData.length; i++) {
+        const r = rawData[i];
+        if (r[1] != marketId || String(r[2]).toLowerCase() !== marketType.toLowerCase()) continue;
+
+        const rDate = new Date(r[0]).getTime();
+        if (rDate < cutoff) continue;
+
+        const tid = String(r[3]);
+        if (!grouped[tid]) grouped[tid] = { buys: [], sells: [], latestDate: 0, curB: 0, curS: 0 };
+
+        const ms = Number(r[6]) || 0;
+        const mb = Number(r[7]) || 0;
+
+        grouped[tid].buys.push(mb);
+        grouped[tid].sells.push(ms);
+
+        // Find the most recent entry for "Current" prices
+        if (rDate > grouped[tid].latestDate) {
+          grouped[tid].latestDate = rDate;
+          grouped[tid].curB = mb;
+          grouped[tid].curS = ms;
+        }
+      }
+
+      // Calculate averages and map to output format
+      const data = [];
+      for (let tid in grouped) {
+        const g = grouped[tid];
+        const avgB = g.buys.reduce((a, b) => a + b, 0) / g.buys.length || 0;
+        const avgS = g.sells.reduce((a, b) => a + b, 0) / g.sells.length || 0;
+        const chgS = avgS > 0 ? (g.curS - avgS) / avgS : 0;
+        const chgB = avgB > 0 ? (g.curB - avgB) / avgB : 0;
+
+        data.push([tid, avgB, avgS, g.curB, g.curS, chgS, chgB]);
+      }
+
+      if (data.length === 0) throw new Error("Local Buffer is Empty");
+
+      FUZ_writeToInterfaceSheet(sheet, data, "[OK] Local Synced");
+      return; // Exit here so it does not hit BigQuery
+
+    } catch (e) {
+      console.warn(`[${targetSheetName}] Local Sync Failed: ${e.message}`);
+      sheet.getRange("E4").setValue(`[!] Local Sync Error: ${e.message}`);
+      return;
+    }
+  }
+
+  // --- 3. THE RECALL SQL (Optimized for E7:K) ---
   const sql = `
     SELECT 
       type_id, 
@@ -843,7 +892,6 @@ function FUZ_refreshPriceInterface(ss, targetSheetName) {
     const data = queryResults.rows ? queryResults.rows.map(row => {
       const v = row.f.map(field => field.v);
       const avgB = parseFloat(v[1]), avgS = parseFloat(v[2]), curB = parseFloat(v[3]), curS = parseFloat(v[4]);
-      // Calculate % Change here to keep the sheet light
       const chgS = avgS > 0 ? (curS - avgS) / avgS : 0;
       const chgB = avgB > 0 ? (curB - avgB) / avgB : 0;
       return [v[0], avgB, avgS, curB, curS, chgS, chgB];
@@ -851,12 +899,17 @@ function FUZ_refreshPriceInterface(ss, targetSheetName) {
 
     if (data.length === 0) throw new Error("Vault is Empty (Waiting for next fetch)");
 
-    // --- 3. THE RESPONSE (Write to E7:K) ---
-    FUZ_writeToInterfaceSheet(sheet, data, "✅ Vault Synced");
+    // --- 4. THE RESPONSE (Write to E7:K) ---
+    FUZ_writeToInterfaceSheet(sheet, data, "[OK] Vault Synced");
 
   } catch (err) {
     console.warn(`[${targetSheetName}] Sync Failed: ${err.message}`);
-    sheet.getRange("E4").setValue(`⚠️ Sync Error: ${err.message}`);
+    sheet.getRange("E4").setValue(`[!] Sync Error: ${err.message}`);
+
+    if (err.message.toLowerCase().includes("quota exceeded")) {
+      console.error("Quota limit hit. Engaging circuit breaker automatically.");
+      toggleBigQueryCircuitBreaker();
+    }
   }
 }
 
@@ -965,8 +1018,40 @@ function FUZ_publishPriceInterfaces(ss) {
     } catch (e) {
       console.error(`[${sheetName}] Sync Failed: ${e.message}`);
       sh.getRange("E4").setValue("!! Sync Error: Check Logs !!");
+
+      // TACTICAL: If we hit a quota limit, SHUT THE GATE for everything else
+      if (e.message.toLowerCase().includes("quota exceeded")) {
+        console.warn(`[QUOTA] Custom BQ limit reached on ${sheetName}. Killing BQ Pipe...`);
+        setBigQueryCircuitBreaker(ss, false); // FORCE it to false, don't toggle it
+      }
     }
   });
+}
+
+/**
+ * Hard-sets the BQ_ENABLED flag to prevent toggle-loops during quota hits.
+ */
+function setBigQueryCircuitBreaker(ss, targetState) {
+  const configSheet = ss.getSheetByName("Market Config");
+  if (!configSheet) return;
+
+  const data = configSheet.getDataRange().getValues();
+  for (let i = 0; i < data.length; i++) {
+    if (data[i][0] === "BQ_ENABLED") {
+      configSheet.getRange(i + 1, 2).setValue(targetState);
+      console.warn(`[GATE] BigQuery Pipe set to ${targetState ? '[ENABLED]' : '[DISABLED]'}`);
+      return;
+    }
+  }
+}
+
+function emergencyGhostCleanup() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheets = ss.getSheets();
+  sheets.forEach(sh => {
+    if (sh.getName().includes("Merge_Temp_")) ss.deleteSheet(sh);
+  });
+  console.log("Workbook Cleaned.");
 }
 
 /**
@@ -975,14 +1060,14 @@ function FUZ_publishPriceInterfaces(ss) {
 function getPricesFromLocalBuffer_(sh) {
   if (!sh) return [];
   const data = sh.getDataRange().getValues();
-  // Filter for the last 24h and map to your [id, buy_med, sell_med, buy_curr, sell_curr] format
-  // (Assuming your local sheet schema matches FUZZ_SHEET_HEADERS)
-  return data.slice(1).map(r => [r[3], r[7], r[6], r[5], r[4]]);
+  
+  // Filter for the last 24h and map to your [id, min_sell, max_buy, median_sell, median_buy] format
+  return data.slice(1).map(r => [r[3], r[4], r[5], r[6], r[7]]);
 }
 
 function getPricesFromVault_(projectId, marketId, marketType, itemIds) {
   const targetProject = 'tenacious-tiger-345318';
-  
+
   // Guard clause: If no IDs are provided, return empty to avoid SQL syntax errors
   if (!itemIds || itemIds.length === 0) return [];
 
@@ -1022,7 +1107,7 @@ function getPricesFromVault_(projectId, marketId, marketType, itemIds) {
   `;
 
   const queryResults = BigQuery.Jobs.query({ query: sql, useLegacySql: false }, targetProject);
-  
+
   // Updated Header to fix the "meadian" typo for consistency
   const headers = ["type_id", "min_sell", "max_buy", "median_sell", "median_buy"];
 
@@ -1102,7 +1187,7 @@ function writeToPriceInterface_(sh, data, isVaultOk) {
     }
     // THE FIX: Output empty strings instead of 0s for missing prices.
     // We also cast the ID to a String to protect it from Sheets rounding.
-    return [String(cleanId), "", "", "", ""]; 
+    return [String(cleanId), "", "", "", ""];
   });
 
   // 4. THE LIGHTNING WRITE
