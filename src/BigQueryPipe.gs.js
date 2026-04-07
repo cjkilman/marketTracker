@@ -7,10 +7,10 @@
 function streamToBigQuery(dataRows) {
   if (!dataRows || dataRows.length === 0) return;
 
-  const cfg = getConfig(); // Pull IDs from your central config
-  const projectId = cfg.BQ_PROJECT_ID || 'tenacious-tiger-345318';
-  const datasetId = 'market_data';
-  const tableId = 'market_prices_staged';
+const cfg = getConfig(); 
+  const projectId = cfg.BQ_PROJECT_ID;
+  const datasetId = cfg.BQ_DATASET_ID;
+  const tableId = 'market_prices_staged'; // Leave this hardcoded if it is a dedicated staging table
 
   // 1. Convert data to Newline Delimited JSON (BigQuery's required format)
   let ndjson = "";

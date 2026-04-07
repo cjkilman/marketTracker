@@ -6,22 +6,57 @@ function getConfigSheet() {
 
   if (configSheet.getLastRow() < 2) {
     // Default settings
-    const defaults = [
-      ["type_id", 34, "Default item type ID (Tritanium)"],
-      ["market_id", 30002187, "Amarr system ID"],
-      ["market_type", "system", "System or region market type"],
-      ["BQ_ENABLED", true, "MASTER SWITCH: TRUE = BigQuery Vault | FALSE = Sheet Backup"],
-      ["BQ_QUOTA_GIB", 30.72, "Daily BigQuery Free Tier Limit (Hard Stop)"],
-      ["MaxLogIDs", 700, "Max item IDs to keep in logs"],
-      ["DaysForCandlestick", 30, "Days to build candlestick chart"],
-      ["RebuildAlways", false, "Always rebuild history (Slow)"],
-      ["OpenTime", "11:00", "Daily open window start (HH:mm)"],
-      ["CloseTime", "18:00", "Daily close window start (HH:mm)"]
-    ];
+const defaults = [
+  ["type_id", 34, "Default item type ID (Tritanium)"],
+  ["market_id", 30002187, "Amarr system ID"],
+  ["market_type", "system", "System or region market type"],
+  ["BQ_ENABLED", true, "MASTER SWITCH: TRUE = BigQuery Vault | FALSE = Sheet Backup"],
+  ["BQ_QUOTA_GIB", 30.72, "Daily BigQuery Free Tier Limit (Hard Stop)"],
+  ["BQ_PROJECT_ID", "tenacious-tiger-345318", "Your BigQuery Project ID"],
+  ["BQ_DATASET_ID", "market_data", "Your BigQuery Dataset ID"],
+  
+  // FIX: This must be the actual BigQuery Table Name (No Spaces)
+  ["BQ_Market_Prices", "market_prices_history", "The BigQuery Database Table"],
+  
+  // FIX: This is the local Google Sheet Tab Name (Spaces OK)
+  ["HistorySheetName", "Market History", "The local Spreadsheet Tab"],
+  
+  ["MaxLogIDs", 700, "Max item IDs to keep in logs"],
+  ["DaysForCandlestick", 30, "Days to build candlestick chart"],
+  ["RebuildAlways", false, "Always rebuild history (Slow)"],
+  ["OpenTime", "11:00", "Daily open window start (HH:mm)"],
+  ["CloseTime", "18:00", "Daily close window start (HH:mm)"]
+];
     configSheet.getRange(2, 1, defaults.length, 3).setValues(defaults);
   }
 
   return configSheet;
+}
+
+function FORCE_SYNC_CONFIG() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName("Market Config");
+  
+  const correctedData = [
+    ["type_id", 34, "Default item type ID (Tritanium)"],
+    ["market_id", 30002187, "Amarr system ID"],
+    ["market_type", "system", "System or region market type"],
+    ["BQ_ENABLED", true, "MASTER SWITCH: TRUE = BigQuery Vault | FALSE = Sheet Backup"],
+    ["BQ_QUOTA_GIB", 30.72, "Daily BigQuery Free Tier Limit (Hard Stop)"],
+    ["BQ_PROJECT_ID", "tenacious-tiger-345318", "Your BigQuery Project ID"],
+    ["BQ_DATASET_ID", "market_data", "Your BigQuery Dataset ID"],
+    ["BQ_Market_Prices", "market_prices_history", "The BigQuery Database Table"],
+    ["HistorySheetName", "Market History", "The local Spreadsheet Tab"],
+    ["MaxLogIDs", 700, "Max item IDs to keep in logs"],
+    ["DaysForCandlestick", 30, "Days to build candlestick chart"],
+    ["RebuildAlways", false, "Always rebuild history (Slow)"],
+    ["OpenTime", "11:00", "Daily open window start (HH:mm)"],
+    ["CloseTime", "18:00", "Daily close window start (HH:mm)"]
+  ];
+
+  // This forces the write regardless of whether the sheet is empty
+  sh.getRange(2, 1, correctedData.length, 3).setValues(correctedData);
+  console.log("✅ CONFIG FORCIBLY UPDATED. Keys are now synced.");
 }
 
 /**

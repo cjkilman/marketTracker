@@ -791,8 +791,11 @@ function pruneSheetToRolling24(ss) {
  * THE LIVE WIRE RECALL: Surgical BigQuery Puller with Local Fallback.
  * Refined to match the E7:K standard and ConfigHandler logic.
  */
+/**
+ * THE LIVE WIRE RECALL: Surgical BigQuery Puller with Local Fallback.
+ */
 function FUZ_refreshPriceInterface(ss, targetSheetName) {
-  const cfg = getConfig(); // Pull IDs from your central config
+  const cfg = getConfig();
   const projectId = cfg.BQ_PROJECT_ID || 'tenacious-tiger-345318';
   const isVaultOk = (cfg.BQ_ENABLED === true);
 
@@ -805,138 +808,47 @@ function FUZ_refreshPriceInterface(ss, targetSheetName) {
   const marketId = parseInt(settings[0]);
   const marketType = String(settings[1]).trim();
 
-  if (isNaN(marketId) || marketType.toLowerCase().includes("loading")) {
-    sheet.getRange("E4").setValue(`[!] Waiting for IMPORTRANGE...`);
-    return;
-  }
+  if (isNaN(marketId)) return;
 
-  // --- 2. LOCAL FALLBACK ENGINE (CIRCUIT BREAKER ACTIVE) ---
-  if (!isVaultOk) {
-    console.log(`[${targetSheetName}] Circuit Breaker active. Running local fallback...`);
-    try {
-      const localSheet = ss.getSheetByName("Market Prices");
-      if (!localSheet) throw new Error("Local buffer missing");
+  // --- 2. GET ITEM IDS (Column B) ---
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 8) return;
+  const itemIds = sheet.getRange(8, 2, lastRow - 7, 1).getValues().flat().filter(id => id > 0);
 
-      const rawData = localSheet.getDataRange().getValues();
-      const cutoff = new Date().getTime() - (24 * 60 * 60 * 1000);
-      const grouped = {};
-
-      // Mimic BigQuery: Filter and group by 24h
-      for (let i = 1; i < rawData.length; i++) {
-        const r = rawData[i];
-        if (r[1] != marketId || String(r[2]).toLowerCase() !== marketType.toLowerCase()) continue;
-
-        const rDate = new Date(r[0]).getTime();
-        if (rDate < cutoff) continue;
-
-        const tid = String(r[3]);
-        if (!grouped[tid]) grouped[tid] = { buys: [], sells: [], latestDate: 0, curB: 0, curS: 0 };
-
-        const ms = Number(r[6]) || 0;
-        const mb = Number(r[7]) || 0;
-
-        grouped[tid].buys.push(mb);
-        grouped[tid].sells.push(ms);
-
-        // Find the most recent entry for "Current" prices
-        if (rDate > grouped[tid].latestDate) {
-          grouped[tid].latestDate = rDate;
-          grouped[tid].curB = mb;
-          grouped[tid].curS = ms;
-        }
-      }
-
-      // Calculate averages and map to output format
-      const data = [];
-      for (let tid in grouped) {
-        const g = grouped[tid];
-        const avgB = g.buys.reduce((a, b) => a + b, 0) / g.buys.length || 0;
-        const avgS = g.sells.reduce((a, b) => a + b, 0) / g.sells.length || 0;
-        const chgS = avgS > 0 ? (g.curS - avgS) / avgS : 0;
-        const chgB = avgB > 0 ? (g.curB - avgB) / avgB : 0;
-
-        data.push([tid, avgB, avgS, g.curB, g.curS, chgS, chgB]);
-      }
-
-      if (data.length === 0) throw new Error("Local Buffer is Empty");
-
-      FUZ_writeToInterfaceSheet(sheet, data, "[OK] Local Synced");
-      return; // Exit here so it does not hit BigQuery
-
-    } catch (e) {
-      console.warn(`[${targetSheetName}] Local Sync Failed: ${e.message}`);
-      sheet.getRange("E4").setValue(`[!] Local Sync Error: ${e.message}`);
-      return;
-    }
-  }
-
-  // --- 3. THE RECALL SQL (Optimized for E7:K) ---
-  const sql = `
-    SELECT 
-      type_id, 
-      ROUND(AVG(median_buy), 2) as avg_buy, 
-      ROUND(AVG(median_sell), 2) as avg_sell,
-      ARRAY_AGG(median_buy ORDER BY date DESC LIMIT 1)[OFFSET(0)] as cur_buy,
-      ARRAY_AGG(median_sell ORDER BY date DESC LIMIT 1)[OFFSET(0)] as cur_sell
-    FROM \`${projectId}.market_data.market_prices_staged\`
-    WHERE market_id = ${marketId}
-      AND LOWER(market_type) = LOWER('${marketType}')
-      AND date >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
-    GROUP BY type_id ORDER BY type_id ASC
-  `;
-
+  // --- 3. THE RECALL (Unified Logic) ---
+  let data = [];
   try {
-    console.log(`[${targetSheetName}] Vault Recall Started...`);
-    const queryResults = BigQuery.Jobs.query({ query: sql, useLegacySql: false }, projectId);
+    if (isVaultOk) {
+      // Use the shared function so indexing is always perfect
+      data = getPricesFromVault_(projectId, marketId, marketType, itemIds);
+    } else {
+      data = getPricesFromLocalBuffer_(ss.getSheetByName("Market Prices"), marketId, itemIds);
+    }
 
-    const data = queryResults.rows ? queryResults.rows.map(row => {
-      const v = row.f.map(field => field.v);
-      const avgB = parseFloat(v[1]), avgS = parseFloat(v[2]), curB = parseFloat(v[3]), curS = parseFloat(v[4]);
-      const chgS = avgS > 0 ? (curS - avgS) / avgS : 0;
-      const chgB = avgB > 0 ? (curB - avgB) / avgB : 0;
-      return [v[0], avgB, avgS, curB, curS, chgS, chgB];
-    }) : [];
-
-    if (data.length === 0) throw new Error("Vault is Empty (Waiting for next fetch)");
-
-    // --- 4. THE RESPONSE (Write to E7:K) ---
-    FUZ_writeToInterfaceSheet(sheet, data, "[OK] Vault Synced");
+    // --- 4. THE RESPONSE (Write to E:K) ---
+    writeToPriceInterface_(sheet, data, isVaultOk);
 
   } catch (err) {
     console.warn(`[${targetSheetName}] Sync Failed: ${err.message}`);
     sheet.getRange("E4").setValue(`[!] Sync Error: ${err.message}`);
-
-    if (err.message.toLowerCase().includes("quota exceeded")) {
-      console.error("Quota limit hit. Engaging circuit breaker automatically.");
-      toggleBigQueryCircuitBreaker();
-    }
   }
 }
 
-/**
- * HELPER: Surgical write to the E7:K range.
- */
 function FUZ_writeToInterfaceSheet(sheet, data, statusPrefix) {
-  const HEADERS = [["type_id_filtered", "Median Buy", "Median Sell", "Current Buy", "Current Sell", "Sell Change", "Buy Change"]];
-
-  // Clear Column E through K starting at row 8
+  // Matches Column E, F, G, H, I, J, K
+  const HEADERS = [["type_id_filtered", "Current Sell", "Current Buy", "Median Sell", "Median Buy", "Sell Change", "Buy Change"]];
+  
+  // Clear E7:K
   const lastRow = sheet.getLastRow();
-  if (lastRow >= 8) sheet.getRange(8, 5, lastRow - 7, 7).clearContent();
+  if (lastRow >= 7) sheet.getRange(7, 5, lastRow - 6, 7).clearContent();
 
-  // Set Headers at Row 7
   sheet.getRange(7, 5, 1, 7).setValues(HEADERS);
-
-  // Write Data at Row 8
   if (data.length > 0) {
     sheet.getRange(8, 5, data.length, 7).setValues(data);
-    // Formatting: J-K as Percentages, F-I as ISK
-    sheet.getRange(8, 10, data.length, 2).setNumberFormat('0.00%');
-    sheet.getRange(8, 6, data.length, 4).setNumberFormat('#,##0.00 "ISK"');
+    sheet.getRange(8, 10, data.length, 2).setNumberFormat('0.00%'); // Changes
+    sheet.getRange(8, 6, data.length, 4).setNumberFormat('#,##0.00 "ISK"'); // Prices
   }
-
-  sheet.getRange("E4").setValue(`${statusPrefix}: ${new Date().toLocaleTimeString()}`);
 }
-
 /**
  * THE GENERAL: Now with Error-Gating and Ironclad Type Enforcement.
  * Targets: 'filtered prices', 'Mineral Supply Prices', 'T1 Supply Prices'.
@@ -1028,6 +940,8 @@ function FUZ_publishPriceInterfaces(ss) {
   });
 }
 
+
+
 /**
  * Hard-sets the BQ_ENABLED flag to prevent toggle-loops during quota hits.
  */
@@ -1054,149 +968,90 @@ function emergencyGhostCleanup() {
   console.log("Workbook Cleaned.");
 }
 
-/**
- * BUFFER: Pulls from the local 'Market Prices' sheet if the Vault is locked.
- */
-function getPricesFromLocalBuffer_(sh) {
+function getPricesFromLocalBuffer_(sh, marketId, itemIds) {
   if (!sh) return [];
   const data = sh.getDataRange().getValues();
+  const idSet = new Set(itemIds.map(id => Number(id)));
   
-  // Filter for the last 24h and map to your [id, min_sell, max_buy, median_sell, median_buy] format
-  return data.slice(1).map(r => [r[3], r[4], r[5], r[6], r[7]]);
+  return data.slice(1)
+    .filter(r => idSet.has(Number(r[3])) && Number(r[1]) === Number(marketId))
+    .map(r => [String(r[3]), r[4], r[5], r[6], r[7]]); // E, F, G, H, I
 }
 
 function getPricesFromVault_(projectId, marketId, marketType, itemIds) {
-  const targetProject = 'tenacious-tiger-345318';
-
-  // Guard clause: If no IDs are provided, return empty to avoid SQL syntax errors
-  if (!itemIds || itemIds.length === 0) return [];
-
+  const cfg = getConfig();
+  const targetProject = cfg.BQ_PROJECT_ID || 'tenacious-tiger-345318';
+  const tableId = cfg.BQ_Market_Prices || 'market_prices_history';
   const idList = itemIds.join(',');
   const cleanType = String(marketType).toLowerCase().trim();
 
   const sql = `
     WITH History AS (
-      SELECT type_id, min_sell, max_buy, date
-      FROM \`tenacious-tiger-345318.market_data.market_prices_staged\`
-      WHERE market_id = '${marketId}'
-      AND market_type = '${cleanType}'
-      AND type_id IN (${idList})
+      SELECT type_id, min_sell, max_buy, date FROM \`${targetProject}.market_data.${tableId}\`
+      WHERE market_id = ${marketId} AND market_type = '${cleanType}' AND type_id IN (${idList})
       AND date >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
     ),
     CalculatedBaselines AS (
-      SELECT 
-        type_id,
+      SELECT type_id,
         PERCENTILE_CONT(NULLIF(min_sell, 0), 0.5) OVER(PARTITION BY type_id) as med_sell_base,
         PERCENTILE_CONT(NULLIF(max_buy, 0), 0.5) OVER(PARTITION BY type_id) as med_buy_base
       FROM History
     ),
     LatestPrice AS (
-      SELECT type_id, min_sell, max_buy,
-             ROW_NUMBER() OVER(PARTITION BY type_id ORDER BY date DESC) as rn
-      FROM History
+      SELECT type_id, min_sell, max_buy, ROW_NUMBER() OVER(PARTITION BY type_id ORDER BY date DESC) as rn FROM History
     )
-    SELECT 
-      CAST(L.type_id AS STRING),        -- Column 0: type_id
-      L.min_sell,                       -- Column 1: min_sell
-      L.max_buy,                        -- Column 2: max_buy
-      CAST(B.med_sell_base AS FLOAT64), -- Column 3: median_sell
-      CAST(B.med_buy_base AS FLOAT64)   -- Column 4: median_buy
+    SELECT CAST(L.type_id AS STRING), L.min_sell, L.max_buy, CAST(B.med_sell_base AS FLOAT64), CAST(B.med_buy_base AS FLOAT64)
     FROM LatestPrice L
     LEFT JOIN (SELECT DISTINCT * FROM CalculatedBaselines) B ON L.type_id = B.type_id
-    WHERE L.rn = 1
-  `;
+    WHERE L.rn = 1`;
 
   const queryResults = BigQuery.Jobs.query({ query: sql, useLegacySql: false }, targetProject);
 
-  // Updated Header to fix the "meadian" typo for consistency
-  const headers = ["type_id", "min_sell", "max_buy", "median_sell", "median_buy"];
-
-  const rows = queryResults.rows ? queryResults.rows.map(row => {
-    // Helper to handle BigQuery's null values (.v property)
-    const val = (idx) => (row.f[idx].v !== null) ? row.f[idx].v : "";
-
-    return [
-      String(val(0)),              // type_id (Header index 0)
-      val(1) !== "" ? Number(val(1)) : "", // min_sell (Header index 1)
-      val(2) !== "" ? Number(val(2)) : "", // max_buy (Header index 2)
-      val(3) !== "" ? Number(val(3)) : "", // median_sell (Header index 3)
-      val(4) !== "" ? Number(val(4)) : ""  // median_buy (Header index 4)
-    ];
+  return queryResults.rows ? queryResults.rows.map(row => {
+    // Just return the 5 values BigQuery found
+    return row.f.map(field => field.v !== null ? field.v : "");
   }) : [];
-
-  console.log(`[VaultRecall] Found ${rows.length} matches for ${cleanType} ${marketId}`);
-  return rows;
 }
 
-/**
- * THE BOULDER PUSHER
- * Clears the 30-minute lease and forces the Vault Merge to fix timeouts.
- */
 function forceSystemRecovery() {
-  const props = PropertiesService.getScriptProperties();
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-
+  const ctx = getAppContext(ss); // Get the handshake
   console.log("🛠 Recovery: Clearing lease and forcing Vault Merge...");
-  props.deleteProperty('LAST_FUZZ_FETCH');
-  props.setProperty('fuzz_pass_complete', 'true'); // Trick the gate into opening
-
-  // This will move the staged data to BigQuery and WIPE the sheet clean
-  runVaultMergeAndReset(ss);
-
-  console.log("✅ Recovery Complete. Staging sheet is empty. UI Pulse will now be fast.");
+  ctx.props.deleteProperty('LAST_FUZZ_FETCH');
+  ctx.props.setProperty('fuzz_pass_complete', 'true'); 
+  
+  runVaultMergeAndReset(ctx); // Pass the ctx
+  console.log("✅ Recovery Complete.");
 }
 
-/**
- * THE PRINTER: Hardened against "Phantom Row" timeouts.
- * Only writes exactly the number of valid items requested.
- */
 function writeToPriceInterface_(sh, data, isVaultOk) {
-  if (!data || data.length === 0) {
-    console.warn(`[${sh.getName()}] No data to write. Skipping printer.`);
-    return;
-  }
+  if (!data || data.length === 0) return;
 
-  const startRow = 8; // Row 7 Headers are PROTECTED
+  const startRow = 8; // Data starts here
   const lastRow = sh.getLastRow();
-  if (lastRow < startRow) return;
-
-  // 1. Get raw IDs, but stop exactly at the last REAL ID to avoid Phantom Rows
-  const rawIds = sh.getRange(startRow, 2, lastRow - startRow + 1, 1).getValues().flat();
-
-  // Find the actual length of real data (ignoring blank cells at the bottom)
-  let actualCount = 0;
-  for (let i = rawIds.length - 1; i >= 0; i--) {
-    if (rawIds[i] !== "" && !isNaN(Number(rawIds[i]))) {
-      actualCount = i + 1;
-      break;
-    }
+  
+  // 1. Clear ONLY E8:I (5 columns)
+  if (lastRow >= startRow) {
+    sh.getRange(startRow, 5, lastRow - startRow + 1, 5).clearContent();
   }
 
-  if (actualCount === 0) return;
-  const validIds = rawIds.slice(0, actualCount); // Trims off the 50,000 blank rows
+  const rawIds = sh.getRange(startRow, 2, Math.max(1, lastRow - startRow + 1), 1).getValues().flat();
+  const validIds = rawIds.filter(id => id !== "" && !isNaN(Number(id)));
 
-  // 2. Map the Vault data: [type_id -> full_row_array]
   const vaultMap = new Map();
   data.forEach(row => vaultMap.set(Number(row[0]), row));
 
-  // 3. Align the Vault data to match the Item IDs
   const output = validIds.map(id => {
     const cleanId = Number(id);
-    if (vaultMap.has(cleanId)) {
-      return vaultMap.get(cleanId); // Found! [ID, Min, Max, MedS, MedB]
-    }
-    // THE FIX: Output empty strings instead of 0s for missing prices.
-    // We also cast the ID to a String to protect it from Sheets rounding.
-    return [String(cleanId), "", "", "", ""];
+    return vaultMap.has(cleanId) ? vaultMap.get(cleanId) : [String(cleanId), "", "", "", ""];
   });
 
-  // 4. THE LIGHTNING WRITE
-  // Because 'output.length' is exactly 737 now, this takes milliseconds.
+  // 2. THE WRITE: Exactly 5 columns (E to I)
   sh.getRange(startRow, 5, output.length, 5).setValues(output);
+  
+  // Format Prices (F:I)
+  sh.getRange(startRow, 6, output.length, 4).setNumberFormat('#,##0.00 "ISK"');
 
-  // 5. Update the UI Header (E4)
-  const timestamp = Utilities.formatDate(new Date(), "America/New_York", "h:mm:ss a");
-  sh.getRange("E4").setValue(`✅ Vault Synced: ${timestamp}`);
-
-  console.log(`[UI] Success: Printed exactly ${output.length} rows to ${sh.getName()}`);
+  const ts = Utilities.formatDate(new Date(), "America/New_York", "h:mm:ss a");
+  sh.getRange("E4").setValue(`✅ Vault Synced: ${ts}`);
 }

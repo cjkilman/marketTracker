@@ -19,27 +19,76 @@ const JOB_LEASE_DURATION_MS = 1800000; // 5 minutes
 var EXECUTION_LOCK_DEPTH_TRY = 0;
 var EXECUTION_LOCK_DEPTH_WAIT = 0;
 
+
+/**
+ * GHOST RECOVERY
+ * Locates orphaned Merge_Temp_ sheets and attempts to push their 
+ * stranded data into the BigQuery Vault before deleting them.
+ */
 function emergencyGhostCleanup() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheets = ss.getSheets();
-  sheets.forEach(sh => {
-    if (sh.getName().includes("Merge_Temp_")) ss.deleteSheet(sh);
-  });
-  console.log("Workbook Cleaned.");
-}
+  const ctx = getAppContext(ss);
 
+  const isVaultOk = (String(ctx.cfg.BQ_ENABLED).toUpperCase() === "TRUE");
+  if (!isVaultOk) {
+    console.warn("[RECOVERY] Vault is currently LOCKED. Cannot merge ghosts at this time.");
+    return;
+  }
+
+  const projectId = ctx.cfg.BQ_PROJECT_ID;
+  const datasetId = ctx.cfg.BQ_DATASET_ID;
+  const tableId = ctx.cfg.BQ_Market_Prices;
+
+  const sheets = ss.getSheets();
+  let ghostsRecovered = 0;
+
+  sheets.forEach(sh => {
+    const name = sh.getName();
+
+    if (name.includes("Merge_Temp_")) {
+      console.log(`[RECOVERY] Found ghost sheet: ${name}. Extracting payload...`);
+      const data = sh.getDataRange().getValues();
+
+      // Only upload if there is actual data (more than just the header row)
+      if (data.length > 1) {
+        try {
+          console.log(`[RECOVERY] Transmitting ${data.length - 1} rows to Vault...`);
+
+          // Push directly to BigQuery using the helper
+          const success = bigQueryBatchLoad_(projectId, datasetId, tableId, data);
+
+          if (success) {
+            console.log(`[RECOVERY] Upload successful. Burning sidecar: ${name}`);
+            ss.deleteSheet(sh);
+            ghostsRecovered++;
+          } else {
+            console.error(`[RECOVERY] Vault rejected payload for ${name}. Sheet retained.`);
+          }
+        } catch (e) {
+          console.error(`[RECOVERY] Failed to merge ${name}: ${e.message}`);
+        }
+      } else {
+        // Sheet is empty or only has headers, burn it safely without uploading
+        console.log(`[RECOVERY] ${name} is empty. Burning sidecar.`);
+        ss.deleteSheet(sh);
+      }
+    }
+  });
+
+  console.log(`[RECOVERY] Workbook Cleaned. Salvaged ${ghostsRecovered} ghost payloads.`);
+}
 
 function rebuildMarketPricesSheet(ctx) {
   const targetSS = ctx ? ctx.ss : SpreadsheetApp.getActiveSpreadsheet();
   const NAME = "Market Prices";
   const HEADERS = [["date", "market_id", "market_type", "type_id", "min_sell", "max_buy", "median_sell", "median_buy"]];
-  
+
   let sh = targetSS.getSheetByName(NAME);
   if (!sh) {
     sh = targetSS.insertSheet(NAME);
     sh.getRange(1, 1, 1, 8).setValues(HEADERS);
   }
-  return sh; 
+  return sh;
 }
 
 
@@ -126,6 +175,8 @@ function deleteTriggersByName(functionName) {
  */
 function executeWithTryLock(func, funcName) {
   const log = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('LockManager') : console;
+ // --- GLOBAL CONFIGURATION ---
+// STRICT: Use ScriptLock only. DocumentLock is incompatible with this architecture.
   const lock = LockService.getScriptLock();
   let functionResult = null;
 
@@ -158,43 +209,64 @@ function executeWithTryLock(func, funcName) {
 }
 
 /**
- * Waits for a ScriptLock (up to 30s) and executes a function. Throws error if lock fails.
+ * Executes a function within a strict ScriptLock.
+ * Prevents "DocumentLock" drift and parallel job collisions.
+ * * @param {Function} func - The function to execute.
+ * @param {string} funcName - Name for logging/trigger management.
+ * @return {*} - Returns the result of the executed function.
  */
 function executeWithWaitLock(func, funcName) {
+  // Fallback for LoggerEx to keep it ASCII/Console based
   const log = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('LockManager') : console;
+  
+  // STRICT: ScriptLock only. Do not use DocumentLock.
   const lock = LockService.getScriptLock();
+  const LOCK_TIMEOUT_MS = 30000;
   let functionResult = null;
 
+  // Initialize depth counter if undefined
+  if (typeof EXECUTION_LOCK_DEPTH_WAIT === 'undefined') {
+    var EXECUTION_LOCK_DEPTH_WAIT = 0; 
+  }
+
   try {
-    lock.waitLock(30000); // 30-second waitLock
+    lock.waitLock(LOCK_TIMEOUT_MS);
   } catch (e) {
-    log.error(`Could not acquire Script Lock for ${funcName} after 30s wait.`);
-    throw e;
+    log.error(`[LOCK FAIL] ${funcName} could not acquire ScriptLock after ${LOCK_TIMEOUT_MS/1000}s.`);
+    throw new Error(`Lock Timeout: ${funcName}`);
   }
 
   const isOuterLock = (EXECUTION_LOCK_DEPTH_WAIT === 0);
   EXECUTION_LOCK_DEPTH_WAIT++;
+
   try {
-    if (isOuterLock) deleteTriggersByName(funcName);
-    log.info(`--- ${isOuterLock ? 'Starting' : 'Entering nested'} Execution (WaitLock): ${funcName} ---`);
+    // If this is the primary entry point, clear any redundant triggers
+    if (isOuterLock && typeof deleteTriggersByName === 'function') {
+      deleteTriggersByName(funcName);
+    }
 
-    functionResult = func(); // Execute and store result
+    log.info(`--- ${isOuterLock ? 'START' : 'NESTED'} : ${funcName} ---`);
 
-    log.info(`--- ${isOuterLock ? 'Finished' : 'Exiting nested'} Execution (WaitLock): ${funcName} ---`);
+    // Execute the actual logic
+    functionResult = func();
+
+    log.info(`--- ${isOuterLock ? 'FINISH' : 'EXIT'} : ${funcName} ---`);
+    
   } catch (e) {
-    log.error(`${funcName} failed: ${e.message}\nStack: ${e.stack}`);
+    log.error(`[EXECUTION ERROR] ${funcName}: ${e.message}`);
+    // No .Flush() here - let the error bubble up naturally
     throw e;
   } finally {
     EXECUTION_LOCK_DEPTH_WAIT--;
     try {
       lock.releaseLock();
     } catch (lockError) {
-      log.error(`CRITICAL: Failed to release Script Lock for ${funcName}: ${lockError.message}`);
+      log.error(`CRITICAL: Lock release failed for ${funcName}`);
     }
   }
+
   return functionResult;
 }
-
 /**
  * Helper to check if it's time to refresh the Google Sheet displays
  */
@@ -240,13 +312,36 @@ function resumeEngine() {
 function masterOrchestrator() {
   const startTime = Date.now();
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const ctx = getAppContext(ss); // Create the context once
-  
+  const ctx = getAppContext(ss);
+
   const props = ctx.props;
   props.setProperty('exec_start_time', String(startTime));
 
-  // 1. CHECK VAULT GATE
+  // ==========================================
+  // 1. MANDATORY RECOVERY: Vault Merge & Clean
+  // ==========================================
   const isVaultOk = (String(ctx.cfg.BQ_ENABLED).toUpperCase() === "TRUE");
+
+  if (isVaultOk) {
+    const targetSheetName = ctx.cfg.MarketPricesSheet || "Market Prices";
+    const stagingSheet = ctx.ss.getSheetByName(targetSheetName);
+    const lastRow = stagingSheet ? stagingSheet.getLastRow() : 0;
+
+    // If Vault is enabled and we have data in the staging area, 
+    // we MUST merge and clean before doing anything else.
+    if (lastRow > 1) {
+      console.log("[RECOVERY] BigQuery Quota Reset detected. Merging staged data to Vault...");
+      try {
+        runVaultMergeAndReset(ctx);
+        console.log("[RECOVERY] Vault Merge and Clean successful.");
+      } catch (e) {
+        console.error("[RECOVERY ERROR] Failed to merge backlog: " + e.message);
+        // Exit to prevent over-stuffing the local sheet if merge fails
+        return;
+      }
+    }
+  }
+
   const itemSource = isVaultOk ? "SDE_invTypes" : "Item List Back End";
   console.log(`[GATE] Vault: ${isVaultOk ? "OPEN" : "LOCKED"}. Source: ${itemSource}`);
 
@@ -256,12 +351,12 @@ function masterOrchestrator() {
   try {
     console.log("--- PHASE 1: FETCHING ---");
     // Worker runs, APPENDS chunked data to 'Market Prices', and sets 'fuzz_pass_complete'
-    updateFuzzMarketDataSheet(itemSource,ctx);
+    updateFuzzMarketDataSheet(itemSource, ctx);
 
   } catch (e) {
     if (e.message.includes("quota")) {
       console.error("[!] CRITICAL QUOTA HIT [!] Tripping Safety Switch.");
-      toggleBigQueryCircuitBreaker(); // Replaced setMarketConfig
+      toggleBigQueryCircuitBreaker();
       return;
     }
     console.warn("Fetch Failed: " + e.message);
@@ -385,49 +480,48 @@ function toggleBigQueryCircuitBreaker(ss) {
   } catch (e) { }
 }
 
-function runVaultMergeAndReset(ctx) {
+function runVaultMergeAndReset(ctx, targetSheetName = "Market Prices") {
   const { ss, cfg } = ctx;
-  const targetSheetName = "Market Prices"; 
-  const oldSh = ss.getSheetByName(targetSheetName);
-  if (!oldSh || oldSh.getLastRow() < 2) return;
+  const sh = ss.getSheetByName(targetSheetName);
+
+  if (!sh || sh.getLastRow() < 2) return;
 
   const isVaultOk = (String(cfg.BQ_ENABLED).toUpperCase() === "TRUE");
-  const tempName = "Merge_Temp_" + Date.now();
+  if (!isVaultOk) return;
 
   try {
-    // Phase A: Detach Sidecar
-    oldSh.setName(tempName);
-    rebuildMarketPricesSheet(ctx); // Create clean landing pad for Fetcher
+    const data = sh.getDataRange().getValues();
+    const success = bigQueryBatchLoad_(cfg.BQ_PROJECT_ID, cfg.BQ_DATASET_ID, cfg.BQ_Market_Prices, data);
 
-    if (isVaultOk) {
-      // Phase B: Attempt Vault Upload
-      // ... (Existing BigQuery Upload Logic) ...
-      
-      // Phase C: Success - Burn the Sidecar
-      ss.deleteSheet(oldSh); 
-      console.log("[Vault] Upload Success. Sidecar deleted.");
-    } else {
-      throw new Error("Vault Disabled: Redirecting to Local Fallback.");
-    }
+    if (success) {
+      console.log(`[VaultGate] Success! Clearing landing pad...`);
 
-  } catch (e) {
-    console.warn(`[VaultGate] ${e.message}`);
-    
-    // Phase D: THE RECOVERY
-    // If we failed, merge the Sidecar data back into the main 'Market Prices'
-    const recoverySh = ss.getSheetByName(tempName);
-    if (recoverySh) {
-      const data = recoverySh.getDataRange().getValues();
-      const mainSh = ss.getSheetByName(targetSheetName);
-      // Append the data back to the live buffer so the UI can see it
-      if (data.length > 1) {
-        mainSh.getRange(mainSh.getLastRow() + 1, 1, data.length - 1, 8)
-              .setValues(data.slice(1));
+      // RE-FETCH the row count right here to avoid "Out of Bounds" errors
+      const currentRowCount = sh.getLastRow();
+      const rowsToDelete = currentRowCount - 1;
+
+      if (rowsToDelete > 0) {
+        try {
+          sh.deleteRows(2, rowsToDelete);
+          console.log(`[VaultGate] Successfully cleared ${rowsToDelete} rows.`);
+        } catch (e) {
+          // If maintenance already cleared it, we just ignore the error and move on
+          console.warn("[VaultGate] Sheet was modified during upload. Skipping manual clear.");
+        }
       }
-      ss.deleteSheet(recoverySh);
-      console.log("[Fallback] Data restored to Market Prices for UI use.");
     }
+  } catch (e) {
+    console.error("Vault Error: " + e.message);
   }
+}
+
+
+
+function KILL_STUCK_PRUNE() {
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty('heavyPruneJobStep');
+  props.deleteProperty('heavyPruneJobReadRow');
+  console.log("Heavy Prune state cleared.");
 }
 
 /**
@@ -512,7 +606,7 @@ function orchestratorTaskUI() {
   const props = PropertiesService.getScriptProperties();
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const now = Date.now();
-  const LEASE_MS = 30 * 60 * 1000; 
+  const LEASE_MS = 30 * 60 * 1000;
 
   props.setProperty('exec_start_time', String(now));
   console.log("--- PHASE 3: UI PULSE (Priority: Prices) ---");
@@ -527,7 +621,7 @@ function orchestratorTaskUI() {
       props.setProperty('LAST_PRICE_PULSE', String(Date.now()));
     } else {
       console.warn("[UI] Low fuel for Price update. Rescheduling pulse.");
-      scheduleOneTimeTrigger('orchestratorTaskUI', 45000); 
+      scheduleOneTimeTrigger('orchestratorTaskUI', 45000);
       return; // Exit early to save remaining fuel for the next attempt
     }
   } else {
@@ -575,34 +669,76 @@ function forceVaultMerge() {
 
 /**
  * INTERNAL HELPER: Executes the BigQuery Load Job
+ * OPTIMIZED: Uses "Streaming Inserts" (Tabledata.insertAll) instead of Load Jobs.
+ * Bypasses the file-upload proxy that causes 503s and chunks data to save memory.
  */
 function bigQueryBatchLoad_(projectId, datasetId, tableId, dataArray) {
-  // Convert 2D array to Newline Delimited JSON (Standard BQ Format)
   const headers = dataArray[0];
-  const jsonRows = dataArray.slice(1).map(row => {
-    let obj = {};
-    headers.forEach((h, i) => obj[h] = row[i]);
-    return JSON.stringify(obj);
-  }).join('\n');
+  const rows = dataArray.slice(1);
+  const CHUNK_SIZE = 2500; // Extremely safe memory limit for Apps Script
 
-  const blob = Utilities.newBlob(jsonRows, 'application/octet-stream');
+  console.log(`[Vault] Initiating streaming insert of ${rows.length} rows to ${tableId}...`);
 
-  const job = {
-    configuration: {
-      load: {
-        destinationTable: {
-          projectId: projectId,
-          datasetId: datasetId,
-          tableId: tableId
-        },
-        sourceFormat: 'NEWLINE_DELIMITED_JSON',
-        writeDisposition: 'WRITE_APPEND' // Keep the history!
+  for (let i = 0; i < rows.length; i += CHUNK_SIZE) {
+    const chunk = rows.slice(i, i + CHUNK_SIZE);
+
+    // Build the specific JSON format required for Streaming Inserts
+    const insertAllRequest = {
+      skipInvalidRows: false,
+      ignoreUnknownValues: true, // Prevents crashes if your sheet has an extra blank column
+      rows: chunk.map(row => {
+        let obj = {};
+        headers.forEach((h, index) => {
+          let val = row[index];
+          // Format dates strictly for BigQuery
+          if (val instanceof Date) {
+            val = Utilities.formatDate(val, Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss");
+          }
+          // Only add the field if the header actually has a name
+          if (h && String(h).trim() !== "") {
+            obj[String(h).trim()] = val;
+          }
+        });
+        return { json: obj };
+      })
+    };
+
+    let chunkSuccess = false;
+    const maxRetries = 3;
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const response = BigQuery.Tabledata.insertAll(insertAllRequest, projectId, datasetId, tableId);
+
+        // Streaming inserts do not crash the script on bad data; they return the exact error.
+        if (response.insertErrors && response.insertErrors.length > 0) {
+          const exactError = response.insertErrors[0].errors[0].message;
+          console.error(`[Vault] Schema Error in chunk: ${exactError}`);
+          return false; // Abort so we don't lose the sheet
+        }
+
+        chunkSuccess = true;
+        break; // Chunk succeeded, break out of the retry loop
+
+      } catch (e) {
+        if (e.message.includes("503") || e.message.includes("Service Unavailable") || e.message.includes("timeout")) {
+          console.warn(`[Vault] API hiccup on chunk ${i}. Retrying attempt ${attempt}...`);
+          if (attempt === maxRetries) throw e;
+          Utilities.sleep(Math.pow(2, attempt) * 1000);
+        } else {
+          console.error(`[Vault] Hard API Error: ${e.message}`);
+          throw e; // Hard error (like Permission Denied)
+        }
       }
     }
-  };
 
-  const runJob = BigQuery.Jobs.insert(job, projectId, blob);
-  return (runJob.status.state === 'DONE' || runJob.status.state === 'PENDING');
+    if (!chunkSuccess) return false;
+
+    // Force garbage collection / memory flush between chunks
+    Utilities.sleep(200);
+  }
+
+  return true; // All chunks succeeded
 }
 
 
