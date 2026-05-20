@@ -849,14 +849,13 @@ function FUZ_writeToInterfaceSheet(sheet, data, statusPrefix) {
     sheet.getRange(8, 6, data.length, 4).setNumberFormat('#,##0.00 "ISK"'); // Prices
   }
 }
+
 /**
- * THE GENERAL: Now with Error-Gating and Ironclad Type Enforcement.
+ * THE GENERAL: Direct Cache-First Recall via fuzAPI.
  * Targets: 'filtered prices', 'Mineral Supply Prices', 'T1 Supply Prices'.
  */
 function FUZ_publishPriceInterfaces(ss) {
   if (!ss) ss = SpreadsheetApp.getActive();
-  const cfg = getConfig();
-  const isVaultOk = (cfg.BQ_ENABLED === true);
 
   const priceSheets = ['filtered prices', 'Mineral Supply Prices', 'T1 Supply Prices'];
 
@@ -880,7 +879,7 @@ function FUZ_publishPriceInterfaces(ss) {
       return; // Skip this sheet and move to the next
     }
 
-    const marketId = parseInt(mktIdRaw);
+    const marketId = parseInt(mktIdRaw, 10);
     const marketType = String(mktTypeRaw).trim();
 
     if (isNaN(marketId)) {
@@ -894,48 +893,43 @@ function FUZ_publishPriceInterfaces(ss) {
 
     const itemIds = sh.getRange(8, 2, lastRow - 7, 1).getValues()
       .flat()
-      .filter(id => !isNaN(parseInt(id)) && id > 0);
+      .filter(id => !isNaN(parseInt(id, 10)) && id > 0);
 
     if (itemIds.length === 0) return;
 
-    console.log(`[${sheetName}] Requesting ${itemIds.length} items for ${marketType} ${marketId}`);
+    console.log(`[${sheetName}] Requesting ${itemIds.length} items from cache client for ${marketType} ${marketId}`);
 
     // --- 3. THE RECALL ---
     let data = [];
     try {
-      if (isVaultOk) {
-        data = getPricesFromVault_(cfg.BQ_PROJECT_ID, marketId, marketType, itemIds);
-      } else {
-        data = getPricesFromLocalBuffer_(ss.getSheetByName('Market Prices'), marketId, itemIds);
-      }
+      // Pull directly from modular cache client
+      const priceMap = getMarketPrices(itemIds, marketId, marketType);
 
-      // --- NEW: THE IRONCLAD TYPE-CASTING FIX ---
-      // 1. Force Column E to Plain Text and Prices to standard decimals BEFORE pasting
-      sh.getRange("E7:E").setNumberFormat("@");
+      // Reconstruct the 2D array structure expected by the printer [ID, MinS, MaxB, MedS, MedB]
+      data = itemIds.map(id => {
+        const obj = priceMap[id];
+        if (obj) {
+          return [
+            Number(id), // Keep native numeric type to align with SDE schemas
+            obj.sell?.min !== "" ? Number(obj.sell.min) : "",
+            obj.buy?.max  !== "" ? Number(obj.buy.max)  : "",
+            obj.sell?.median !== "" ? Number(obj.sell.median) : "",
+            obj.buy?.median  !== "" ? Number(obj.buy.median)  : ""
+          ];
+        }
+        return [Number(id), "", "", "", ""];
+      });
+
+      // 1. Enforce numeric standard format directly on the ranges
+      sh.getRange("E7:E").setNumberFormat("0");
       sh.getRange("F7:K").setNumberFormat("#,##0.00");
 
-      // 2. Loop through the data payload and force the type_id (Index 0) to be a strict string
-      if (data && data.length > 0) {
-        for (let i = 0; i < data.length; i++) {
-          if (data[i][0] !== "" && data[i][0] != null) {
-            // This prevents Google Sheets from performing any math or rounding on the ID
-            data[i][0] = String(data[i][0]);
-          }
-        }
-      }
-
       // --- 4. THE RESPONSE (Write to E7:K) ---
-      writeToPriceInterface_(sh, data, isVaultOk);
+      writeToPriceInterface_(sh, data, false);
 
     } catch (e) {
       console.error(`[${sheetName}] Sync Failed: ${e.message}`);
       sh.getRange("E4").setValue("!! Sync Error: Check Logs !!");
-
-      // TACTICAL: If we hit a quota limit, SHUT THE GATE for everything else
-      if (e.message.toLowerCase().includes("quota exceeded")) {
-        console.warn(`[QUOTA] Custom BQ limit reached on ${sheetName}. Killing BQ Pipe...`);
-        setBigQueryCircuitBreaker(ss, false); // FORCE it to false, don't toggle it
-      }
     }
   });
 }
