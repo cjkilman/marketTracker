@@ -1,4 +1,11 @@
 /**
+ * BigQuery Disabled/ Archieved
+ * Eve Market Data is too much of a Firehose of Data it kills the monthly quote in 2 weeks
+ */
+
+
+
+/**
  * Wrapper for the scheduler (Hardened against null/undefined event objects)
  */
 function refreshPriceInterfaceSheetsManual(e) {

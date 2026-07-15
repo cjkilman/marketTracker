@@ -1,12 +1,12 @@
 /***** marketFetcherESI.gs  —  MAIN PROJECT FILE ********************************
  * Contains BOTH sides:
- *   1) ENGINE: pulls ESI region history via GESI → caches & publishes slim table
- *   2) CLIENT: marketStatDataCache(...)  (cache-only; reads CacheService via your
- *      _getCachedFuz and _normalizeOrder from marketStatData)
+ * 1) ENGINE: pulls ESI region history via GESI → caches & publishes slim table
+ * 2) CLIENT: marketStatDataCache(...)  (cache-only; reads CacheService via your
+ * _getCachedFuz and _normalizeOrder from marketStatData)
  *
  * SLIM IS LAW:
- *   - Engine publishes named range: MarketResultESI_Region (type_id, region_id, vol30, ts, status)
- *   - Clients import that single range; all other math stays local (Fuz books + DoB).
+ * - Engine publishes named range: MarketResultESI_Region (type_id, region_id, vol30, ts, status)
+ * - Clients import that single range; all other math stays local (Fuz books + DoB).
  *******************************************************************************/
 
 /* ============================ CONFIG: ENGINE ============================ */
@@ -32,16 +32,25 @@ const DAILY_UTC_MIN = 20;
 const HEADERS_REGION = ['type_id', 'region_id', 'volume30_region', 'velocity30_region', 'volume7_region', 'velocity7_region', 'volume5_region', 'velocity5_region', 'last_updated', 'status'];
 const HEADERS_PUBLISH = ['type_id', 'region_id', 'volume30_region', 'volume7_region', 'volume5_region', 'last_updated', 'status'];
 
-
-/** ---------- Rate limit + backoff (lightweight) ---------- **/
-const PACER_PROP_GAP = 'esi_gap_ms';
-const PACER_PROP_LAST = 'esi_last_ms';
-const PACER_MIN_MS = 400;   // start ~2.5 rps
-const PACER_MAX_MS = 5000;  // cap 5s between calls
+/* ============================ ESI SYSTEM HOOKS ============================ */
+const getMarketEsiHooks = (authChar) => ({
+  onLock: (err) => {
+    LoggerEx.error('FATAL: Quota Exceeded mid-fetch. Gate locked.');
+    stopWorker_('Google Quota Exceeded'); 
+  },
+  onAuthError: (err) => {
+    const props = PropertiesService.getScriptProperties();
+    props.setProperty('mf_blocked_auth', '1');
+    props.deleteProperty('mf_job_active');
+    
+    const charName = authChar || 'Default Character';
+    LoggerEx.error(`Auth Failure for [${charName}] on ${err.endpoint}. Hint: Re-authorize GESI.`);
+    
+    stopWorker_('auth required');
+  }
+});
 
 /***** GESI batching + governor (≤300 req/min) ********************************/
-
-// Hard cap
 var ESI_TB_RATE_PER_MIN = 300;   // tokens added per minute
 var ESI_TB_BURST = 300;   // max token bucket
 var ESI_GROUP_SIZE = 50;    // requests per fetchAll group
@@ -73,12 +82,6 @@ function tbConsume_(need) {
   return waitMs;
 }
 
-// ----- Blacksmoke/GESI client -----
-function getGESIHistoryClient_() {
-  // Requires GESI library + authorized character (Sheets Add-ons → GESI → Authorize)
-  return GESI.getClient().setFunction('markets_region_history');
-}
-
 function isBeforeNoonET_() {
   return +Utilities.formatDate(new Date(), 'America/New_York', 'H') < 12;
 }
@@ -86,255 +89,115 @@ function getBatchSize_() {      // AM: 200, PM: 60
   return isBeforeNoonET_() ? 200 : 60;
 }
 
-
-
-function buildHistoryRequests_(client, regionId, typeIds) {
-  return typeIds.map(function (tid) {
-    return client.buildRequest({
-      region_id: regionId,
-      type_id: tid,
-      show_column_headings: false,
-      version: 'latest'
-    });
-  });
-}
-
 function summarizeHistoryMulti_(rows) {
   if (!rows || !rows.length) return { vol30: 0, vel30: 0, vol7: 0, vel7: 0, vol5: 0, vel5: 0 };
-  
+
   var v30 = 0, v7 = 0, v5 = 0;
-  // ESI returns chronological. Count backwards from the newest day.
   var daysToCount = Math.min(rows.length, 30);
-  
+
   for (var k = 1; k <= daysToCount; k++) {
     var dailyVol = +rows[rows.length - k].volume || 0;
     v30 += dailyVol;
     if (k <= 7) v7 += dailyVol;
     if (k <= 5) v5 += dailyVol;
   }
-  
+
   var n30 = daysToCount;
   var n7 = Math.min(rows.length, 7);
   var n5 = Math.min(rows.length, 5);
-  
-  return { 
+
+  return {
     vol30: v30, vel30: (n30 ? v30 / n30 : 0),
     vol7: v7, vel7: (n7 ? v7 / n7 : 0),
     vol5: v5, vel5: (n5 ? v5 / n5 : 0)
   };
 }
 
-function mapGESIRespToResult_(resp, typeId) {
-  var code = resp.getResponseCode();
-  if (code === 200) {
-    try {
-      var arr = JSON.parse(resp.getContentText()) || [];
-      var m = summarizeHistoryMulti_(arr);
-      return { 
-        typeId: typeId, status: 'OK', 
-        vol30: m.vol30, vel30: m.vel30,
-        vol7: m.vol7, vel7: m.vel7,
-        vol5: m.vol5, vel5: m.vel5
-      };
-    } catch (e) {
-      return { typeId: typeId, status: 'ERR_PARSE' };
-    }
-  }
-  if (code === 401 || code === 403) return { typeId: typeId, status: 'ERR_AUTH', code: code };
-  if (code === 420 || code === 429) return { typeId: typeId, status: 'ERR_RATE', code: code };
-  if (code >= 500) return { typeId: typeId, status: 'ERR_5XX', code: code };
-  if (code >= 400) return { typeId: typeId, status: 'ERR_4XX', code: code };
-  return { typeId: typeId, status: 'ERR_' + code, code: code };
-}
-
-function fetchHistoryBatchGESI_(regionId, typeIds) {
-  var client = getGESIHistoryClient_();
-  var out = [];
+function fetchHistoryBatchGESI_(regionId, typeIds, authChar) {
+  // THE FIX: Only pass authChar if it actually contains a string
+  const authClient = authChar ? GESI.getClient(authChar) : GESI.getClient();
   
-  // Start with the configured max size (e.g., 50)
-  // If we hit errors, we will lower this variable dynamically for this run.
-  var currentBatchSize = ESI_GROUP_SIZE; 
-  var i = 0;
+  const hooks = getMarketEsiHooks(authChar);
+  const service = ESI.forEndpoint(authClient, 'markets_region_history', hooks, null);
 
-  while (i < typeIds.length) {
-    // 1. Slice the next batch based on current dynamic size
-    var end = Math.min(i + currentBatchSize, typeIds.length);
-    var ids = typeIds.slice(i, end);
+  const wait = tbConsume_(typeIds.length);
+  if (wait > 0) Utilities.sleep(Math.min(wait, 30000));
 
-    // 2. Pay the rate-limit cost (Token Bucket)
-    var wait = tbConsume_(ids.length);
-    if (wait > 0) Utilities.sleep(Math.min(wait, 30000));
-
-    var reqs = buildHistoryRequests_(client, regionId, ids);
-    
-    try {
-      // 3. Attempt the fetch
-      var resps = UrlFetchApp.fetchAll(reqs);
-
-      // --- Success Path ---
-      
-      // Log error budget (optional, using first response)
-      try {
-        if (resps.length > 0) {
-          var hdr = resps[0].getAllHeaders && resps[0].getAllHeaders();
-          var remain = +(hdr && (hdr['x-esi-error-limit-remain'] || hdr['X-Esi-Error-Limit-Remain']) || -1);
-          if (remain >= 0) (LoggerEx?.info || console.info)('esi.errbudget', { remain: remain });
-        }
-      } catch (_) { }
-
-      // Process results
-      for (var k = 0; k < resps.length; k++) {
-        out.push(mapGESIRespToResult_(resps[k], ids[k]));
-      }
-
-      // Advance the cursor by the ACTUAL number of items processed
-      i += ids.length; 
-      
-      // Optional: If we are running successfully at a low batch size, 
-      // you could slowly increment currentBatchSize here, but usually 
-      // it's safer to stay low once a run has proven unstable.
-      
-      Utilities.sleep(ESI_MICRO_BREATH_MS);
-
-    } catch (e) {
-      // --- Error Path ---
-      var msg = String(e.message || "");
-      var isBandwidth = msg.includes("Bandwidth") || msg.includes("quota") || msg.includes("limit");
-
-      // If it's a bandwidth error and we can still reduce the size:
-      if (isBandwidth && currentBatchSize > 1) {
-        var oldSize = currentBatchSize;
-        // Dynamic Adjustment: Cut batch size in half
-        currentBatchSize = Math.max(1, Math.floor(currentBatchSize / 2));
-        
-        (LoggerEx?.warn || console.warn)('esi.bandwidth.adapt', {
-           msg: "Bandwidth limit hit. Reducing batch size and retrying.",
-           oldSize: oldSize,
-           newSize: currentBatchSize,
-           index: i
-        });
-        
-        // Wait a moment for the quota bucket to drain
-        Utilities.sleep(3000);
-        
-        // LOOP REPEATS: We do NOT increment 'i', so we retry the same items with the smaller batch.
-      } else {
-        // Fatal error: Not bandwidth related, OR we are already at batch size 1
-        throw e;
-      }
+  return typeIds.map(typeId => {
+    if (ESI.isLocked()) {
+      return { typeId: typeId, status: 'ERR_RATE' };
     }
-  }
-  
-  return out;
-}
 
+    const response = service.get({ 
+      region_id: regionId, 
+      type_id: typeId 
+    });
 
-
-function isRateLimitedError_(e) {
-  const s = String(e && e.message || e || '');
-  return /bandwidth quota exceeded|error limit|too many|429|420/i.test(s);
-}
-
-function rateLimitPacer_() {
-  const p = PropertiesService.getScriptProperties();
-  const gap = Math.max(PACER_MIN_MS, Math.min(PACER_MAX_MS, Number(p.getProperty(PACER_PROP_GAP)) || PACER_MIN_MS));
-  const last = Number(p.getProperty(PACER_PROP_LAST)) || 0;
-  const now = Date.now();
-  const wait = Math.max(0, last + gap - now);
-  if (wait > 0) Utilities.sleep(wait);
-  p.setProperty(PACER_PROP_LAST, String(Date.now()));
-  return gap;
-}
-
-function bumpPacer_() {
-  const p = PropertiesService.getScriptProperties();
-  const cur = Math.max(PACER_MIN_MS, Number(p.getProperty(PACER_PROP_GAP)) || PACER_MIN_MS);
-  const next = Math.min(PACER_MAX_MS, Math.ceil(cur * 1.5));
-  p.setProperty(PACER_PROP_GAP, String(next));
-  return next;
-}
-
-function relaxPacer_() {
-  const p = PropertiesService.getScriptProperties();
-  const cur = Math.max(PACER_MIN_MS, Number(p.getProperty(PACER_PROP_GAP)) || PACER_MIN_MS);
-  const next = Math.max(PACER_MIN_MS, Math.floor(cur * 0.8));
-  p.setProperty(PACER_PROP_GAP, String(next));
-  return next;
-}
-
-function withRetries_(fn, tries = 3, baseDelay = 800) {
-  let attempt = 0;
-  while (true) {
-    try {
-      rateLimitPacer_();              // global pacing
-      return fn();                    // do the call
-    } catch (e) {
-      if (isRateLimitedError_(e) && attempt < tries - 1) {
-        const gap = bumpPacer_();
-        const jitter = Math.floor(Math.random() * 300);
-        const backoff = baseDelay * Math.pow(2, attempt) + jitter;
-        (LoggerEx?.warn || console.warn)(`Rate-limited: gap=${gap}ms, backoff=${backoff}ms, try=${attempt + 1}/${tries}`);
-        Utilities.sleep(backoff);
-        attempt++;
-        continue;
+    if (response.error) {
+      if (response.error === 'LOCKED' || response.error.includes('429') || response.error.includes('420')) {
+        return { typeId: typeId, status: 'ERR_RATE' };
       }
-      throw e; // non-rate error or out of tries
+      if (response.error === 'AUTH_FAILURE') {
+        return { typeId: typeId, status: 'ERR_AUTH' };
+      }
+      return { typeId: typeId, status: 'ERR_ESI' };
     }
-  }
-}
 
-function fetchVol30One_(typeId, regionId) {
-  try {
-    const hist = withRetries_(
-      () => GESI.getClient()
-        .setFunction('markets_region_history')
-        .executeRaw({ type_id: typeId, region_id: regionId }),
-      3, 800
-    ); // -> [{date:"YYYY-MM-DD", volume:..., ...}]
-
+    const hist = response.data;
     if (!Array.isArray(hist) || hist.length === 0) {
-      return { status: 'NOT_FOUND', vol30: "", vel: "" };
+      return { typeId: typeId, status: 'NOT_FOUND' };
     }
 
-    const vol30 = sumLastNDaysObj_(hist, 30); // sums 'volume' last 30d (UTC)
+    const m = summarizeHistoryMulti_(hist);
+    return {
+      typeId: typeId,
+      status: 'OK',
+      vol30: m.vol30, vel30: m.vel30,
+      vol7:  m.vol7,  vel7:  m.vel7,
+      vol5:  m.vol5,  vel5:  m.vel5
+    };
+  });
+}
 
-    if (vol30 > 0) {
-      return { status: 'OK', vol30: vol30, vel: vol30 / 30 };
-    }
-    // zero over the last 30 days → treat as no data for math purposes
-    return { status: 'NO_DATA_30D', vol30: "", vel: "" };
+function fetchVol30One_(typeId, regionId, authChar) {
+  // THE FIX: Only pass authChar if it actually contains a string
+  const authClient = authChar ? GESI.getClient(authChar) : GESI.getClient(); 
+  
+  const service = ESI.forEndpoint(authClient, 'markets_region_history', getMarketEsiHooks(authChar), null);
+  
+  const response = service.get({ region_id: regionId, type_id: typeId });
 
-  } catch (e) {
-    if (isRateLimitedError_(e)) {
-      return { status: 'ERR_RATE' }; // do not write a row; retry next run
+  if (response.error) {
+    if (response.error === 'LOCKED' || response.error.includes('429') || response.error.includes('420')) {
+      return { status: 'ERR_RATE', vol30: "", vel: "" };
     }
-    (LoggerEx?.error || console.error)('ESI error:', e?.message || e, e?.stack);
+    const log = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('FETCH_ONE') : console;
+    log.error(`ESI error for Item ${typeId} in Region ${regionId}: ${response.error}`);
     return { status: 'ERR_ESI', vol30: "", vel: "" };
   }
+
+  const hist = response.data;
+  if (!Array.isArray(hist) || hist.length === 0) {
+    return { status: 'NOT_FOUND', vol30: "", vel: "" };
+  }
+
+  const m = summarizeHistoryMulti_(hist);
+  if (m.vol30 > 0) return { status: 'OK', vol30: m.vol30, vel: m.vel30 };
+  
+  return { status: 'NO_DATA_30D', vol30: "", vel: "" };
 }
 
-
-
-
 /* ============================ CONFIG: CLIENT ============================ */
-/* marketStatDataCache uses your CacheService via _getCachedFuz and _normalizeOrder.
- * It needs NO sheet/range config. In your Sheets formulas, add your own FUZ_TICK heartbeat.
- */
-
 function testESIHistory() {
   const rid = 10000043; // Domain
   const tid = 34;       // Tritanium
   const client = GESI.getClient().setFunction('markets_region_history');
   const resp = UrlFetchApp.fetch(client.buildRequest({
-    region_id: rid,
-    type_id: tid,
-    show_column_headings: false,
-    version: 'latest'
+    region_id: rid, type_id: tid, show_column_headings: false, version: 'latest'
   }));
   const rows = JSON.parse(resp.getContentText());
   console.log('history rows:', Array.isArray(rows) ? rows.length : rows);
 }
-
 
 /* =============================== SETUP ================================= */
 function setupEngine() {
@@ -368,29 +231,34 @@ function ensurePublishSheet_(ss) {
     sh.getRange(1, 1, 1, HEADERS_PUBLISH.length).setValues([HEADERS_PUBLISH]);
     sh.setFrozenRows(1);
   }
-  // heartbeat (outside named range)
   sh.getRange('G1').setValue('published_at');
   sh.getRange('H1').setNumberFormat('yyyy-mm-dd"T"hh:mm:ss"Z"');
   SpreadsheetApp.getActive().setNamedRange(NR_MARKET_RESULT, sh.getRange('A:E'));
 }
 
-
 /* ============================ SCHEDULING =============================== */
 function installDailyKickoff() {
-  // clear old triggers for a clean slate
   ScriptApp.getProjectTriggers().forEach(t => {
     const h = t.getHandlerFunction();
     if (h === 'kickoffMarketHistoryRefresh' || h === 'marketFetchChunk') {
       ScriptApp.deleteTrigger(t);
     }
   });
+  
   ScriptApp.newTrigger('kickoffMarketHistoryRefresh')
     .timeBased().everyDays(1).atHour(DAILY_UTC_HOUR).nearMinute(DAILY_UTC_MIN)
     .inTimezone('Etc/UTC').create();
-  SpreadsheetApp.getUi().alert(`Daily kickoff installed @ ${DAILY_UTC_HOUR}:${DAILY_UTC_MIN} UTC ✅`);
+  
+  // NON-BLOCKING FIX: Log to console and use toast instead of alert
+  const msg = "Daily kickoff installed @ " + DAILY_UTC_HOUR + ":" + DAILY_UTC_MIN + " UTC";
+  console.log("[SUCCESS] " + msg);
+  
+  try {
+    SpreadsheetApp.getActiveSpreadsheet().toast(msg, "Trigger Setup");
+  } catch (e) {
+    // Safety fallback if executed outside spreadsheet runtime context
+  }
 }
-
-
 /* ========================= KICKOFF → WORKER ============================ */
 function kickoffMarketHistoryRefresh() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -404,21 +272,22 @@ function kickoffMarketHistoryRefresh() {
   props.setProperty('mf_job_active', '1');
   props.setProperty('mf_job_started', new Date().toISOString());
 
-  // publishMarketResultESIRegion(); // <-- REFACTORED: Removed.
-  // This is too "heavy" to call here. The `markAllCacheStale_` call
-  // is sufficient. Publishing will be handled by the ESI_publishClientInterfaces
-  // timer and the stopWorker_() function.
-
   ScriptApp.newTrigger('marketFetchChunk').timeBased().everyMinutes(WORKER_EVERY_MIN).create();
 }
 
-
 /* ===================== WORKER: ESI → CACHE (GESI) ====================== */
 function marketFetchChunk() {
+  const props = PropertiesService.getScriptProperties();
+  
+  if (ESI.isLocked()) {
+    LoggerEx.error('ABORT: ESI global quota is locked. Skipping execution to protect account.');
+    stopWorker_('Quota Lock Active');
+    return;
+  }
+  
   var t0 = Date.now();
-  var rid = Utilities.getUuid().slice(0, 8); // run id for grouping
+  var rid = Utilities.getUuid().slice(0, 8);
 
-  // prevent overlap
   var lock = LockService.getScriptLock();
   if (!lock.tryLock(5000)) {
     LoggerEx.warn('mf.lock.busy rid=' + rid);
@@ -433,7 +302,6 @@ function marketFetchChunk() {
       return stopWorker_('no cache');
     }
 
-    var props = PropertiesService.getScriptProperties();
     if (props.getProperty('mf_job_active') !== '1') {
       LoggerEx.log('mf.early.no_active_job rid=' + rid);
       return stopWorker_('no active job');
@@ -464,14 +332,11 @@ function marketFetchChunk() {
       ' cursorIn=' + JSON.stringify({ ri: ri, ii: ii }) +
       ' region=' + regionId + ' window=' + JSON.stringify({ from: ii, to: end, size: chunk.length }));
 
-    // --- REFACTORED: Removed duplicate variable declarations ---
     var rowsOut = [];
     var processed = 0;
     var hitRate = false;
     var ok = 0, err = 0, errAuth = 0;
-    // --- END REFACTOR ---
 
-    // --- GESI batch (auth handled by GESI, paced by token bucket) ---
     var results = fetchHistoryBatchGESI_(regionId, chunk);
 
     for (var i = 0; i < results.length; i++) {
@@ -480,13 +345,13 @@ function marketFetchChunk() {
       if (r.status === 'ERR_RATE') {
         hitRate = true;
         LoggerEx.warn('mf.rate.hit rid=' + rid + ' region=' + regionId + ' processed=' + processed);
-        break; 
+        break;
       }
 
       if (r.status === 'ERR_AUTH') {
         errAuth++;
         rowsOut.push([r.typeId, regionId, "", "", "", "", "", "", new Date(), 'ERR_AUTH']);
-        continue; 
+        continue;
       }
 
       if (r.status === 'OK') {
@@ -498,46 +363,31 @@ function marketFetchChunk() {
         err++;
         rowsOut.push([r.typeId, regionId, "", "", "", "", "", "", new Date(), r.status]);
         LoggerEx.warn('mf.item.err rid=' + rid + ' region=' + regionId + ' type=' + r.typeId + ' status=' + r.status);
-        processed++; 
+        processed++;
       }
     }
 
-
-    // Flush once
     if (rowsOut.length) {
       upsertRegionCache_(cache, rowsOut);
-      
-      // publishMarketResultESIRegion(); // <-- REFACTORED: Removed.
-      // This function is too "heavy" to run inside the 1-minute worker loop.
-      // It will be called by stopWorker_() when the job is done, or by
-      // the ESI_publishClientInterfaces timer.
-      
       LoggerEx.log('mf.flush.chunk rid=' + rid + ' rows=' + rowsOut.length);
     } else {
       LoggerEx.log('mf.flush.empty rid=' + rid);
     }
 
-    // Auth fail-fast: stop job, preserve cursor. No recycling.
     if (errAuth > 0) {
-      var props = PropertiesService.getScriptProperties();
-      props.setProperty('mf_blocked_auth', '1'); // breadcrumb if you want to gate startup
+      props.setProperty('mf_blocked_auth', '1');
       props.deleteProperty('mf_job_active');
       LoggerEx.error('mf.auth.block rid=' + rid + ' region=' + regionId + ' errAuth=' + errAuth + ' hint="Sheets → Add-ons → GESI → Authorize Character"');
       return stopWorker_('auth required');
     }
 
-
-    // Advance cursor only by actual work
     var cursorBefore = { ri: ri, ii: ii };
     if (hitRate && processed === 0) {
-      if (typeof hardenPacer_ === 'function') hardenPacer_();
       LoggerEx.warn('mf.cursor.stay_due_to_rate rid=' + rid + ' region=' + regionId +
         ' cursor=' + JSON.stringify(cursorBefore));
-      // keep ri/ii unchanged
     } else {
       ii += processed;
       if (ii >= items.length) { ii = 0; ri++; }
-      if (!hitRate && typeof relaxPacer_ === 'function') relaxPacer_();
     }
 
     var done = (ri >= regions.length);
@@ -559,14 +409,15 @@ function marketFetchChunk() {
     props.setProperty('mf_cursor', JSON.stringify({ ri: ri, ii: ii }));
 
   } catch (e) {
-    LoggerEx.error('mf.run.exception rid=' + rid + ' msg=' + (e && e.message));
-    throw e;
+    const errorMsg = String(e && e.message);
+    LoggerEx.error('mf.run.exception rid=' + rid + ' msg=' + errorMsg);
+    throw e; 
+
   } finally {
     try { lock.releaseLock(); } catch (e2) { }
     LoggerEx.log('mf.run.end rid=' + rid + ' ms=' + (Date.now() - t0));
   }
 }
-
 
 function isValidRegionId_(n) {
   n = Math.floor(Number(n));
@@ -575,25 +426,19 @@ function isValidRegionId_(n) {
 
 /**
  * GAP FILLER: Scans 'Item List Back End' vs 'Cache_Market_ESI_Region'.
- * Fetches any item that is missing from the Cache.
  */
 function fillMissingEsiHistory() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const cacheSh = ss.getSheetByName('Cache_Market_ESI_Region');
-  
-  // 1. Get Expected IDs (From Source)
+
   const expectedIds = readListFlex_(ITEMS_SOURCE, { numeric: true });
-  
-  // 2. Get Existing IDs (From Cache)
+
   const existingIds = new Set();
   if (cacheSh && cacheSh.getLastRow() > 1) {
-    // Cache has data: [type_id, region_id, ...]
-    // We only care about type_id (Col A) for now, or you can check pair key.
-    const data = cacheSh.getRange(2, 1, cacheSh.getLastRow()-1, 1).getValues();
+    const data = cacheSh.getRange(2, 1, cacheSh.getLastRow() - 1, 1).getValues();
     data.forEach(r => existingIds.add(Number(r[0])));
   }
 
-  // 3. Find Gaps
   const missing = expectedIds.filter(id => !existingIds.has(id));
 
   if (missing.length === 0) {
@@ -603,47 +448,43 @@ function fillMissingEsiHistory() {
 
   console.log(`[GapFiller] Found ${missing.length} missing items. Fetching...`);
 
-  // 4. Manual Fetch Loop (Reusing your internal logic)
-  // We target your default regions from 'Market Settings'
-  const regions = readListFlex_(REGIONS_SOURCE, { 
-    numeric: true, integer: true, dropZeros: true, validator: isValidRegionId_ 
+  const regions = readListFlex_(REGIONS_SOURCE, {
+    numeric: true, integer: true, dropZeros: true, validator: isValidRegionId_
   });
-  
+
   regions.forEach(rid => {
-    // Reuse your existing batch fetcher
     const results = fetchHistoryBatchGESI_(rid, missing);
-    
-    // Format for Cache Upsert
     const rowsOut = [];
     results.forEach(r => {
       if (r.status === 'OK') {
-        rowsOut.push([r.typeId, rid, r.vol30, r.vel, new Date(), 'OK']);
+        rowsOut.push([
+          r.typeId, rid, r.vol30, r.vel30, r.vol7, r.vel7, r.vol5, r.vel5, new Date(), 'OK'
+        ]);
       } else {
-        rowsOut.push([r.typeId, rid, "", "", new Date(), r.status]);
+        rowsOut.push([
+          r.typeId, rid, "", "", "", "", "", "", new Date(), r.status
+        ]);
       }
     });
 
-    // Save to Cache
     if (rowsOut.length) {
       upsertRegionCache_(ensureCacheMarketESIRegion_(ss), rowsOut);
       console.log(`[GapFiller] Saved ${rowsOut.length} items for Region ${rid}`);
     }
   });
 
-  // 5. Update Publish Sheet immediately
   publishMarketResultESIRegion();
   console.log("[GapFiller] Complete. Cache & Publish updated.");
 }
 
-
 /* =============================== HELPERS ================================ */
 function publishMarketResultESIRegion(ss) {
-  if(!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   const cache = ss.getSheetByName(SHEET_REGION_CACHE);
   const pub = ss.getSheetByName(SHEET_PUBLISH);
   if (!cache || !pub) throw new Error('Missing sheets');
 
-  const keepPairs = getConfigPairSet_();               // ← NEW
+  const keepPairs = getConfigPairSet_();
 
   const vals = cache.getDataRange().getValues();
   const out = [HEADERS_PUBLISH];
@@ -652,8 +493,8 @@ function publishMarketResultESIRegion(ss) {
     const h = vals[0];
     const ix = {
       t: h.indexOf('type_id'), r: h.indexOf('region_id'),
-      v30: h.indexOf('volume30_region'), 
-      v7: h.indexOf('volume7_region'), 
+      v30: h.indexOf('volume30_region'),
+      v7: h.indexOf('volume7_region'),
       v5: h.indexOf('volume5_region'),
       u: h.indexOf('last_updated'), s: h.indexOf('status')
     };
@@ -662,7 +503,7 @@ function publishMarketResultESIRegion(ss) {
       const row = vals[i];
       const t = row[ix.t], r = row[ix.r];
       if (t === "" || r === "") continue;
-      if (!keepPairs.has(`${Math.floor(t)}:${Math.floor(r)}`)) continue;  
+      if (!keepPairs.has(`${Math.floor(t)}:${Math.floor(r)}`)) continue;
 
       let status = String(row[ix.s] || "").toUpperCase();
       if (status === "STALE") status = "STALE-ESI";
@@ -679,19 +520,21 @@ function publishMarketResultESIRegion(ss) {
   pub.clearContents();
   pub.getRange(1, 1, out.length, HEADERS_PUBLISH.length).setValues(out);
   pub.getRange('H1').setNumberFormat('yyyy-mm-dd\"T\"hh:mm:ss\"Z\"').setValue(new Date());
+
+  if (out.length > 1) {
+    pub.getRange(2, 3, out.length - 1, 3).setNumberFormat('0');
+  }
+
   SpreadsheetApp.getActive().setNamedRange(NR_MARKET_RESULT, pub.getRange('A:E'));
 }
 
 /**
  * Build a values-only table per client from Publish_ESI_Region.
- * Input:  Sheet "Interface Clients" → A:Client, B:region_id_heartbeat
- * Source: Sheet "Publish_ESI_Region" (A:E = type_id,region_id,volume30_region,last_updated,status)
  * Output: Sheet "Publish_ESI_Region_<client>" with headers:
- *         [type_id, volume30_region, last_updated, status]
- * Named range for client: MarketResultESI_Region_<client>
+ * [type_id, volume30_region, last_updated, status]
  */
-function ESI_publishVolumeInterfaces() {
-  const ss = SpreadsheetApp.getActive();
+function ESI_publishVolumeInterfaces(ss) {
+  if (!ss) ss = SpreadsheetApp.getActive();
   const srcSh = ss.getSheetByName('Publish_ESI_Region');
   const cliSh = ss.getSheetByName('Interface Clients');
   
@@ -716,7 +559,6 @@ function ESI_publishVolumeInterfaces() {
     return;
   }
 
-  // ---- helpers ----
   const normStatus = (s) => String(s || '').trim().toUpperCase().replace(/_/g, '-');
   const toInt = (v) => {
     const n = Number(String(v).replace(/[^\d\-]/g, ''));
@@ -726,23 +568,16 @@ function ESI_publishVolumeInterfaces() {
     if (v instanceof Date) return v;
     const s = String(v || '').trim();
     if (!s) return null;
-    // Try YYYY-MM-DD first
     const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
     if (m) return new Date(Date.UTC(+m[1], +m[2]-1, +m[3]));
-    // Try serial / general number
     const n = Number(s);
-    if (Number.isFinite(n)) return new Date(Math.round((n - 25569) * 86400000)); // Excel serial fallback
-    // Last resort: Date.parse
+    if (Number.isFinite(n)) return new Date(Math.round((n - 25569) * 86400000)); 
     const t = Date.parse(s);
     return isNaN(t) ? null : new Date(t);
   };
 
-  // ---- group rows by region ----
-  // Build region → deduped rows keyed by type_id (prefer latest last_updated)
-  /** @type {Map<number, Map<number, any[]>>} */
   const byRegion = new Map();
 
-  // src schema A..E: [type_id, region_id, vol30, last_updated, status]
   for (let r = 1; r < src.length; r++) {
     const row = src[r];
     const typeId = toInt(row[0]);
@@ -750,13 +585,12 @@ function ESI_publishVolumeInterfaces() {
     if (!Number.isFinite(typeId) || !Number.isFinite(regionId)) continue;
 
     const vol30 = Number(row[2]) || 0;
-    const last = toDate(row[3]);       // Date or null
+    const last = toDate(row[3]);      
     const status = normStatus(row[4]);
 
     if (!byRegion.has(regionId)) byRegion.set(regionId, new Map());
     const bag = byRegion.get(regionId);
 
-    // dedupe by type_id: keep the row with the most recent last_updated
     const prev = bag.get(typeId);
     if (!prev) {
       bag.set(typeId, [typeId, vol30, last || '', status]);
@@ -768,7 +602,6 @@ function ESI_publishVolumeInterfaces() {
     }
   }
 
-  // ---- read clients ----
   if (lastCliRow < 2) return;
   const cliRows = cliSh.getRange(2, 1, lastCliRow - 1, 3).getValues();
 
@@ -779,16 +612,12 @@ function ESI_publishVolumeInterfaces() {
     const regionId = toInt(ridRaw);
     if (!client || !Number.isFinite(regionId)) continue;
 
-    // Build allowed set (default OK|STALE-ESI; "ALL" skips filtering)
     const filt = String(filtRaw || 'OK|STALE-ESI').trim();
     const allowAll = normStatus(filt) === 'ALL';
     const allowed = new Set(
-      allowAll
-        ? []
-        : filt.split(/[|,]/).map((x) => normStatus(x)).filter(Boolean)
+      allowAll ? [] : filt.split(/[|,]/).map((x) => normStatus(x)).filter(Boolean)
     );
 
-    // Pull region rows and apply status filter
     const bag = byRegion.get(regionId);
     const rows = [];
     if (bag && bag.size) {
@@ -799,10 +628,8 @@ function ESI_publishVolumeInterfaces() {
       }
     }
 
-    // Optional: sort by volume desc, then type_id
     rows.sort((a, b) => (b[1] - a[1]) || (a[0] - b[0]));
 
-    // Coerce last_updated to Date objects for formatting
     for (let i = 0; i < rows.length; i++) {
       const d = rows[i][2];
       rows[i][2] = toDate(d) || '';
@@ -811,19 +638,16 @@ function ESI_publishVolumeInterfaces() {
     const outName = 'Publish_ESI_Region_' + client;
     const outSh = getOrCreateSheet(ss, outName, OUT_HEADERS);
 
-    // Clear old data rows, keep header
     const last = outSh.getLastRow();
     if (last > 1) outSh.getRange(2, 1, last - 1, OUT_HEADERS.length).clearContent();
 
     if (rows.length) {
       outSh.getRange(2, 1, rows.length, OUT_HEADERS.length).setValues(rows);
-      // number/date formats
-      outSh.getRange(2, 1, rows.length, 1).setNumberFormat('0');              // type_id
-      outSh.getRange(2, 2, rows.length, 1).setNumberFormat('#,##0');          // volume30_region
-      outSh.getRange(2, 3, rows.length, 1).setNumberFormat('yyyy-mm-dd');     // last_updated
+      outSh.getRange(2, 1, rows.length, 1).setNumberFormat('0');              
+      outSh.getRange(2, 2, rows.length, 1).setNumberFormat('#,##0');          
+      outSh.getRange(2, 3, rows.length, 1).setNumberFormat('yyyy-mm-dd');     
     }
 
-    // Update named range (header + data)
     const height = Math.max(1, rows.length + 1);
     ss.setNamedRange(
       'MarketResultESI_Region_' + client,
@@ -840,19 +664,15 @@ function markAllCacheStale_(sheet) {
   const iStatus = h.indexOf('status');
   if (iStatus === -1) throw new Error('status col missing');
 
-  // Build status-only updates, conditional per row
   const newStatuses = [];
   for (let r = 1; r < data.length; r++) {
     const cur = String(data[r][iStatus] || "").toUpperCase();
-    // Flip only good rows to STALE-ESI; leave others as-is
     const next = (cur === "OK" || cur === "STALE-ESI") ? "STALE-ESI" : cur;
     newStatuses.push([next]);
   }
 
-  // Write just the status column; do NOT overwrite dates or numbers
   sheet.getRange(2, iStatus + 1, newStatuses.length, 1).setValues(newStatuses);
 }
-
 
 function stopWorker_(reason) {
   ScriptApp.getProjectTriggers()
@@ -862,7 +682,6 @@ function stopWorker_(reason) {
   if (reason) console.log('marketFetchChunk: stopped (' + reason + ')');
 }
 
-// Sum last 30 days (objects or arrays)
 function sumLastNDaysObj_(hist, days) {
   const startMs = Date.now() - days * 864e5;
   let sum = 0;
@@ -873,21 +692,13 @@ function sumLastNDaysObj_(hist, days) {
   return sum;
 }
 
-/**
- * REVISED: List reader that catches and reports #N/A errors
- */
 function readListFlex_(spec, opts) {
   opts = Object.assign({
-    numeric: true,
-    integer: true,
-    dropZeros: true,
-    dedupe: true,
-    validator: null
+    numeric: true, integer: true, dropZeros: true, dedupe: true, validator: null
   }, opts || {});
 
   const ss = SpreadsheetApp.getActive();
   
-  // 1. Establish the source
   let rangeObj = (spec && typeof spec.getValues === 'function') ? spec : ss.getRangeByName(spec);
   
   if (!rangeObj && typeof spec === 'string' && spec.includes('!')) {
@@ -898,28 +709,23 @@ function readListFlex_(spec, opts) {
     }
   }
 
-  // 2. Safety check
   if (!rangeObj) {
     console.error(`[LIST_ERROR] Could not find source: ${spec}`);
     return [];
   }
 
   const seen = new Set(), out = [];
-  const vals = rangeObj.getValues(); // This is the 2D array [ID, Name]
+  const vals = rangeObj.getValues(); 
 
   for (let i = 0; i < vals.length; i++) {
     let typeIdRaw = String(vals[i][0]).trim(); 
-    // Column B (Index 1) holds the Name for our diagnostic log
     let itemName = vals[i][1] ? String(vals[i][1]).trim() : "Unknown Item";
 
-// --- THE SILENT GATE ---
-    // If the ID is a known spreadsheet error, skip this row but keep going.
     if (String(typeIdRaw).includes("#N/A") || 
         String(typeIdRaw).includes("Check Name") || 
         String(typeIdRaw).includes("#VALUE!") || 
         String(typeIdRaw).includes("#REF!")) {
-      
-      continue; // <--- CORRECT: Skips this item, proceeds to the next.
+      continue; 
     }
 
     if (!typeIdRaw.length) continue; 
@@ -947,44 +753,65 @@ function readListFlex_(spec, opts) {
   return out;
 }
 
-
-// Upsert (type_id, region_id) rows into Cache_Market_ESI_Region
+// FAST BLOCK UPDATER
 function upsertRegionCache_(sheet, rows) {
   if (!rows.length) return;
-  const data = sheet.getDataRange().getValues();
-  const h = data[0];
-  const iType = h.indexOf('type_id');
-  const iReg = h.indexOf('region_id');
+
+  const lastRow = sheet.getLastRow();
+  const numCols = rows[0].length;
+
+  if (lastRow <= 1) {
+    sheet.getRange(2, 1, rows.length, numCols).setValues(rows);
+    return;
+  }
+
+  const lookupKeys = sheet.getRange(2, 1, lastRow - 1, 2).getValues();
   const map = new Map();
-  for (let r = 1; r < data.length; r++) {
-    const t = data[r][iType], g = data[r][iReg];
+
+  for (let r = 0; r < lookupKeys.length; r++) {
+    const t = lookupKeys[r][0];
+    const g = lookupKeys[r][1];
     if (t === '' || g === '') continue;
-    map.set(`${t}:${g}`, r + 1);
+    map.set(`${t}:${g}`, r + 2);
   }
-  const updates = [], appends = [];
+
+  const appends = [];
+  const updates = [];
+
   for (const row of rows) {
-    const [typeId, regionId] = row;
-    const rn = map.get(`${typeId}:${regionId}`);
-    if (rn) updates.push({ rn, row }); else appends.push(row);
+    const targetSheetRow = map.get(`${row[0]}:${row[1]}`);
+    if (targetSheetRow !== undefined) {
+      updates.push({ rn: targetSheetRow, data: row });
+    } else {
+      appends.push(row);
+    }
   }
-  updates.forEach(u => sheet.getRange(u.rn, 1, 1, HEADERS_REGION.length).setValues([u.row]));
-  if (appends.length) {
-    const start = sheet.getLastRow() + 1;
-    sheet.getRange(start, 1, appends.length, HEADERS_REGION.length).setValues(appends);
+
+  if (updates.length > 0) {
+    updates.sort((a, b) => a.rn - b.rn);
+
+    let blockStart = updates[0].rn;
+    let blockData = [updates[0].data];
+
+    for (let i = 1; i < updates.length; i++) {
+      const prevRn = updates[i - 1].rn;
+      const currRn = updates[i].rn;
+
+      if (currRn === prevRn + 1) {
+        blockData.push(updates[i].data);
+      } else {
+        sheet.getRange(blockStart, 1, blockData.length, numCols).setValues(blockData);
+        blockStart = currRn;
+        blockData = [updates[i].data];
+      }
+    }
+    sheet.getRange(blockStart, 1, blockData.length, numCols).setValues(blockData);
+  }
+
+  if (appends.length > 0) {
+    sheet.getRange(lastRow + 1, 1, appends.length, numCols).setValues(appends);
   }
 }
-
-
-/* =============================== DEBUG ================================= */
-function debugListSources() {
-  const items = readListFlex_(ITEMS_SOURCE, { numeric: true });
-  const regions = readListFlex_(REGIONS_SOURCE, { numeric: true });
-  console.log({
-    items_count: items.length, regions_count: regions.length,
-    sample_items: items.slice(0, 5), sample_regions: regions.slice(0, 5)
-  });
-}
-
 
 function _pairKey_(t, r) { return `${Math.floor(t)}:${Math.floor(r)}`; }
 
@@ -995,7 +822,6 @@ function getConfigPairSet_() {
   for (const t of items) for (const r of regions) set.add(_pairKey_(t, r));
   return set;
 }
-
 
 function pruneCacheToConfig_(mode = 'tombstone') {
   const ss = SpreadsheetApp.getActive();
@@ -1016,7 +842,6 @@ function pruneCacheToConfig_(mode = 'tombstone') {
   const keepPairs = getConfigPairSet_();
 
   if (mode === 'hard') {
-    // Rebuild the sheet with only configured rows
     const out = [h];
     for (let i = 1; i < vals.length; i++) {
       const row = vals[i];
@@ -1028,13 +853,12 @@ function pruneCacheToConfig_(mode = 'tombstone') {
     return;
   }
 
-  // tombstone: mark non-config rows as REMOVED and blank their numbers
   const updates = [];
   for (let i = 1; i < vals.length; i++) {
     const row = vals[i];
     const keep = keepPairs.has(_pairKey_(row[iT], row[iR]));
     if (!keep) {
-      row[iV] = "";               // blank numerics
+      row[iV] = "";
       if (iVel > -1) row[iVel] = "";
       if (iU > -1) row[iU] = new Date();
       row[iS] = "REMOVED";
@@ -1044,13 +868,6 @@ function pruneCacheToConfig_(mode = 'tombstone') {
   updates.forEach(u => sh.getRange(u.rn, 1, 1, h.length).setValues([u.row]));
 }
 
-
-
-
-/**
- * Install/replace a time trigger to republish client interfaces.
- * @param {number} everyMinutes  One of: 1, 5, 10, 15, 30 (default 10)
- */
 function ESI_installClientInterfaceRefresh(everyMinutes) {
   const allowed = [1, 5, 10, 15, 30];
   const n = Number(everyMinutes || 5);
@@ -1061,10 +878,8 @@ function ESI_installClientInterfaceRefresh(everyMinutes) {
   ScriptApp.newTrigger('ESI_publishVolumeInterfaces').timeBased().everyMinutes(n).create();
 }
 
-/** Remove the refresh trigger */
 function ESI_stopClientInterfaceRefresh() {
   ScriptApp.getProjectTriggers()
-    .filter(t => t.getHandlerFunction() === 'ESI_publishClientInterfaces')
+    .filter(t => t.getHandlerFunction() === 'ESI_publishVolumeInterfaces')
     .forEach(t => ScriptApp.deleteTrigger(t));
 }
-

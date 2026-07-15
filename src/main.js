@@ -11,8 +11,8 @@ function onOpen() {
     .addItem('Run SDE Update (Full)', 'sde_job_START')
     .addSeparator()
     // --- PIPE MAINTENANCE (THE CROWBARS) ---
-    .addItem('⚠️ Manual: Reset BigQuery (Hard Reset)', 'resetBigQueryTable')
-    .addItem('🔄 Manual: Toggle BQ Circuit Breaker', 'toggleBigQueryCircuitBreaker')
+    .addItem('⚠️ Manual: Refresh New Item Volumes', 'fillMissingEsiHistory')
+
     .addSeparator()
     .addItem('Manual: Reset Fuzz Job State', '_resetFuzzMarketDataJobState_MENU')
     .addItem('Manual: Reset ESI Job State', '_resetEsiHistoryJobState_MENU')

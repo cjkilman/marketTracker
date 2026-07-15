@@ -70,6 +70,99 @@ function _readMarketIDsFromSettings() {
   return marketPairs;
 }
 
+/**
+ * --- MASTER FUNCTION DEFINITION (Optimized for Velocity Momentum) ---
+ * Builds the full matrix of {type_id, market_id, market_type} requests,
+ * prioritizing high-velocity and surging items first.
+ */
+function getMasterMarketRequestsRegion() {
+  const itemIDs = _readItemIDList(ITEM_ID_SOURCE);
+  const marketPairs = _readMarketIDsFromSettings(); 
+
+  if (itemIDs.length === 0 || marketPairs.length === 0) {
+    (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('MasterRunner') : console).warn('Market request list is empty.');
+    return [];
+  }
+
+  // --- MOMENTUM PRIORITIZATION LAYER ---
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const cacheSh = ss.getSheetByName('Cache_Market_ESI_Region');
+    
+    if (cacheSh && cacheSh.getLastRow() > 1) {
+      const cacheData = cacheSh.getDataRange().getValues();
+      const h = cacheData[0];
+      const iType = h.indexOf('type_id');
+      const iVel30 = h.indexOf('velocity30_region');
+      const iVel5 = h.indexOf('velocity5_region');
+      const iStatus = h.indexOf('status');
+
+      // Map to store maximum momentum score per item type
+      const momentumMap = new Map();
+
+      for (let r = 1; r < cacheData.length; r++) {
+        const tId = Number(cacheData[r][iType]);
+        if (!tId) continue;
+
+        const status = String(cacheData[r][iStatus] || "");
+        let score = 1.0; // Baseline entry score
+
+        // Push dead items or persistent budget-draining errors to the absolute bottom
+        if (status.includes('ERR') || status === 'NOT_FOUND') {
+          score = 0.0;
+        } else {
+          const v30 = parseFloat(cacheData[r][iVel30]) || 0;
+          const v5 = parseFloat(cacheData[r][iVel5]) || 0;
+
+          if (v30 > 0) {
+            score = v5 / v30; // High ratio = surging short-term momentum
+          } else if (v5 > 0) {
+            score = 2.0; // Captures sudden new market movement
+          }
+        }
+
+        const maxScore = momentumMap.get(tId) || 0;
+        if (score > maxScore) momentumMap.set(tId, score);
+      }
+
+      // Sort the baseline itemIDs array before matrix construction
+      itemIDs.sort((a, b) => {
+        const scoreA = momentumMap.has(a) ? momentumMap.get(a) : 1.0;
+        const scoreB = momentumMap.has(b) ? momentumMap.get(b) : 1.0;
+        return scoreB - scoreA; // Descending order (highest priority first)
+      });
+    }
+  } catch (e) {
+    // Fail-safe: If caching fails, continue with default sorting order without breaking
+    (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('MasterRunner') : console).warn('Velocity priority skipped: ' + e.message);
+  }
+  // --- END PRIORITIZATION LAYER ---
+
+  const requests = [];
+  const processedKeys = new Set();
+  
+  for (const pair of marketPairs) {
+    for (const type_id of itemIDs) {
+      const key = `${type_id}|${pair.market_id}|${pair.market_type}`;
+      
+      if (!processedKeys.has(key)) {
+        requests.push({
+          type_id: type_id,
+          market_id: pair.market_id,
+          market_type: pair.market_type
+        });
+        processedKeys.add(key);
+      }
+    }
+  }
+  
+  // Note: Sorting strictly by market_id preserves your chunk sequence rules, 
+  // but because itemIDs entered the loop pre-sorted by momentum, items within 
+  // each market group maintain their priority order perfectly.
+  requests.sort((a, b) => a.market_id - b.market_id);
+
+  return requests;
+}
 
 /**
  * --- MASTER FUNCTION DEFINITION (Required by MarketFetcher.gs.js) ---

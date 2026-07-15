@@ -36,50 +36,7 @@ const PRUNE_BATCH_SIZE = 5000; // How many rows to read/process at a time
 
 const LOG_FUZZ = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('FuzzWorker') : console);
 
-/**
- * WRAPPER: Handles Lease & Lock.
- * - Checks if 30 minutes have passed.
- * - Calls executeWithTryLock(_updateFuzzMarketDataWorker).
- * - Updates Lease Timestamp ONLY if successful.
- */
-function updateFuzzMarketDataSheet(itemSource, ctx) {
-  const LOG_HEADER = '[Orchestrator]';
-  const LEASE_MINUTES = 30;
-  const PROPS = PropertiesService.getScriptProperties();
 
-  // --- 1. LEASE CHECK ---
-  const lastRun = parseFloat(PROPS.getProperty('LAST_FUZZ_FETCH') || '0');
-  const now = Date.now();
-  const minutesSince = (now - lastRun) / (1000 * 60);
-
-  if (minutesSince < LEASE_MINUTES) {
-    console.log(`${LOG_HEADER} Lease Active. Skipping Fetch. (Next run in ${(LEASE_MINUTES - minutesSince).toFixed(1)} min)`);
-    return;
-  }
-
-  // --- 2. EXECUTE WITH LOCK ---
-  // You MUST use 'return' here so the True/False/Null passes back to the 'success' variable
-  const success = executeWithTryLock(() => {
-    return _updateFuzzMarketDataWorker(itemSource, ctx);
-  }, 'updateFuzzMarketDataSheet');
-
-  // --- 3. UPDATE LEASE (The State Machine Logic) ---
-  if (success === true) {
-    // STATE 1: 100% Pass Complete. 
-    console.log(`${LOG_HEADER} 100% Pass Complete. Setting 30-minute Lease.`);
-    PROPS.setProperty('LAST_FUZZ_FETCH', now.toString());
-  }
-  else if (success === false) {
-    // STATE 2: Partial Pass / Timeout. 
-    console.log(`${LOG_HEADER} Partial Pass. Clearing lease so next pulse resumes immediately.`);
-    // VIP BYPASS: Deleting the lease ensures the next 3-minute trigger isn't blocked
-    PROPS.deleteProperty('LAST_FUZZ_FETCH');
-  }
-  else {
-    // STATE 3: Lock Busy (success is null or undefined)
-    console.warn(`${LOG_HEADER} Execution skipped by ScriptLock.`);
-  }
-}
 
 /**
  * Resets the state of the Fuzz market data job.
@@ -105,6 +62,53 @@ function _resetFuzzMarketDataJobState(error) {
 }
 
 
+/**
+ * WRAPPER: Handles Lease, Lock, and the Global Quota Gate.
+ */
+function updateFuzzMarketDataSheet(itemSource, ctx) {
+  const LOG_HEADER = '[Orchestrator]';
+  const LEASE_MINUTES = 30;
+  
+  if (!ctx) ctx = getAppContext();
+  const PROPS = ctx.props;
+
+  // --- 0. TIER 2 GLOBAL QUOTA GATE ---
+  if (PROPS.getProperty('DAILY_QUOTA_EXHAUSTED') === 'true') {
+    console.warn(`${LOG_HEADER} ABORT: Global UrlFetchApp Quota Exhausted. FuzzWorker standing down.`);
+    return;
+  }
+
+  // --- 1. LEASE CHECK ---
+  const lastRun = parseFloat(PROPS.getProperty('LAST_FUZZ_FETCH') || '0');
+  const now = Date.now();
+  const minutesSince = (now - lastRun) / (1000 * 60);
+
+  if (minutesSince < LEASE_MINUTES) {
+    console.log(`${LOG_HEADER} Lease Active. Skipping Fetch. (Next run in ${(LEASE_MINUTES - minutesSince).toFixed(1)} min)`);
+    return;
+  }
+
+  // --- 2. EXECUTE WITH LOCK ---
+  const success = executeWithTryLock(() => {
+    return _updateFuzzMarketDataWorker(itemSource, ctx);
+  }, 'updateFuzzMarketDataSheet');
+
+  // --- 3. UPDATE LEASE ---
+  if (success === true) {
+    console.log(`${LOG_HEADER} 100% Pass Complete. Setting 30-minute Lease.`);
+    PROPS.setProperty('LAST_FUZZ_FETCH', now.toString());
+  
+  } else if (success === false) {
+    console.log(`${LOG_HEADER} Partial Pass. Clearing lease so next pulse resumes immediately.`);
+    PROPS.deleteProperty('LAST_FUZZ_FETCH');
+  
+  } else {
+    // --- THE FIX: RESCHEDULE IF LOCKED ---
+    // If success is null, another script held the lock.
+    console.warn(`${LOG_HEADER} Execution skipped by ScriptLock. Rescheduling in 10s...`);
+    scheduleOneTimeTrigger('launchMarketFetcher_Thread', 10000); 
+  }
+}
 
 /**
  * WORKER: Smart Execution.
@@ -112,12 +116,23 @@ function _resetFuzzMarketDataJobState(error) {
  */
 function _updateFuzzMarketDataWorker(itemSource, ctx) {
   const LOG = (typeof LoggerEx !== 'undefined') ? LoggerEx.withTag('FuzzWorker') : console;
-
-  // Handshake destructuring
+  
+  // THE FIX: A secondary safety net, just in case the worker is called directly.
+  if (!ctx) ctx = getAppContext();
+  
+  // 1. Handshake destructuring (ctx is now guaranteed to exist)
   const { ss, props, cfg } = ctx;
 
+  // 2. PRE-FLIGHT GATE: Stop if the system is already locked
+  if (props.getProperty('DAILY_QUOTA_EXHAUSTED') === 'true') {
+    LOG.warn("ABORT: Daily Quota exhausted. Price Tracker skipping fetch...");
+    return false; // Return false to tell the Orchestrator it aborted cleanly
+  }
+
   // --- 1. LOAD ITEMS (The Dynamic Map) ---
-  const sourceName = itemSource || "Item List Back End";
+  // A Google Time-Driven trigger passes an event object [object Object] as the first argument.
+  // We need to ensure we don't accidentally try to look for a sheet named "[object Object]".
+  const sourceName = (typeof itemSource === 'string') ? itemSource : "Item List Back End";
   const itemSheet = ss.getSheetByName(sourceName);
 
   if (!itemSheet) {
@@ -202,8 +217,8 @@ function _updateFuzzMarketDataWorker(itemSource, ctx) {
       if (rowsToStream.length > 0) {
         props.setProperty('fuzz_job_active', 'true');
 
-        // TACTICAL: Direct reference or instant rebuild using Context ss handle
-        const stagingSheet = ss.getSheetByName("Market Prices") || rebuildMarketPricesSheet(ctx);
+        // Uses standard getOrCreateSheet
+        const stagingSheet = ss.getSheetByName(FUZZ_SHEET_FINAL) || getOrCreateSheet(ss, FUZZ_SHEET_FINAL, FUZZ_SHEET_HEADERS);
 
         const lastRow = stagingSheet.getLastRow();
         const chunkSize = 4000;
@@ -211,7 +226,6 @@ function _updateFuzzMarketDataWorker(itemSource, ctx) {
         for (let j = 0; j < rowsToStream.length; j += chunkSize) {
           const chunk = rowsToStream.slice(j, j + chunkSize);
           stagingSheet.getRange(lastRow + 1 + j, 1, chunk.length, 8).setValues(chunk);
-          // NO FLUSH. Let the V8 engine queue the writes natively.
         }
         props.setProperty('fuzz_job_active', 'false');
       }
@@ -222,16 +236,19 @@ function _updateFuzzMarketDataWorker(itemSource, ctx) {
     }
   }
 
-  // --- 4. COMPLETION SIGNAL ---
-  LOG.info(`100% Market Pass Complete.`);
+  // --- 4. COMPLETION SIGNAL & UI HANDOFF ---
+  LOG.info(`100% Market Pass Complete. Data is secured in local database.`);
   props.setProperty('fuzz_pass_complete', 'true');
   props.setProperty('fuzz_hub_bookmark', '0');
+
+  // THE CHAIN: Instantly wake up the Orchestrator UI task to push fresh numbers to Market Tycoon
+  LOG.info(`Spawning UI Pulse to push fresh data to consumers...`);
+  scheduleOneTimeTrigger('orchestratorTaskUI', 1000);
 
   // --- 5. TACTICAL STATIC DATA PULSE ---
   const utilitySheet = ss.getSheetByName("Utility");
   if (utilitySheet) {
     utilitySheet.getRange("B3").setValue(0);
-    // TACTICAL FLUSH: Mandatory for triggering ImportRange formula resets
     SpreadsheetApp.flush();
     utilitySheet.getRange("B3").setValue(1);
     LOG.info(`Static Data Pulse Fired.`);
@@ -593,6 +610,7 @@ function _heavyPruneWorker() {
 /**
  * NEW: The "Finalize" function for the heavy prune.
  * This runs the *second* deduplication (across all batches) and performs the atomic swap.
+ * @deprecated Kept for Historcal Reference incase We Need it
  */
 function _finalizePrune() {
   const LOG = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('PruneFinalizer') : console);
@@ -714,8 +732,12 @@ function _finalizePrune() {
 
 /**
  * NEW: Resets the state of the Heavy Prune job.
+ * @deprecated
  */
 function _resetHeavyPruneJobState(error) {
+  /**
+   * OBSOLETE Left Over From Old Code Keep function incase we Need to revisit this
+   */
   const LOG = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('HeavyPrune') : console);
   LOG.warn(`RESETTING Heavy Prune Job State. Reason: ${error ? error.message : 'Manual'}`);
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
@@ -788,17 +810,10 @@ function pruneSheetToRolling24(ss) {
 }
 
 /**
- * THE LIVE WIRE RECALL: Surgical BigQuery Puller with Local Fallback.
- * Refined to match the E7:K standard and ConfigHandler logic.
- */
-/**
- * THE LIVE WIRE RECALL: Surgical BigQuery Puller with Local Fallback.
+ * THE LIVE WIRE RECALL: Surgical Local Puller.
+ * Refined to match the E7:K standard. BigQuery removed entirely.
  */
 function FUZ_refreshPriceInterface(ss, targetSheetName) {
-  const cfg = getConfig();
-  const projectId = cfg.BQ_PROJECT_ID || 'tenacious-tiger-345318';
-  const isVaultOk = (cfg.BQ_ENABLED === true);
-
   if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheet = ss.getSheetByName(targetSheetName);
   if (!sheet) return console.warn(`[SKIP] Sheet "${targetSheetName}" not found.`);
@@ -806,7 +821,7 @@ function FUZ_refreshPriceInterface(ss, targetSheetName) {
   // --- 1. THE GATE (C4:D4) ---
   const settings = sheet.getRange("C4:D4").getValues()[0];
   const marketId = parseInt(settings[0]);
-  const marketType = String(settings[1]).trim();
+  const marketType = String(settings[1]).trim(); // <-- Here is our guy
 
   if (isNaN(marketId)) return;
 
@@ -815,29 +830,44 @@ function FUZ_refreshPriceInterface(ss, targetSheetName) {
   if (lastRow < 8) return;
   const itemIds = sheet.getRange(8, 2, lastRow - 7, 1).getValues().flat().filter(id => id > 0);
 
-  // --- 3. THE RECALL (Unified Logic) ---
-  let data = [];
+  // --- 3. THE RECALL (100% Local Sheet Scrape) ---
   try {
-    if (isVaultOk) {
-      // Use the shared function so indexing is always perfect
-      data = getPricesFromVault_(projectId, marketId, marketType, itemIds);
-    } else {
-      data = getPricesFromLocalBuffer_(ss.getSheetByName("Market Prices"), marketId, itemIds);
-    }
+    // BUG FIX: Pass marketType into the local buffer
+    const data = getPricesFromLocalBuffer_(ss.getSheetByName("Market Prices"), marketId, marketType, itemIds);
 
     // --- 4. THE RESPONSE (Write to E:K) ---
-    writeToPriceInterface_(sheet, data, isVaultOk);
+    writeToPriceInterface_(sheet, data, false);
 
   } catch (err) {
-    console.warn(`[${targetSheetName}] Sync Failed: ${err.message}`);
+    console.warn(`[${targetSheetName}] Local Sync Failed: ${err.message}`);
     sheet.getRange("E4").setValue(`[!] Sync Error: ${err.message}`);
   }
+}
+
+/**
+ * Filter the local Market Prices sheet based on ID and Type
+ */
+function getPricesFromLocalBuffer_(sh, marketId, marketType, itemIds) {
+  if (!sh) return [];
+  const data = sh.getDataRange().getValues();
+  const idSet = new Set(itemIds.map(id => Number(id)));
+
+  const cleanType = String(marketType).toLowerCase().trim();
+
+  return data.slice(1)
+    .filter(r => {
+      // r[1] = market_id, r[2] = market_type, r[3] = type_id
+      return idSet.has(Number(r[3])) &&
+        Number(r[1]) === Number(marketId) &&
+        String(r[2]).toLowerCase().trim() === cleanType;
+    })
+    .map(r => [String(r[3]), r[4], r[5], r[6], r[7]]); // E, F, G, H, I
 }
 
 function FUZ_writeToInterfaceSheet(sheet, data, statusPrefix) {
   // Matches Column E, F, G, H, I, J, K
   const HEADERS = [["type_id_filtered", "Current Sell", "Current Buy", "Median Sell", "Median Buy", "Sell Change", "Buy Change"]];
-  
+
   // Clear E7:K
   const lastRow = sheet.getLastRow();
   if (lastRow >= 7) sheet.getRange(7, 5, lastRow - 6, 7).clearContent();
@@ -912,9 +942,9 @@ function FUZ_publishPriceInterfaces(ss) {
           return [
             Number(id), // Keep native numeric type to align with SDE schemas
             obj.sell?.min !== "" ? Number(obj.sell.min) : "",
-            obj.buy?.max  !== "" ? Number(obj.buy.max)  : "",
+            obj.buy?.max !== "" ? Number(obj.buy.max) : "",
             obj.sell?.median !== "" ? Number(obj.sell.median) : "",
-            obj.buy?.median  !== "" ? Number(obj.buy.median)  : ""
+            obj.buy?.median !== "" ? Number(obj.buy.median) : ""
           ];
         }
         return [Number(id), "", "", "", ""];
@@ -934,25 +964,6 @@ function FUZ_publishPriceInterfaces(ss) {
   });
 }
 
-
-
-/**
- * Hard-sets the BQ_ENABLED flag to prevent toggle-loops during quota hits.
- */
-function setBigQueryCircuitBreaker(ss, targetState) {
-  const configSheet = ss.getSheetByName("Market Config");
-  if (!configSheet) return;
-
-  const data = configSheet.getDataRange().getValues();
-  for (let i = 0; i < data.length; i++) {
-    if (data[i][0] === "BQ_ENABLED") {
-      configSheet.getRange(i + 1, 2).setValue(targetState);
-      console.warn(`[GATE] BigQuery Pipe set to ${targetState ? '[ENABLED]' : '[DISABLED]'}`);
-      return;
-    }
-  }
-}
-
 function emergencyGhostCleanup() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const sheets = ss.getSheets();
@@ -962,68 +973,29 @@ function emergencyGhostCleanup() {
   console.log("Workbook Cleaned.");
 }
 
-function getPricesFromLocalBuffer_(sh, marketId, itemIds) {
-  if (!sh) return [];
-  const data = sh.getDataRange().getValues();
-  const idSet = new Set(itemIds.map(id => Number(id)));
-  
-  return data.slice(1)
-    .filter(r => idSet.has(Number(r[3])) && Number(r[1]) === Number(marketId))
-    .map(r => [String(r[3]), r[4], r[5], r[6], r[7]]); // E, F, G, H, I
-}
-
-function getPricesFromVault_(projectId, marketId, marketType, itemIds) {
-  const cfg = getConfig();
-  const targetProject = cfg.BQ_PROJECT_ID || 'tenacious-tiger-345318';
-  const tableId = cfg.BQ_Market_Prices || 'market_prices_history';
-  const idList = itemIds.join(',');
-  const cleanType = String(marketType).toLowerCase().trim();
-
-  const sql = `
-    WITH History AS (
-      SELECT type_id, min_sell, max_buy, date FROM \`${targetProject}.market_data.${tableId}\`
-      WHERE market_id = ${marketId} AND market_type = '${cleanType}' AND type_id IN (${idList})
-      AND date >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
-    ),
-    CalculatedBaselines AS (
-      SELECT type_id,
-        PERCENTILE_CONT(NULLIF(min_sell, 0), 0.5) OVER(PARTITION BY type_id) as med_sell_base,
-        PERCENTILE_CONT(NULLIF(max_buy, 0), 0.5) OVER(PARTITION BY type_id) as med_buy_base
-      FROM History
-    ),
-    LatestPrice AS (
-      SELECT type_id, min_sell, max_buy, ROW_NUMBER() OVER(PARTITION BY type_id ORDER BY date DESC) as rn FROM History
-    )
-    SELECT CAST(L.type_id AS STRING), L.min_sell, L.max_buy, CAST(B.med_sell_base AS FLOAT64), CAST(B.med_buy_base AS FLOAT64)
-    FROM LatestPrice L
-    LEFT JOIN (SELECT DISTINCT * FROM CalculatedBaselines) B ON L.type_id = B.type_id
-    WHERE L.rn = 1`;
-
-  const queryResults = BigQuery.Jobs.query({ query: sql, useLegacySql: false }, targetProject);
-
-  return queryResults.rows ? queryResults.rows.map(row => {
-    // Just return the 5 values BigQuery found
-    return row.f.map(field => field.v !== null ? field.v : "");
-  }) : [];
-}
-
 function forceSystemRecovery() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const ctx = getAppContext(ss); // Get the handshake
-  console.log("🛠 Recovery: Clearing lease and forcing Vault Merge...");
+  const ctx = getAppContext(ss);
+  console.log("🛠 Recovery: Clearing lease and forcing Local UI Pulse...");
+
+  // Clear the fetch lease so Fuzzwork can run again immediately
   ctx.props.deleteProperty('LAST_FUZZ_FETCH');
-  ctx.props.setProperty('fuzz_pass_complete', 'true'); 
-  
-  runVaultMergeAndReset(ctx); // Pass the ctx
-  console.log("✅ Recovery Complete.");
+  ctx.props.setProperty('fuzz_pass_complete', 'true');
+  ctx.props.deleteProperty('fuzz_hub_bookmark');
+  ctx.props.setProperty('fuzz_job_active', 'false');
+
+  // Manually trigger the UI to update from the local database
+  scheduleOneTimeTrigger('orchestratorTaskUI', 1000);
+
+  console.log("✅ Recovery Complete. UI will update in 1 second.");
 }
 
-function writeToPriceInterface_(sh, data, isVaultOk) {
+function writeToPriceInterface_(sh, data) {
   if (!data || data.length === 0) return;
 
   const startRow = 8; // Data starts here
   const lastRow = sh.getLastRow();
-  
+
   // 1. Clear ONLY E8:I (5 columns)
   if (lastRow >= startRow) {
     sh.getRange(startRow, 5, lastRow - startRow + 1, 5).clearContent();
@@ -1042,10 +1014,10 @@ function writeToPriceInterface_(sh, data, isVaultOk) {
 
   // 2. THE WRITE: Exactly 5 columns (E to I)
   sh.getRange(startRow, 5, output.length, 5).setValues(output);
-  
+
   // Format Prices (F:I)
   sh.getRange(startRow, 6, output.length, 4).setNumberFormat('#,##0.00 "ISK"');
 
   const ts = Utilities.formatDate(new Date(), "America/New_York", "h:mm:ss a");
-  sh.getRange("E4").setValue(`✅ Vault Synced: ${ts}`);
+  sh.getRange("E4").setValue(`✅ Local DB Synced: ${ts}`); // Changed 'Vault' to 'Local DB'
 }

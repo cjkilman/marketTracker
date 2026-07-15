@@ -12,6 +12,13 @@
 var EXECUTION_LOCK_DEPTH_TRY = 0;
 var EXECUTION_LOCK_DEPTH_WAIT = 0;
 
+function diagnoseEnvironment() {
+  console.log("--- RUNTIME DUMP START ---");
+  // This prints the actual code currently residing in the server's memory
+  console.log(masterOrchestrator.toString());
+  console.log("--- RUNTIME DUMP END ---");
+}
+
 /**
  * Ensures all functions share the same Spreadsheet and Config handles.
  */
@@ -159,6 +166,7 @@ function executeWithWaitLock(func, funcName) {
   return functionResult;
 }
 
+
 /** Helper to check if we have enough execution time left (in seconds) */
 function hasFuel(secondsNeeded) {
   const props = PropertiesService.getScriptProperties();
@@ -167,41 +175,152 @@ function hasFuel(secondsNeeded) {
   return (300 - elapsedSeconds) > secondsNeeded; // 300s = 5 minutes (Leaves 1 min safety buffer)
 }
 
+
+/* ============================ DAILY MASTER RESET ============================ */
+
+/**
+ * Run this function ONCE from the editor to install the daily reset trigger.
+ * It schedules the master reset to fire daily at 11:20 UTC (just after EVE downtime).
+ */
+function installDailyMasterReset() {
+  const functionName = 'masterDailyResetJob';
+  
+  // 1. Delete any existing reset triggers to prevent duplicates
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === functionName) {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+
+  // 2. Create the new daily trigger
+  ScriptApp.newTrigger(functionName)
+    .timeBased()
+    .everyDays(1)
+    .atHour(11) // 11:00 UTC
+    .nearMinute(20) // ~11:20 UTC
+    .inTimezone('Etc/UTC')
+    .create();
+
+  SpreadsheetApp.getUi().alert(`Master Reset Trigger installed for ~11:20 UTC ✅`);
+}
+
+/**
+ * THE CROWBAR: This is the function the trigger actually runs.
+ * It clears all global locks, resets all modules, and preps the system for a new day.
+ */
+function masterDailyResetJob() {
+  const LOG = (typeof LoggerEx !== 'undefined' ? LoggerEx.withTag('MasterReset') : console);
+  LOG.info("--- INITIATING DAILY MASTER SYSTEM RESET ---");
+
+  const props = PropertiesService.getScriptProperties();
+
+  // 1. CLEAR THE GLOBAL SHIELD
+  props.deleteProperty('DAILY_QUOTA_EXHAUSTED');
+  LOG.info("Global Quota Lock: CLEARED.");
+
+  // 2. RESET ESI MODULE (If exposed globally)
+  if (typeof ESI !== 'undefined' && typeof ESI.reset === 'function') {
+    try {
+      ESI.reset();
+    } catch (e) {
+      LOG.error(`ESI Module reset failed: ${e.message}`);
+    }
+  }
+
+  // 3. RESET FUZZWORK FOREGROUND ENGINE
+  try {
+    // Calling your existing Fuzz reset function
+    _resetFuzzMarketDataJobState(new Error("Scheduled Daily Reset"));
+    // Clear the specific lease so it fires immediately on next Orchestrator loop
+    props.deleteProperty('LAST_FUZZ_FETCH'); 
+  } catch (e) {
+    LOG.error(`Fuzzwork reset failed: ${e.message}`);
+  }
+
+  // 4. RESET PRUNING ENGINE
+  try {
+    // Calling your existing Prune reset function
+    if (typeof _resetHeavyPruneJobState === 'function') {
+      _resetHeavyPruneJobState(new Error("Scheduled Daily Reset"));
+    }
+  } catch (e) {
+    LOG.error(`Pruning engine reset failed: ${e.message}`);
+  }
+
+  LOG.info("--- MASTER SYSTEM RESET COMPLETE ---");
+}
+
 /**
  * THE ENDGAME ORCHESTRATOR
- * Lightweight loop conductor. Schedules UI distributions directly.
+ * Lightweight loop. Checks lease, dispatches thread if due, runs maintenance.
  */
 function masterOrchestrator() {
-  const startTime = Date.now();
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const ctx = getAppContext(ss);
+  const ctx = getAppContext(ss); // Define context first
+  
+  // --- TIER 1: GLOBAL QUOTA KILL SWITCH ---
+  if (ctx.props.getProperty('DAILY_QUOTA_EXHAUSTED') === 'true') {
+    console.error("ORCHESTRATOR ABORT: Global Quota Lock is ACTIVE. System hibernating until reset.");
+    return; // Completely stop the orchestrator from doing any work
+  }
 
-  ctx.props.setProperty('exec_start_time', String(startTime));
-  console.log("--- ORCHESTRATOR LOOP PULSE ---");
+  const LEASE_MINUTES = 30;
 
-  // Directly prompt the UI layer update task
-  console.log("[STAGGER] Scheduling UI Pulse for +1 Minute...");
-  scheduleOneTimeTrigger('orchestratorTaskUI', 60000);
+  // 1. DATA FIRST: Lease Gate
+  const lastRun = parseFloat(ctx.props.getProperty('LAST_FUZZ_FETCH') || '0');
+  const now = Date.now();
+  const minutesSince = (now - lastRun) / (1000 * 60);
 
-  // Maintenance Check
+  if (minutesSince >= LEASE_MINUTES) {
+    console.log("[BOUNCER] Lease expired. Dispatching fetcher thread...");
+    launchMarketFetcher_Thread();
+  } else {
+    console.log(`[BOUNCER] Lease active. Next run in ${(LEASE_MINUTES - minutesSince).toFixed(1)}m`);
+  }
+
+  // 2. UI PULSE
+  ctx.props.setProperty('exec_start_time', String(now));
+  if (hasFuel(60)) {
+    console.log("--- UI PULSE ---");
+    orchestratorTaskUI();
+  } else {
+    console.warn("[UI] Skipped: Insufficient fuel.");
+  }
+  /** Place Holder incase we have maintence jobs Later
+  // 3. MAINTENANCE
+  ctx.props.setProperty('exec_start_time', String(now));
   if (hasFuel(60)) {
     console.log("--- MAINTENANCE CHECK ---");
     runMaintenanceJobs();
   } else {
-    console.warn("[MAINTENANCE] Skipped: Insufficient execution fuel remaining.");
-  }
+    console.warn("[MAINTENANCE] Insufficient fuel.");
+  }*/
+}
+
+
+/**
+ * DEDICATED THREAD LAUNCHER
+ * Triggered by the Orchestrator. Rebuilds context and grants FuzzWorker a fresh 6-minute clock.
+ */
+function launchMarketFetcher_Thread() {
+  console.log("[THREAD START] Waking up dedicated 6-minute slot for MarketFetcher...");
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ctx = getAppContext(ss); 
+  
+  updateFuzzMarketDataSheet(null, ctx); 
 }
 
 /**
  * ROUND-ROBIN MAINTENANCE SCHEDULER
- * Retained clean interface shell for future zero-cost tasks.
+ * Checks FuzzFetcher, Pruning, and Daily Resets.
  */
 function runMaintenanceJobs() {
   const SCRIPT_PROP = PropertiesService.getScriptProperties();
-  const NOW_MS = new Date().getTime();
+  const NOW_MS = Date.now();
 
-  // All legacy database staging / heavy pruning tasks removed
-  const JOB_QUEUE = [];
+  const JOB_QUEUE = [
+
+  ];
 
   const QUEUE_INDEX_KEY = 'MAINTENANCE_QUEUE_INDEX';
   let currentIndex = parseInt(SCRIPT_PROP.getProperty(QUEUE_INDEX_KEY) || '0', 10);
@@ -218,17 +337,11 @@ function runMaintenanceJobs() {
     if (isDue) {
       console.log(`[MAINTENANCE] Dispatching: ${job.name}`);
       try {
-        const jobFunctions = {};
-
-        if (jobFunctions[job.name]) {
-          jobFunctions[job.name](); 
-          SCRIPT_PROP.setProperty(lastRunKey, NOW_MS.toString());
-          SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, ((currentIndex + 1) % JOB_QUEUE.length).toString());
-          console.log(`[MAINTENANCE] ${job.name} completed successfully.`);
-          return; 
-        } else {
-          console.warn(`[MAINTENANCE] Function ${job.name} is not defined in the workspace.`);
-        }
+        job.run(); 
+        SCRIPT_PROP.setProperty(lastRunKey, NOW_MS.toString());
+        SCRIPT_PROP.setProperty(QUEUE_INDEX_KEY, ((currentIndex + 1) % JOB_QUEUE.length).toString());
+        console.log(`[MAINTENANCE] ${job.name} successfully dispatched/completed.`);
+        return; 
       } catch (e) {
         console.error(`[MAINTENANCE] Critical Failure in ${job.name}: ${e.message}`);
       }

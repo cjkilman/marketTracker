@@ -1,9 +1,15 @@
 // cjkilman/markettracker/marketTracker-dev/src/BigQueryPipe.gs.js
 
 /**
+ * BigQuery Disabled/ Archieved
+ * Eve Market Data is too much of a Firehose of Data it kills the monthly quote in 2 weeks
+ */
+
+/**
  * INDUSTRIAL PIPE: Direct-to-Vault Streaming.
  * Bypasses Google Sheets entirely to prevent the "Spinning Wheel" crash.
  */
+
 function streamToBigQuery(dataRows) {
   if (!dataRows || dataRows.length === 0) return;
 
